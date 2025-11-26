@@ -1,0 +1,49 @@
+# Flow Matching Policy configuration
+# Based on: https://github.com/HRI-EU/flow_matching
+
+_base_: "base.yaml"
+
+algorithm: "flow_matching"
+
+# Environment
+env:
+  name: "point_mass_2d"
+  max_episode_steps: 200
+
+# Training settings
+training:
+  seed: 42
+  total_steps: 20000
+  batch_size: 256
+  eval_interval: 1000
+  
+# Expert data collection
+expert_data:
+  num_episodes: 100
+  noise_std: 0.1
+
+# Flow matching settings
+flow:
+  variant: "vanilla"  # "vanilla", "reflected", or "consistency"
+  num_inference_steps: 10
+  sigma_min: 0.001
+  
+# For reflected flow variant
+reflected:
+  reflection_mode: "hard"  # "hard" or "soft"
+  action_bounds: [-1.0, 1.0]
+
+# For consistency flow variant
+consistency:
+  consistency_weight: 1.0
+  use_ema_teacher: true
+  ema_decay: 0.999
+  
+# Network architecture
+network:
+  hidden_dims: [256, 256, 256]
+  time_embed_dim: 64
+
+# Optimizer
+optimizer:
+  learning_rate: 1.0e-4

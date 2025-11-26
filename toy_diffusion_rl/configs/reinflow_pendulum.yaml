@@ -1,0 +1,48 @@
+# ReinFlow configuration
+# Based on: https://github.com/ReinFlow/ReinFlow
+
+_base_: "base.yaml"
+
+algorithm: "reinflow"
+
+# Environment
+env:
+  name: "point_mass_2d"
+  max_episode_steps: 200
+
+# Training settings
+training:
+  seed: 42
+  total_iterations: 100  # Number of online RL iterations
+  rollout_steps: 2048
+  eval_interval: 10
+  
+# Offline pretraining
+pretrain:
+  enabled: true
+  num_steps: 5000
+  expert_episodes: 100
+  expert_noise: 0.1
+
+# Flow settings
+flow:
+  num_flow_steps: 10
+
+# PPO settings for online fine-tuning
+ppo:
+  clip_ratio: 0.2
+  ppo_epochs: 10
+  batch_size: 64
+  gamma: 0.99
+  gae_lambda: 0.95
+  value_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 0.5
+
+# Network architecture
+network:
+  hidden_dims: [256, 256]
+  
+# Optimizer
+optimizer:
+  learning_rate: 3.0e-4

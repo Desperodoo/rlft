@@ -1,0 +1,46 @@
+# CPQL (Consistency Policy Q-Learning) configuration
+# Based on: https://github.com/cccedric/cpql
+
+_base_: "base.yaml"
+
+algorithm: "cpql"
+
+# Environment
+env:
+  name: "point_mass_2d"
+  max_episode_steps: 200
+
+# Training settings
+training:
+  seed: 42
+  total_steps: 50000
+  batch_size: 256
+  eval_interval: 2000
+  
+# Expert data collection
+expert_data:
+  num_episodes: 100
+  noise_std: 0.2
+
+# Consistency model settings
+consistency:
+  num_noise_levels: 20
+  sigma_max: 1.0
+  sigma_min: 0.002
+  consistency_weight: 1.0
+  bc_weight: 1.0
+
+# RL settings
+rl:
+  gamma: 0.99
+  tau: 0.005
+  alpha: 0.1  # Temperature for Q-value
+
+# Network architecture
+network:
+  hidden_dims: [256, 256]
+  
+# Optimizer
+optimizer:
+  learning_rate_policy: 3.0e-4
+  learning_rate_q: 3.0e-4
