@@ -1,8 +1,13 @@
 """
-Consistency Flow Policy
+Unified Consistency Flow Policy
 
-Implements consistency-style training for flow matching,
-enabling single-step or few-step action generation.
+Consistency-style training for flow matching with multi-modal observation support.
+Enables single-step or few-step action generation.
+
+Supports multiple observation modes:
+- "state": State vector only
+- "image": Image observation only  
+- "state_image": Both state and image (multimodal)
 
 References:
 - Consistency Models (Song et al., 2023)
@@ -10,87 +15,202 @@ References:
 - rectified-flow-pytorch: https://github.com/lucidrains/rectified-flow-pytorch
 
 Key Insight from ManiFlow:
-- The model predicts AVERAGE VELOCITY v_avg = (x_1 - x_t) / (1 - t)
-- At inference, we use: x_1 = x_t + (1 - t) * v_avg
-- This naturally handles single-step generation when t=0
+- The model predicts velocity v = x_1 - x_0 (constant for linear flow)
+- At inference: x_1 = x_0 + v
+- Consistency training ensures model predicts consistent x_1 across timesteps
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple, Union
 import copy
 
-from .base_flow import FlowMatchingPolicyBase
-from ...common.networks import FlowVelocityPredictor
+try:
+    from ...common.networks import MLP, TimestepEmbedding
+    from ...common.obs_encoder import ObservationEncoder, create_obs_encoder
+except ImportError:
+    try:
+        from toy_diffusion_rl.common.networks import MLP, TimestepEmbedding
+        from toy_diffusion_rl.common.obs_encoder import ObservationEncoder, create_obs_encoder
+    except ImportError:
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from common.networks import MLP, TimestepEmbedding
+        from common.obs_encoder import ObservationEncoder, create_obs_encoder
 
 
-class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
-    """Consistency Flow Policy for fast action generation (ManiFlow-style).
+class MultiModalVelocityPredictorV2(nn.Module):
+    """Velocity predictor with multi-modal observation support.
+    
+    Uses TimestepEmbedding (sinusoidal + MLP) for consistency with
+    non-multimodal FlowVelocityPredictor.
+    
+    Args:
+        action_dim: Dimension of action space
+        hidden_dims: Hidden layer dimensions
+        time_embed_dim: Dimension of timestep embedding
+        obs_encoder: ObservationEncoder for processing observations
+        obs_dim: Fallback observation dimension if no encoder
+    """
+    
+    def __init__(
+        self,
+        action_dim: int,
+        hidden_dims: List[int] = [256, 256, 256],
+        time_embed_dim: int = 64,
+        obs_encoder: Optional[ObservationEncoder] = None,
+        obs_dim: int = 0,
+    ):
+        super().__init__()
+        
+        self.action_dim = action_dim
+        self.obs_encoder = obs_encoder
+        
+        if obs_encoder is not None:
+            obs_feature_dim = obs_encoder.output_dim
+        else:
+            obs_feature_dim = obs_dim
+        
+        self.obs_feature_dim = obs_feature_dim
+        
+        # Use TimestepEmbedding for consistency with non-multimodal version
+        self.time_embed = TimestepEmbedding(time_embed_dim)
+        
+        # Velocity prediction network
+        input_dim = obs_feature_dim + action_dim + time_embed_dim
+        self.net = MLP(
+            input_dim=input_dim,
+            output_dim=action_dim,
+            hidden_dims=hidden_dims,
+            activation=nn.SiLU(),
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+        image: Optional[torch.Tensor] = None,
+        obs_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict velocity at position x and time t.
+        
+        Args:
+            x: Current position in flow (B, action_dim)
+            t: Current timestep in [0, 1] (B,)
+            state: Optional state vector (B, state_dim)
+            image: Optional image tensor (B, C, H, W)
+            obs_features: Pre-computed observation features
+        
+        Returns:
+            Predicted velocity (B, action_dim)
+        """
+        if obs_features is not None:
+            features = obs_features
+        elif self.obs_encoder is not None:
+            features = self.obs_encoder(state=state, image=image)
+        else:
+            features = state
+        
+        # Use TimestepEmbedding (takes raw t, handles conversion internally)
+        t_embed = self.time_embed(t)
+        combined = torch.cat([features, x, t_embed], dim=-1)
+        return self.net(combined)
+
+
+class ConsistencyFlowPolicy:
+    """Unified Consistency Flow Policy with multi-modal observation support.
     
     Following ManiFlow's approach:
     1. Train with mixed Flow + Consistency objectives
-    2. Model predicts average velocity v_avg = (x_1 - x_t) / (1-t)
+    2. Model predicts velocity v = x_1 - x_0
     3. Use EMA teacher for consistency targets
-    4. Single-step inference: x_1 = x_0 + 1.0 * v_avg(x_0, t=0)
+    4. Single-step inference: x_1 = x_0 + v
     
     Args:
-        state_dim: Dimension of state space
-        action_dim: Dimension of action space  
+        action_dim: Dimension of action space
+        obs_mode: Observation mode ("state", "image", or "state_image")
+        state_dim: Dimension of state space (required for state/state_image)
+        image_shape: Image shape as (H, W, C) (required for image/state_image)
         hidden_dims: Hidden layer dimensions
-        learning_rate: Learning rate
         flow_batch_ratio: Fraction of batch for flow loss (default 0.5)
         consistency_batch_ratio: Fraction of batch for consistency loss (default 0.5)
         use_ema_teacher: Use EMA model as teacher
         ema_decay: Decay rate for EMA
         num_inference_steps: Number of ODE steps for multi-step inference
+        vision_encoder_type: Type of vision encoder ("cnn" or "dinov2")
+        vision_output_dim: Output dimension of vision encoder
+        freeze_vision_encoder: Whether to freeze vision encoder
+        learning_rate: Learning rate
         device: Device for computation
     """
     
     def __init__(
         self,
-        state_dim: int,
         action_dim: int,
-        hidden_dims: list = [256, 256, 256],
-        learning_rate: float = 1e-4,
-        consistency_weight: float = 1.0,  # kept for compatibility
+        obs_mode: str = "state",
+        state_dim: Optional[int] = None,
+        image_shape: Optional[Tuple[int, int, int]] = None,
+        hidden_dims: List[int] = [256, 256, 256],
         flow_batch_ratio: float = 0.5,
         consistency_batch_ratio: float = 0.5,
         use_ema_teacher: bool = True,
         ema_decay: float = 0.999,
         num_inference_steps: int = 10,
-        denoise_timesteps: int = 10,  # discretization for t sampling
+        sigma_min: float = 0.001,
+        vision_encoder_type: str = "cnn",
+        vision_output_dim: int = 128,
+        freeze_vision_encoder: bool = False,
+        learning_rate: float = 1e-4,
         device: str = "cpu"
     ):
-        super().__init__(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            hidden_dims=hidden_dims,
-            learning_rate=learning_rate,
-            device=device
-        )
-        
+        self.action_dim = action_dim
+        self.obs_mode = obs_mode
+        self.state_dim = state_dim
+        self.image_shape = image_shape
         self.flow_batch_ratio = flow_batch_ratio
         self.consistency_batch_ratio = consistency_batch_ratio
         self.use_ema_teacher = use_ema_teacher
         self.ema_decay = ema_decay
         self.num_inference_steps = num_inference_steps
-        self.denoise_timesteps = denoise_timesteps
+        self.sigma_min = sigma_min
+        self.device = device
         
-        # Single network that predicts average velocity
-        # v_avg = (x_1 - x_t) / (1 - t), so x_1 = x_t + (1-t) * v_avg
-        self.optimizer = torch.optim.Adam(
-            self.velocity_net.parameters(),
-            lr=learning_rate
-        )
+        # Create observation encoder
+        self.obs_encoder = create_obs_encoder(
+            obs_mode=obs_mode,
+            state_dim=state_dim,
+            image_shape=image_shape,
+            vision_encoder_type=vision_encoder_type,
+            vision_output_dim=vision_output_dim,
+            freeze_vision=freeze_vision_encoder,
+        ).to(device)
+        
+        # Velocity network
+        self.velocity_net = MultiModalVelocityPredictorV2(
+            action_dim=action_dim,
+            hidden_dims=hidden_dims,
+            obs_encoder=self.obs_encoder,
+        ).to(device)
         
         # EMA teacher for consistency training
         if use_ema_teacher:
             self.ema_velocity_net = copy.deepcopy(self.velocity_net)
             for p in self.ema_velocity_net.parameters():
                 p.requires_grad = False
-                
+        
+        # Collect trainable parameters
+        trainable_params = list(self.velocity_net.parameters())
+        
+        if obs_mode in ["image", "state_image"] and not freeze_vision_encoder:
+            vision_params = [p for p in self.obs_encoder.vision_encoder.parameters() if p.requires_grad]
+            trainable_params.extend(vision_params)
+        
+        self.optimizer = torch.optim.Adam(trainable_params, lr=learning_rate)
+    
     def _update_ema(self):
         """Update EMA parameters."""
         if not self.use_ema_teacher:
@@ -102,6 +222,65 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
                 self.velocity_net.parameters()
             ):
                 ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1-self.ema_decay)
+    
+    def _parse_observation(
+        self,
+        obs: Union[np.ndarray, Dict[str, np.ndarray], torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Parse observation into state and image tensors."""
+        state = None
+        image = None
+        
+        if self.obs_mode == "state":
+            if isinstance(obs, dict):
+                obs = obs.get("state", obs.get("obs", obs))
+            if isinstance(obs, np.ndarray):
+                state = torch.FloatTensor(obs).to(self.device)
+            else:
+                state = obs.to(self.device) if isinstance(obs, torch.Tensor) else torch.FloatTensor(obs).to(self.device)
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+                
+        elif self.obs_mode == "image":
+            if isinstance(obs, dict):
+                obs = obs.get("image", obs)
+            if isinstance(obs, np.ndarray):
+                if obs.ndim == 3 and obs.shape[-1] in [1, 3, 4]:
+                    obs = np.transpose(obs, (2, 0, 1))
+                image = torch.FloatTensor(obs).to(self.device)
+            else:
+                image = obs.to(self.device)
+            if image.max() > 1.0:
+                image = image / 255.0
+            if image.dim() == 3:
+                image = image.unsqueeze(0)
+                
+        else:  # state_image
+            if isinstance(obs, dict):
+                state_data = obs.get("state", obs.get("obs"))
+                image_data = obs.get("image")
+            else:
+                raise ValueError("For state_image mode, obs must be a dict")
+            
+            if isinstance(state_data, np.ndarray):
+                state = torch.FloatTensor(state_data).to(self.device)
+            else:
+                state = state_data.to(self.device)
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+            
+            if isinstance(image_data, np.ndarray):
+                if image_data.ndim == 3 and image_data.shape[-1] in [1, 3, 4]:
+                    image_data = np.transpose(image_data, (2, 0, 1))
+                image = torch.FloatTensor(image_data).to(self.device)
+            else:
+                image = image_data.to(self.device)
+            if image.max() > 1.0:
+                image = image / 255.0
+            if image.dim() == 3:
+                image = image.unsqueeze(0)
+        
+        return state, image
     
     def _linear_interpolate(
         self,
@@ -116,7 +295,7 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
     def _get_flow_targets(
         self,
         actions: torch.Tensor,
-        states: torch.Tensor
+        obs_features: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """Get flow matching targets.
         
@@ -131,11 +310,13 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
         # Sample timestep uniformly
         t = torch.rand(batch_size, device=self.device)
         
-        # Interpolate
-        x_t = self._linear_interpolate(x_0, actions, t)
+        # Interpolate (with sigma_min for stability)
+        t_expand = t.unsqueeze(-1)
+        sigma_t = 1 - (1 - self.sigma_min) * t_expand
+        x_t = sigma_t * x_0 + t_expand * actions
         
-        # Target: instantaneous velocity (constant for linear flow)
-        v_target = actions - x_0
+        # Target: velocity accounting for sigma_min
+        v_target = actions - (1 - self.sigma_min) * x_0
         
         return {
             'x_t': x_t,
@@ -148,7 +329,7 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
     def _get_consistency_targets(
         self,
         actions: torch.Tensor,
-        states: torch.Tensor
+        obs_features: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         """Get consistency training targets (ManiFlow-style).
         
@@ -159,8 +340,7 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
         Method:
         1. At t_next, use EMA teacher to predict velocity v
         2. Compute predicted x_1 = x_t_next + (1 - t_next) * v
-        3. Target velocity at t is: (pred_x_1 - x_t) / (1 - t) 
-           But since v should be constant, we can use: pred_x_1 - x_0
+        3. Target velocity at t is: pred_x_1 - x_0
         """
         batch_size = actions.shape[0]
         
@@ -183,7 +363,7 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
         # Use EMA teacher to predict velocity at t_next
         with torch.no_grad():
             net = self.ema_velocity_net if self.use_ema_teacher else self.velocity_net
-            v_teacher = net(states, x_t_next, t_next)
+            v_teacher = net(x_t_next, t_next, obs_features=obs_features)
             
             # Estimate x_1 using teacher's prediction: x_1 = x_t_next + (1 - t_next) * v
             t_next_expand = t_next.unsqueeze(-1)
@@ -197,23 +377,38 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
             'x_t': x_t,
             't': t,
             'v_target': v_target,
-            'target_t': delta_t,
             'x_0': x_0,
             'x_1': actions
         }
     
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Train with combined flow matching and consistency loss (ManiFlow-style).
+        """Train with combined flow matching and consistency loss.
         
         Args:
-            batch: Dictionary with 'states' and 'actions'
+            batch: Dictionary with observation and action tensors
             
         Returns:
             Dictionary of training metrics
         """
-        states = batch["states"]
-        actions = batch["actions"]
-        batch_size = states.shape[0]
+        # Parse batch
+        states = batch.get("states", batch.get("obs", batch.get("state")))
+        images = batch.get("images", batch.get("image"))
+        actions = batch["actions"] if "actions" in batch else batch["action"]
+        
+        if states is not None:
+            states = states.to(self.device)
+        if images is not None:
+            images = images.to(self.device)
+            if images.dim() == 4 and images.shape[-1] in [1, 3, 4]:
+                images = images.permute(0, 3, 1, 2)
+            if images.max() > 1.0:
+                images = images / 255.0
+        actions = actions.to(self.device)
+        
+        batch_size = actions.shape[0]
+        
+        # Pre-compute observation features (shared for both losses)
+        obs_features = self.obs_encoder(state=states, image=images)
         
         # Split batch for flow and consistency training
         flow_size = int(batch_size * self.flow_batch_ratio)
@@ -225,13 +420,13 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
         
         # ============ Flow Matching Loss ============
         if flow_size > 0:
-            flow_states = states[:flow_size]
             flow_actions = actions[:flow_size]
+            flow_features = obs_features[:flow_size]
             
-            flow_targets = self._get_flow_targets(flow_actions, flow_states)
+            flow_targets = self._get_flow_targets(flow_actions, flow_features)
             
             # Predict velocity
-            v_pred = self.velocity_net(flow_states, flow_targets['x_t'], flow_targets['t'])
+            v_pred = self.velocity_net(flow_targets['x_t'], flow_targets['t'], obs_features=flow_features)
             
             flow_loss = F.mse_loss(v_pred, flow_targets['v_target'])
             total_loss = total_loss + flow_loss
@@ -239,13 +434,13 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
         
         # ============ Consistency Loss ============
         if cons_size > 0:
-            cons_states = states[flow_size:flow_size+cons_size]
             cons_actions = actions[flow_size:flow_size+cons_size]
+            cons_features = obs_features[flow_size:flow_size+cons_size]
             
-            cons_targets = self._get_consistency_targets(cons_actions, cons_states)
+            cons_targets = self._get_consistency_targets(cons_actions, cons_features)
             
-            # Predict average velocity
-            v_pred = self.velocity_net(cons_states, cons_targets['x_t'], cons_targets['t'])
+            # Predict velocity
+            v_pred = self.velocity_net(cons_targets['x_t'], cons_targets['t'], obs_features=cons_features)
             
             cons_loss = F.mse_loss(v_pred, cons_targets['v_target'])
             total_loss = total_loss + cons_loss
@@ -264,46 +459,36 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
             "loss": total_loss.item(),
             "flow_loss": flow_loss_val,
             "consistency_loss": cons_loss_val,
-            "direct_loss": 0.0  # Not used in ManiFlow-style
         }
     
     @torch.no_grad()
     def sample_action(
         self,
-        state: np.ndarray,
+        obs: Union[np.ndarray, Dict[str, np.ndarray]],
         num_steps: Optional[int] = None,
-        use_consistency: bool = True
+        use_ema: bool = True
     ) -> np.ndarray:
         """Sample action using ODE integration.
         
-        The model predicts velocity v = x_1 - x_0 (constant for linear flow).
-        ODE: dx/dt = v, so x_t = x_0 + t * v
-        
-        For single-step at t=0:
-        x_1 = x_0 + 1.0 * v = x_0 + v
-        
-        For multi-step:
-        x_{t+dt} = x_t + dt * v
-        
         Args:
-            state: Current state
+            obs: Current observation
             num_steps: Number of ODE steps (default: self.num_inference_steps)
-            use_consistency: If True, use EMA model
+            use_ema: If True, use EMA model
             
         Returns:
             Sampled action
         """
-        if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state).to(self.device)
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-            
-        batch_size = state.shape[0]
+        state, image = self._parse_observation(obs)
+        batch_size = state.shape[0] if state is not None else image.shape[0]
+        
         num_steps = num_steps or self.num_inference_steps
         
         # Select which network to use
-        net = self.ema_velocity_net if (use_consistency and self.use_ema_teacher) else self.velocity_net
+        net = self.ema_velocity_net if (use_ema and self.use_ema_teacher) else self.velocity_net
         net.eval()
+        
+        # Pre-compute observation features
+        obs_features = self.obs_encoder(state=state, image=image)
         
         # Start from noise
         x = torch.randn(batch_size, self.action_dim, device=self.device)
@@ -312,32 +497,72 @@ class ConsistencyFlowPolicy(FlowMatchingPolicyBase):
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((batch_size,), i * dt, device=self.device)
-            
-            # Predict velocity (constant for linear flow, but may vary for learned flow)
-            v = net(state, x, t)
+            v = net(x, t, obs_features=obs_features)
             x = x + v * dt
         
         action = torch.clamp(x, -1.0, 1.0)
+        return action.cpu().numpy().squeeze()
+    
+    @torch.no_grad()
+    def sample_action_single_step(
+        self,
+        obs: Union[np.ndarray, Dict[str, np.ndarray]],
+        use_ema: bool = True
+    ) -> np.ndarray:
+        """Sample action in a single step (consistency model style).
+        
+        Args:
+            obs: Current observation
+            use_ema: If True, use EMA model
+            
+        Returns:
+            Sampled action
+        """
+        state, image = self._parse_observation(obs)
+        batch_size = state.shape[0] if state is not None else image.shape[0]
+        
+        net = self.ema_velocity_net if (use_ema and self.use_ema_teacher) else self.velocity_net
+        net.eval()
+        
+        obs_features = self.obs_encoder(state=state, image=image)
+        
+        # Start from noise
+        x_0 = torch.randn(batch_size, self.action_dim, device=self.device)
+        
+        # Single step at t=0: x_1 = x_0 + v(x_0, t=0)
+        t = torch.zeros(batch_size, device=self.device)
+        v = net(x_0, t, obs_features=obs_features)
+        x_1 = x_0 + v
+        
+        action = torch.clamp(x_1, -1.0, 1.0)
         return action.cpu().numpy().squeeze()
     
     def save(self, path: str):
         """Save model checkpoint."""
         checkpoint = {
             "velocity_net": self.velocity_net.state_dict(),
-            "consistency_net": self.consistency_net.state_dict(),
+            "obs_encoder": self.obs_encoder.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "obs_mode": self.obs_mode,
+            "config": {
+                "action_dim": self.action_dim,
+                "state_dim": self.state_dim,
+                "image_shape": self.image_shape,
+                "num_inference_steps": self.num_inference_steps,
+                "flow_batch_ratio": self.flow_batch_ratio,
+                "consistency_batch_ratio": self.consistency_batch_ratio,
+                "ema_decay": self.ema_decay,
+            },
         }
         if self.use_ema_teacher:
             checkpoint["ema_velocity_net"] = self.ema_velocity_net.state_dict()
-            checkpoint["ema_consistency_net"] = self.ema_consistency_net.state_dict()
         torch.save(checkpoint, path)
         
     def load(self, path: str):
         """Load model checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         self.velocity_net.load_state_dict(checkpoint["velocity_net"])
-        self.consistency_net.load_state_dict(checkpoint["consistency_net"])
+        self.obs_encoder.load_state_dict(checkpoint["obs_encoder"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         if self.use_ema_teacher and "ema_velocity_net" in checkpoint:
             self.ema_velocity_net.load_state_dict(checkpoint["ema_velocity_net"])
-            self.ema_consistency_net.load_state_dict(checkpoint["ema_consistency_net"])

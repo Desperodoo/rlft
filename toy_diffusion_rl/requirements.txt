@@ -11,6 +11,18 @@ pyyaml>=6.0
 matplotlib>=3.5.0
 tqdm>=4.64.0
 
+# Robotics environments (Stage 2: Pick-and-Place)
+gymnasium-robotics>=1.2.0
+mujoco>=2.3.0
+
+# Dataset storage
+h5py>=3.8.0
+
+# Vision encoders
+torchvision>=0.15.0
+timm>=0.9.0  # For DINOv2/DINOv3 pretrained models
+opencv-python>=4.8.0
+
 # Optional: TensorBoard logging
 # tensorboard>=2.10.0
 

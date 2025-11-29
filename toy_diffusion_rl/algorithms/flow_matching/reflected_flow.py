@@ -1,9 +1,14 @@
 """
-Reflected Flow Policy
+Unified Reflected Flow Policy
 
 Flow matching with boundary reflection for bounded action spaces.
 When the flow trajectory hits action bounds, it reflects back into
 the valid region, maintaining the density.
+
+Supports multiple observation modes:
+- "state": State vector only
+- "image": Image observation only  
+- "state_image": Both state and image (multimodal)
 
 References:
 - Reflected Flow Matching (inspired by rectified flow ideas)
@@ -11,15 +16,107 @@ References:
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple, Union
 
-from .base_flow import FlowMatchingPolicyBase
+try:
+    from ...common.networks import MLP, TimestepEmbedding
+    from ...common.obs_encoder import ObservationEncoder, create_obs_encoder
+except ImportError:
+    try:
+        from toy_diffusion_rl.common.networks import MLP, TimestepEmbedding
+        from toy_diffusion_rl.common.obs_encoder import ObservationEncoder, create_obs_encoder
+    except ImportError:
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        from common.networks import MLP, TimestepEmbedding
+        from common.obs_encoder import ObservationEncoder, create_obs_encoder
 
 
-class ReflectedFlowPolicy(FlowMatchingPolicyBase):
-    """Reflected Flow Policy for bounded action spaces.
+class MultiModalReflectedVelocityPredictor(nn.Module):
+    """Velocity predictor with multi-modal observation support for reflected flow.
+    
+    Uses TimestepEmbedding (sinusoidal + MLP) for consistency with
+    non-multimodal FlowVelocityPredictor.
+    
+    Args:
+        action_dim: Dimension of action space
+        hidden_dims: Hidden layer dimensions
+        time_embed_dim: Dimension of timestep embedding
+        obs_encoder: ObservationEncoder for processing observations
+        obs_dim: Fallback observation dimension if no encoder
+    """
+    
+    def __init__(
+        self,
+        action_dim: int,
+        hidden_dims: List[int] = [256, 256, 256],
+        time_embed_dim: int = 64,
+        obs_encoder: Optional[ObservationEncoder] = None,
+        obs_dim: int = 0,
+    ):
+        super().__init__()
+        
+        self.action_dim = action_dim
+        self.obs_encoder = obs_encoder
+        
+        if obs_encoder is not None:
+            obs_feature_dim = obs_encoder.output_dim
+        else:
+            obs_feature_dim = obs_dim
+        
+        self.obs_feature_dim = obs_feature_dim
+        
+        # Use TimestepEmbedding for consistency with non-multimodal version
+        self.time_embed = TimestepEmbedding(time_embed_dim)
+        
+        # Velocity prediction network
+        input_dim = obs_feature_dim + action_dim + time_embed_dim
+        self.net = MLP(
+            input_dim=input_dim,
+            output_dim=action_dim,
+            hidden_dims=hidden_dims,
+            activation=nn.SiLU(),
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+        image: Optional[torch.Tensor] = None,
+        obs_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict velocity at position x and time t.
+        
+        Args:
+            x: Current position in flow (B, action_dim)
+            t: Current timestep in [0, 1] (B,)
+            state: Optional state vector (B, state_dim)
+            image: Optional image tensor (B, C, H, W)
+            obs_features: Pre-computed observation features
+        
+        Returns:
+            Predicted velocity (B, action_dim)
+        """
+        if obs_features is not None:
+            features = obs_features
+        elif self.obs_encoder is not None:
+            features = self.obs_encoder(state=state, image=image)
+        else:
+            features = state
+        
+        # Use TimestepEmbedding (takes raw t, handles conversion internally)
+        t_embed = self.time_embed(t)
+        combined = torch.cat([features, x, t_embed], dim=-1)
+        return self.net(combined)
+
+
+class ReflectedFlowPolicy:
+    """Unified Reflected Flow Policy with multi-modal observation support.
     
     Extends vanilla flow matching with boundary reflection:
     - During training, actions that would go outside [-1, 1] are reflected
@@ -27,43 +124,140 @@ class ReflectedFlowPolicy(FlowMatchingPolicyBase):
     
     Two modes of reflection are supported:
     1. Hard reflection: Immediate bounce back at boundary
-    2. Soft reflection: Smooth penalty pushing trajectory back
+    2. Soft reflection: Smooth clamping (with gradient)
     
     Args:
-        state_dim: Dimension of state space
         action_dim: Dimension of action space
+        obs_mode: Observation mode ("state", "image", or "state_image")
+        state_dim: Dimension of state space (required for state/state_image)
+        image_shape: Image shape as (H, W, C) (required for image/state_image)
         hidden_dims: Hidden layer dimensions
-        learning_rate: Learning rate
         num_inference_steps: Number of ODE integration steps
         reflection_mode: 'hard' or 'soft'
         action_bounds: Action bounds (default: [-1, 1])
+        boundary_regularization: Weight for boundary regularization loss
+        vision_encoder_type: Type of vision encoder ("cnn" or "dinov2")
+        vision_output_dim: Output dimension of vision encoder
+        freeze_vision_encoder: Whether to freeze vision encoder
+        learning_rate: Learning rate
         device: Device for computation
     """
     
     def __init__(
         self,
-        state_dim: int,
         action_dim: int,
-        hidden_dims: list = [256, 256, 256],
-        learning_rate: float = 1e-4,
+        obs_mode: str = "state",
+        state_dim: Optional[int] = None,
+        image_shape: Optional[Tuple[int, int, int]] = None,
+        hidden_dims: List[int] = [256, 256, 256],
         num_inference_steps: int = 10,
         reflection_mode: str = "hard",
-        action_bounds: tuple = (-1.0, 1.0),
+        action_bounds: Tuple[float, float] = (-1.0, 1.0),
+        boundary_regularization: float = 0.1,
+        sigma_min: float = 0.001,
+        vision_encoder_type: str = "cnn",
+        vision_output_dim: int = 128,
+        freeze_vision_encoder: bool = False,
+        learning_rate: float = 1e-4,
         device: str = "cpu"
     ):
-        super().__init__(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            hidden_dims=hidden_dims,
-            learning_rate=learning_rate,
-            device=device
-        )
-        
+        self.action_dim = action_dim
+        self.obs_mode = obs_mode
+        self.state_dim = state_dim
+        self.image_shape = image_shape
         self.num_inference_steps = num_inference_steps
         self.reflection_mode = reflection_mode
         self.action_low = action_bounds[0]
         self.action_high = action_bounds[1]
+        self.boundary_regularization = boundary_regularization
+        self.sigma_min = sigma_min
+        self.device = device
         
+        # Create observation encoder
+        self.obs_encoder = create_obs_encoder(
+            obs_mode=obs_mode,
+            state_dim=state_dim,
+            image_shape=image_shape,
+            vision_encoder_type=vision_encoder_type,
+            vision_output_dim=vision_output_dim,
+            freeze_vision=freeze_vision_encoder,
+        ).to(device)
+        
+        # Velocity network
+        self.velocity_net = MultiModalReflectedVelocityPredictor(
+            action_dim=action_dim,
+            hidden_dims=hidden_dims,
+            obs_encoder=self.obs_encoder,
+        ).to(device)
+        
+        # Collect trainable parameters
+        trainable_params = list(self.velocity_net.parameters())
+        
+        if obs_mode in ["image", "state_image"] and not freeze_vision_encoder:
+            vision_params = [p for p in self.obs_encoder.vision_encoder.parameters() if p.requires_grad]
+            trainable_params.extend(vision_params)
+        
+        self.optimizer = torch.optim.Adam(trainable_params, lr=learning_rate)
+    
+    def _parse_observation(
+        self,
+        obs: Union[np.ndarray, Dict[str, np.ndarray], torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Parse observation into state and image tensors."""
+        state = None
+        image = None
+        
+        if self.obs_mode == "state":
+            if isinstance(obs, dict):
+                obs = obs.get("state", obs.get("obs", obs))
+            if isinstance(obs, np.ndarray):
+                state = torch.FloatTensor(obs).to(self.device)
+            else:
+                state = obs.to(self.device) if isinstance(obs, torch.Tensor) else torch.FloatTensor(obs).to(self.device)
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+                
+        elif self.obs_mode == "image":
+            if isinstance(obs, dict):
+                obs = obs.get("image", obs)
+            if isinstance(obs, np.ndarray):
+                if obs.ndim == 3 and obs.shape[-1] in [1, 3, 4]:
+                    obs = np.transpose(obs, (2, 0, 1))
+                image = torch.FloatTensor(obs).to(self.device)
+            else:
+                image = obs.to(self.device)
+            if image.max() > 1.0:
+                image = image / 255.0
+            if image.dim() == 3:
+                image = image.unsqueeze(0)
+                
+        else:  # state_image
+            if isinstance(obs, dict):
+                state_data = obs.get("state", obs.get("obs"))
+                image_data = obs.get("image")
+            else:
+                raise ValueError("For state_image mode, obs must be a dict")
+            
+            if isinstance(state_data, np.ndarray):
+                state = torch.FloatTensor(state_data).to(self.device)
+            else:
+                state = state_data.to(self.device)
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+            
+            if isinstance(image_data, np.ndarray):
+                if image_data.ndim == 3 and image_data.shape[-1] in [1, 3, 4]:
+                    image_data = np.transpose(image_data, (2, 0, 1))
+                image = torch.FloatTensor(image_data).to(self.device)
+            else:
+                image = image_data.to(self.device)
+            if image.max() > 1.0:
+                image = image / 255.0
+            if image.dim() == 3:
+                image = image.unsqueeze(0)
+        
+        return state, image
+    
     def _reflect_trajectory(
         self, 
         x: torch.Tensor, 
@@ -88,7 +282,8 @@ class ReflectedFlowPolicy(FlowMatchingPolicyBase):
         if self.reflection_mode == "hard":
             # Hard reflection: bounce back
             # Track how many times we cross each boundary
-            while True:
+            max_iterations = 10
+            for _ in range(max_iterations):
                 # Check lower bound
                 below_low = x_new < self.action_low
                 if below_low.any():
@@ -104,11 +299,9 @@ class ReflectedFlowPolicy(FlowMatchingPolicyBase):
                 # Check if all within bounds
                 if not (below_low.any() or above_high.any()):
                     break
-                    
-                # Safety: prevent infinite loops
-                if (x_new < self.action_low - 1).any() or (x_new > self.action_high + 1).any():
-                    x_new = torch.clamp(x_new, self.action_low, self.action_high)
-                    break
+            
+            # Final clamp for safety
+            x_new = torch.clamp(x_new, self.action_low, self.action_high)
         else:
             # Soft reflection: just clamp (with gradient)
             x_new = torch.clamp(x_new, self.action_low, self.action_high)
@@ -120,7 +313,7 @@ class ReflectedFlowPolicy(FlowMatchingPolicyBase):
         x_0: torch.Tensor,
         x_1: torch.Tensor,
         t: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute target velocity with reflection awareness.
         
         The target velocity is adjusted to account for reflections
@@ -132,9 +325,8 @@ class ReflectedFlowPolicy(FlowMatchingPolicyBase):
             t: Current timestep
             
         Returns:
-            Target velocity that accounts for reflection
+            Tuple of (target velocity, current position x_t)
         """
-        # For simplicity, we use a modified path that stays in bounds
         # Compute linear interpolation
         t_expand = t.unsqueeze(-1)
         x_t = (1 - t_expand) * x_0 + t_expand * x_1
@@ -153,14 +345,30 @@ class ReflectedFlowPolicy(FlowMatchingPolicyBase):
         """Train step with reflection-aware flow matching.
         
         Args:
-            batch: Dictionary with 'states' and 'actions' tensors
+            batch: Dictionary with observation and action tensors
             
         Returns:
             Dictionary of training metrics
         """
-        states = batch["states"]
-        actions = batch["actions"]  # Already bounded to [-1, 1]
-        batch_size = states.shape[0]
+        # Parse batch
+        states = batch.get("states", batch.get("obs", batch.get("state")))
+        images = batch.get("images", batch.get("image"))
+        actions = batch["actions"] if "actions" in batch else batch["action"]
+        
+        if states is not None:
+            states = states.to(self.device)
+        if images is not None:
+            images = images.to(self.device)
+            if images.dim() == 4 and images.shape[-1] in [1, 3, 4]:
+                images = images.permute(0, 3, 1, 2)
+            if images.max() > 1.0:
+                images = images / 255.0
+        actions = actions.to(self.device)
+        
+        # Pre-compute observation features
+        obs_features = self.obs_encoder(state=states, image=images)
+        
+        batch_size = actions.shape[0]
         
         # Sample noise (can be larger than action bounds)
         x_0 = torch.randn_like(actions)
@@ -172,29 +380,27 @@ class ReflectedFlowPolicy(FlowMatchingPolicyBase):
         target_v, x_t = self._compute_reflected_target(x_0, actions, t)
         
         # Predict velocity
-        predicted_v = self.velocity_net(states, x_t, t)
+        predicted_v = self.velocity_net(x_t, t, obs_features=obs_features)
         
-        # Loss
+        # Main loss
         loss = F.mse_loss(predicted_v, target_v)
         
         # Add boundary regularization loss
         # Encourage velocities that point inward at boundaries
-        boundary_mask = (x_t <= self.action_low + 0.1) | (x_t >= self.action_high - 0.1)
-        if boundary_mask.any():
-            # At lower bound, velocity should be positive
-            # At upper bound, velocity should be negative
-            lower_mask = x_t <= self.action_low + 0.1
-            upper_mask = x_t >= self.action_high - 0.1
+        if self.boundary_regularization > 0:
+            boundary_margin = 0.1
+            lower_mask = x_t <= self.action_low + boundary_margin
+            upper_mask = x_t >= self.action_high - boundary_margin
             
             boundary_loss = 0.0
             if lower_mask.any():
-                # Penalize negative velocities at lower bound
-                boundary_loss += F.relu(-predicted_v[lower_mask]).mean() * 0.1
+                # At lower bound, velocity should be positive
+                boundary_loss = boundary_loss + F.relu(-predicted_v[lower_mask]).mean()
             if upper_mask.any():
-                # Penalize positive velocities at upper bound
-                boundary_loss += F.relu(predicted_v[upper_mask]).mean() * 0.1
+                # At upper bound, velocity should be negative
+                boundary_loss = boundary_loss + F.relu(predicted_v[upper_mask]).mean()
                 
-            loss = loss + boundary_loss
+            loss = loss + self.boundary_regularization * boundary_loss
         
         # Optimize
         self.optimizer.zero_grad()
@@ -207,27 +413,27 @@ class ReflectedFlowPolicy(FlowMatchingPolicyBase):
     @torch.no_grad()
     def sample_action(
         self,
-        state: np.ndarray,
+        obs: Union[np.ndarray, Dict[str, np.ndarray]],
         num_steps: Optional[int] = None
     ) -> np.ndarray:
         """Sample action with reflected integration.
         
         Args:
-            state: Current state
+            obs: Current observation
             num_steps: Number of integration steps
             
         Returns:
             Sampled action
         """
-        if isinstance(state, np.ndarray):
-            state = torch.FloatTensor(state).to(self.device)
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-            
+        state, image = self._parse_observation(obs)
+        batch_size = state.shape[0] if state is not None else image.shape[0]
+        
         self.velocity_net.eval()
         num_steps = num_steps or self.num_inference_steps
         
-        batch_size = state.shape[0]
+        # Pre-compute observation features
+        obs_features = self.obs_encoder(state=state, image=image)
+        
         dt = 1.0 / num_steps
         
         # Start from noise
@@ -235,12 +441,37 @@ class ReflectedFlowPolicy(FlowMatchingPolicyBase):
         
         for i in range(num_steps):
             t = torch.full((batch_size,), i * dt, device=self.device)
-            v = self.velocity_net(state, x, t)
+            v = self.velocity_net(x, t, obs_features=obs_features)
             
             # Apply reflection during integration
             x = self._reflect_trajectory(x, v, dt)
-            
+        
         # Final clamp for safety
         x = torch.clamp(x, self.action_low, self.action_high)
         
         return x.cpu().numpy().squeeze()
+    
+    def save(self, path: str):
+        """Save model checkpoint."""
+        checkpoint = {
+            "velocity_net": self.velocity_net.state_dict(),
+            "obs_encoder": self.obs_encoder.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "obs_mode": self.obs_mode,
+            "config": {
+                "action_dim": self.action_dim,
+                "state_dim": self.state_dim,
+                "image_shape": self.image_shape,
+                "num_inference_steps": self.num_inference_steps,
+                "reflection_mode": self.reflection_mode,
+                "action_bounds": (self.action_low, self.action_high),
+            },
+        }
+        torch.save(checkpoint, path)
+        
+    def load(self, path: str):
+        """Load model checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.velocity_net.load_state_dict(checkpoint["velocity_net"])
+        self.obs_encoder.load_state_dict(checkpoint["obs_encoder"])
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
