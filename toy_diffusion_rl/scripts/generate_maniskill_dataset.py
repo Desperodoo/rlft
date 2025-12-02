@@ -37,7 +37,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -65,73 +65,223 @@ def to_numpy(x):
 
 
 class ManiSkillScriptedExpert:
-    """Improved scripted expert policy for ManiSkill3 PickCube task.
+    """Scripted expert policy for ManiSkill3 PickCube task.
+    
+    PickCube is a "pick and hold" task - the goal is to pick up the cube
+    and hold it at a goal position in the AIR (not place it down).
     
     Uses privileged state information to compute actions:
     1. Move to pre-grasp position above cube
-    2. Lower and close gripper
-    3. Lift and move to goal
-    4. Lower and release
+    2. Lower to cube
+    3. Close gripper
+    4. Move to goal position (in the air) and hold
     
-    This policy works with the raw ManiSkill3 observation dict.
+    This policy works with both:
+    - Raw ManiSkill3 observation dict (state_dict mode)
+    - Flat state tensor (state mode) with known structure
+    
+    Flat state structure for PickCube-v1 (42 dims):
+    - [0:9]   qpos (joint positions)
+    - [9:18]  qvel (joint velocities)  
+    - [18:19] is_grasped
+    - [19:26] tcp_pose (3 pos + 4 quat)
+    - [26:29] goal_pos
+    - [29:36] obj_pose (3 pos + 4 quat)
+    - [36:39] tcp_to_obj_pos
+    - [39:42] obj_to_goal_pos
+    
+    Action space (pd_ee_delta_pose): [dx, dy, dz, dax, day, daz, gripper]
+    - position delta: world frame
+    - rotation delta: axis-angle in end-effector frame
     """
+    
+    # Indices for flat state tensor
+    TCP_POS_IDX = 19  # tcp_pose[:3]
+    TCP_QUAT_IDX = 22  # tcp_pose[3:7] - quaternion (w, x, y, z) or (x, y, z, w)
+    GOAL_POS_IDX = 26  # goal_pos
+    OBJ_POS_IDX = 29   # obj_pose[:3]
+    OBJ_QUAT_IDX = 32  # obj_pose[3:7]
+    
+    # Target orientation: gripper pointing down
+    # ManiSkill3 uses (x, y, z, w) quaternion format
+    # Initial gripper pose is approximately (x=0, y=1, z=0, w=0) - 180 deg around Y axis
+    # This corresponds to gripper pointing down with fingers along X axis
+    # We want to maintain this orientation
+    TARGET_QUAT_XYZW = np.array([0.0, 1.0, 0.0, 0.0])  # (x, y, z, w) - 180 deg around Y
     
     def __init__(
         self,
         approach_height: float = 0.08,
         grasp_height: float = 0.02,
-        lift_height: float = 0.15,
         position_gain: float = 10.0,
+        orientation_gain: float = 0.5,  # Lower gain for smoother orientation correction
         max_action: float = 1.0,
+        use_orientation_control: bool = True,
     ):
         self.approach_height = approach_height
         self.grasp_height = grasp_height
-        self.lift_height = lift_height
         self.position_gain = position_gain
+        self.orientation_gain = orientation_gain
         self.max_action = max_action
+        self.use_orientation_control = use_orientation_control
         
         self.phase = 0
         self.grasp_counter = 0
+        # Store initial cube position for reference
+        self.initial_cube_z = None
     
     def reset(self):
         """Reset policy state for new episode."""
         self.phase = 0
         self.grasp_counter = 0
+        self.initial_cube_z = None
     
-    def get_action(
+    @staticmethod
+    def quat_xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
+        """Convert quaternion from (x, y, z, w) to (w, x, y, z) format."""
+        return np.array([q[3], q[0], q[1], q[2]])
+    
+    @staticmethod
+    def quat_wxyz_to_xyzw(q: np.ndarray) -> np.ndarray:
+        """Convert quaternion from (w, x, y, z) to (x, y, z, w) format."""
+        return np.array([q[1], q[2], q[3], q[0]])
+    
+    @staticmethod
+    def quat_to_axis_angle(q: np.ndarray) -> np.ndarray:
+        """Convert quaternion (w, x, y, z) to axis-angle representation.
+        
+        Args:
+            q: Quaternion [w, x, y, z]
+            
+        Returns:
+            axis_angle: [ax, ay, az] where magnitude is the angle
+        """
+        # Normalize quaternion
+        q = q / (np.linalg.norm(q) + 1e-8)
+        w, x, y, z = q
+        
+        # Compute angle
+        angle = 2.0 * np.arccos(np.clip(abs(w), -1.0, 1.0))
+        
+        # Compute axis
+        sin_half = np.sin(angle / 2.0)
+        if sin_half < 1e-6:
+            return np.zeros(3)
+        
+        axis = np.array([x, y, z]) / sin_half
+        
+        # Handle quaternion sign ambiguity
+        if w < 0:
+            angle = -angle
+        
+        return axis * angle
+    
+    @staticmethod
+    def quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+        """Multiply two quaternions (w, x, y, z format)."""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        ])
+    
+    @staticmethod
+    def quat_conjugate(q: np.ndarray) -> np.ndarray:
+        """Compute quaternion conjugate (inverse for unit quaternion)."""
+        return np.array([q[0], -q[1], -q[2], -q[3]])
+    
+    def compute_orientation_error(
+        self,
+        current_quat_xyzw: np.ndarray,
+        target_quat_xyzw: np.ndarray = None,
+    ) -> np.ndarray:
+        """Compute orientation error as axis-angle.
+        
+        Args:
+            current_quat_xyzw: Current orientation [x, y, z, w] (ManiSkill3 format)
+            target_quat_xyzw: Target orientation [x, y, z, w], defaults to pointing down
+            
+        Returns:
+            axis_angle: Rotation error [dax, day, daz]
+        """
+        if target_quat_xyzw is None:
+            target_quat_xyzw = self.TARGET_QUAT_XYZW
+        
+        # Convert to (w, x, y, z) format for computation
+        current_quat = self.quat_xyzw_to_wxyz(current_quat_xyzw)
+        target_quat = self.quat_xyzw_to_wxyz(target_quat_xyzw)
+        
+        # Normalize quaternions
+        current_quat = current_quat / (np.linalg.norm(current_quat) + 1e-8)
+        target_quat = target_quat / (np.linalg.norm(target_quat) + 1e-8)
+        
+        # Compute relative rotation: q_error = q_target * q_current^-1
+        q_error = self.quat_multiply(target_quat, self.quat_conjugate(current_quat))
+        
+        # Convert to axis-angle
+        return self.quat_to_axis_angle(q_error)
+    
+    def _extract_positions_from_flat(
+        self,
+        obs: np.ndarray,
+        env_idx: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Extract gripper, cube, goal positions and TCP quaternion from flat state tensor.
+        
+        Args:
+            obs: Flat state tensor of shape (num_envs, 42) or (42,)
+            env_idx: Environment index
+            
+        Returns:
+            gripper_pos, cube_pos, goal_pos, tcp_quat (each shape (3,) or (4,))
+        """
+        if isinstance(obs, torch.Tensor):
+            obs = obs.cpu().numpy()
+        if obs.ndim > 1:
+            obs = obs[env_idx]
+        
+        gripper_pos = obs[self.TCP_POS_IDX:self.TCP_POS_IDX + 3].copy()
+        goal_pos = obs[self.GOAL_POS_IDX:self.GOAL_POS_IDX + 3].copy()
+        cube_pos = obs[self.OBJ_POS_IDX:self.OBJ_POS_IDX + 3].copy()
+        
+        # Extract TCP quaternion (assuming w, x, y, z format)
+        tcp_quat = obs[self.TCP_QUAT_IDX:self.TCP_QUAT_IDX + 4].copy()
+        
+        return gripper_pos, cube_pos, goal_pos, tcp_quat
+    
+    def _extract_positions_from_dict(
         self,
         raw_obs: Dict,
         env_idx: int = 0,
-    ) -> np.ndarray:
-        """Compute expert action from raw ManiSkill3 observation.
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Extract gripper, cube, goal positions and TCP quaternion from observation dict.
         
         Args:
-            raw_obs: Raw observation dict from ManiSkill3
-            env_idx: Environment index for batched observations
-        
+            raw_obs: Raw observation dict from ManiSkill3 (state_dict mode)
+            env_idx: Environment index
+            
         Returns:
-            Action array (7,) for pd_ee_delta_pose: [dx, dy, dz, dax, day, daz, gripper]
+            gripper_pos, cube_pos, goal_pos, tcp_quat (each shape (3,) or (4,))
         """
-        # Extract positions from observation
         extra = raw_obs.get("extra", {})
         
-        # Get TCP (end-effector) position
+        # Get TCP (end-effector) pose (position + quaternion)
         tcp_pose = extra.get("tcp_pose", None)
         if tcp_pose is None:
-            # Fallback: use agent qpos
-            agent = raw_obs.get("agent", {})
-            qpos = agent.get("qpos", np.zeros(9))
-            if isinstance(qpos, torch.Tensor):
-                qpos = qpos.cpu().numpy()
-            if qpos.ndim > 1:
-                qpos = qpos[env_idx]
-            gripper_pos = np.array([0.0, 0.0, 0.1])  # Default
+            gripper_pos = np.array([0.0, 0.0, 0.1])
+            tcp_quat = np.array([1.0, 0.0, 0.0, 0.0])  # identity quaternion
         else:
             if isinstance(tcp_pose, torch.Tensor):
                 tcp_pose = tcp_pose.cpu().numpy()
             if tcp_pose.ndim > 1:
                 tcp_pose = tcp_pose[env_idx]
-            gripper_pos = tcp_pose[:3]
+            gripper_pos = tcp_pose[:3].copy()
+            # tcp_pose is [x, y, z, qw, qx, qy, qz] or [x, y, z, qx, qy, qz, qw]
+            # ManiSkill3 uses (w, x, y, z) convention internally
+            tcp_quat = tcp_pose[3:7].copy()
         
         # Get cube position
         obj_pose = extra.get("obj_pose", None)
@@ -142,34 +292,64 @@ class ManiSkillScriptedExpert:
                 obj_pose = obj_pose.cpu().numpy()
             if obj_pose.ndim > 1:
                 obj_pose = obj_pose[env_idx]
-            cube_pos = obj_pose[:3]
+            cube_pos = obj_pose[:3].copy()
         
         # Get goal position
         goal_pos = extra.get("goal_pos", None)
         if goal_pos is None:
-            goal_pos = cube_pos + np.array([0.1, 0.1, 0.1])
+            goal_pos = cube_pos + np.array([0.1, 0.1, 0.2])
         else:
             if isinstance(goal_pos, torch.Tensor):
                 goal_pos = goal_pos.cpu().numpy()
             if goal_pos.ndim > 1:
                 goal_pos = goal_pos[env_idx]
             if len(goal_pos.shape) > 0 and goal_pos.shape[-1] >= 3:
-                goal_pos = goal_pos[:3]
+                goal_pos = goal_pos[:3].copy()
+        
+        return gripper_pos, cube_pos, goal_pos, tcp_quat
+    
+    def get_action(
+        self,
+        obs: Union[Dict, np.ndarray, torch.Tensor],
+        env_idx: int = 0,
+    ) -> np.ndarray:
+        """Compute expert action from observation.
+        
+        Args:
+            obs: Either a dict (state_dict mode) or tensor/array (state mode)
+            env_idx: Environment index for batched observations
+        
+        Returns:
+            Action array (7,) for pd_ee_delta_pose: [dx, dy, dz, dax, day, daz, gripper]
+        """
+        # Extract positions and orientation based on observation type
+        if isinstance(obs, dict):
+            gripper_pos, cube_pos, goal_pos, tcp_quat = self._extract_positions_from_dict(obs, env_idx)
+        else:
+            gripper_pos, cube_pos, goal_pos, tcp_quat = self._extract_positions_from_flat(obs, env_idx)
+        
+        # Store initial cube z position
+        if self.initial_cube_z is None:
+            self.initial_cube_z = cube_pos[2]
         
         # Initialize action
         action = np.zeros(7, dtype=np.float32)
         
-        # Compute position errors
+        # Compute orientation correction to maintain gripper pointing down
+        if self.use_orientation_control:
+            # Compute orientation error as axis-angle
+            orientation_error = self.compute_orientation_error(tcp_quat)
+            # Apply orientation correction (scaled by gain)
+            action[3:6] = self.orientation_gain * orientation_error
+        
+        # Compute target positions
         cube_above = cube_pos.copy()
-        cube_above[2] += self.approach_height
+        cube_above[2] = self.initial_cube_z + self.approach_height
         
         cube_grasp = cube_pos.copy()
-        cube_grasp[2] += self.grasp_height
+        cube_grasp[2] = self.initial_cube_z + self.grasp_height
         
-        goal_above = goal_pos.copy()
-        goal_above[2] = max(goal_above[2], cube_pos[2] + self.lift_height)
-        
-        # Phase 0: Move to pre-grasp position
+        # Phase 0: Move to pre-grasp position (above cube)
         if self.phase == 0:
             delta = cube_above - gripper_pos
             action[:3] = self.position_gain * delta
@@ -178,7 +358,7 @@ class ManiSkillScriptedExpert:
             if np.linalg.norm(delta) < 0.02:
                 self.phase = 1
         
-        # Phase 1: Lower to grasp
+        # Phase 1: Lower to grasp position
         elif self.phase == 1:
             delta = cube_grasp - gripper_pos
             action[:3] = self.position_gain * delta
@@ -197,31 +377,17 @@ class ManiSkillScriptedExpert:
             if self.grasp_counter > 10:
                 self.phase = 3
         
-        # Phase 3: Lift and move to goal
+        # Phase 3: Move to goal position (in the air) and HOLD
         elif self.phase == 3:
-            delta = goal_above - gripper_pos
-            action[:3] = self.position_gain * delta
-            action[6] = -1.0  # Keep closed
-            
-            if np.linalg.norm(delta[:2]) < 0.02 and delta[2] < 0.02:
-                self.phase = 4
-        
-        # Phase 4: Lower to goal
-        elif self.phase == 4:
             delta = goal_pos - gripper_pos
             action[:3] = self.position_gain * delta
-            action[6] = -1.0  # Keep closed
+            action[6] = -1.0  # Keep closed - don't let go!
             
-            if np.linalg.norm(delta) < 0.03:
-                self.phase = 5
-        
-        # Phase 5: Release
-        elif self.phase == 5:
-            action[:3] = 0.0
-            action[6] = 1.0  # Open gripper
+            # Stay in this phase - keep holding at goal position
         
         # Clip actions
         action[:3] = np.clip(action[:3], -self.max_action, self.max_action)
+        action[3:6] = np.clip(action[3:6], -self.max_action, self.max_action)  # Clip rotation
         action[6] = np.clip(action[6], -1.0, 1.0)
         
         return action
@@ -321,11 +487,18 @@ def collect_episodes_parallel(
     num_envs: int = 16,
     verbose: bool = True,
 ) -> Dict[str, List]:
-    """Collect episodes with parallel environments.
+    """Collect episodes with parallel environments using ManiSkillVectorEnv.
     
-    Note: This is more complex due to asynchronous episode endings.
-    For simplicity, we collect a fixed number of steps and track episodes.
+    Uses the official ManiSkillVectorEnv wrapper with auto_reset=True to properly
+    handle episode resets. When an episode ends, next_obs is the new episode's
+    initial observation, and info["final_observation"] contains the old episode's
+    final observation.
     """
+    from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
+    
+    # Wrap environment with ManiSkillVectorEnv for proper auto-reset behavior
+    vec_env = ManiSkillVectorEnv(env, auto_reset=True, ignore_terminations=False)
+    
     data = {
         "obs": [],
         "next_obs": [],
@@ -340,127 +513,178 @@ def collect_episodes_parallel(
         data["images"] = []
         data["next_images"] = []
     
-    # Per-environment tracking
-    env_episode_ids = np.zeros(num_envs, dtype=np.int32)
+    # Per-environment tracking - each env gets a unique episode ID
+    env_episode_ids = np.arange(num_envs, dtype=np.int32)  # [0, 1, ..., num_envs-1]
     env_timesteps = np.zeros(num_envs, dtype=np.int32)
     env_experts = [ManiSkillScriptedExpert() for _ in range(num_envs)]
     
-    current_episode = 0
+    # Next available episode ID
+    next_episode_id = num_envs
+    completed_episodes = 0
     successes = 0
     
-    obs, info = env.reset()
+    obs, info = vec_env.reset()
     
     # Reset all experts
     for exp in env_experts:
         exp.reset()
     
-    steps_per_episode = max_episode_steps
-    total_steps_needed = num_episodes * steps_per_episode
-    steps_collected = 0
-    
     pbar = tqdm(total=num_episodes, desc="Collecting episodes") if verbose else None
     
-    while current_episode < num_episodes:
-        # Get actions for all environments
-        raw_obs = info.get("raw_obs", obs)
+    while completed_episodes < num_episodes:
+        # For expert policy, we need privileged state info (obj_pose, etc.)
+        # Access the base ManiSkill environment observation which contains full state info
+        # including obj_pose in the 'extra' dict
+        try:
+            privileged_obs = vec_env.base_env.get_obs()
+        except AttributeError:
+            # Fallback: if base_env doesn't exist, try to unwrap
+            if hasattr(vec_env, 'env'):
+                try:
+                    privileged_obs = vec_env.env.unwrapped.get_obs()
+                except:
+                    privileged_obs = obs  # Last resort fallback
+            else:
+                privileged_obs = obs
         
+        # Get actions from expert policy using privileged observation
         actions = []
         for i in range(num_envs):
-            action = env_experts[i].get_action(raw_obs, env_idx=i)
+            action = env_experts[i].get_action(privileged_obs, env_idx=i)
             actions.append(action)
         actions = np.stack(actions, axis=0)
         
-        # Store current observations (convert Tensor to numpy if needed)
+        # Prepare observations for storage
         if obs_mode == "state":
-            state = obs if not isinstance(obs, dict) else obs
-            state_np = to_numpy(state)
-            for i in range(num_envs):
-                if env_episode_ids[i] < num_episodes:
-                    data["obs"].append(state_np[i].copy() if state_np.ndim > 1 else state_np.copy())
+            state_np = to_numpy(obs)
         elif obs_mode == "image":
-            image = obs if not isinstance(obs, dict) else obs
-            image_np = to_numpy(image)
-            for i in range(num_envs):
-                if env_episode_ids[i] < num_episodes:
-                    data["images"].append(image_np[i].copy() if image_np.ndim > 3 else image_np.copy())
+            image_np = to_numpy(obs)
         else:  # state_image
             state_np = to_numpy(obs["state"])
             image_np = to_numpy(obs["image"])
-            for i in range(num_envs):
-                if env_episode_ids[i] < num_episodes:
-                    data["obs"].append(state_np[i].copy())
-                    data["images"].append(image_np[i].copy())
         
         # Step all environments
         actions_tensor = torch.from_numpy(actions).float()
-        if torch.cuda.is_available():
+        # Make sure actions are on the same device as the environment
+        if hasattr(vec_env, 'device'):
+            actions_tensor = actions_tensor.to(vec_env.device)
+        elif torch.cuda.is_available():
             actions_tensor = actions_tensor.cuda()
         
-        next_obs, rewards, terminated, truncated, info = env.step(actions_tensor)
+        next_obs, rewards, terminated, truncated, info = vec_env.step(actions_tensor)
         
-        # Convert to numpy first to avoid cross-GPU tensor operations
+        # Convert to numpy
         if isinstance(terminated, torch.Tensor):
             terminated = terminated.cpu().numpy()
         if isinstance(truncated, torch.Tensor):
             truncated = truncated.cpu().numpy()
         dones = terminated | truncated
         
-        # Convert rewards to numpy
         if isinstance(rewards, torch.Tensor):
             rewards = rewards.cpu().numpy()
         
-        # Store transitions (convert Tensor to numpy if needed)
+        # Get final observations for environments that just ended
+        # With auto_reset=True, next_obs is the NEW episode's initial obs
+        # info["final_observation"] contains the OLD episode's final obs
+        final_obs_available = "final_observation" in info
+        if final_obs_available:
+            final_obs = info["final_observation"]
+            if obs_mode == "state":
+                final_state_np = to_numpy(final_obs)
+            elif obs_mode == "image":
+                final_image_np = to_numpy(final_obs)
+            else:  # state_image
+                final_state_np = to_numpy(final_obs["state"]) if isinstance(final_obs, dict) else to_numpy(final_obs)
+                final_image_np = to_numpy(final_obs["image"]) if isinstance(final_obs, dict) else None
+        
+        # Prepare next observations for storage (for non-done envs)
         if obs_mode == "state":
-            next_state = next_obs if not isinstance(next_obs, dict) else next_obs
-            next_state_np = to_numpy(next_state)
+            next_state_np = to_numpy(next_obs)
         elif obs_mode == "image":
-            next_image = next_obs if not isinstance(next_obs, dict) else next_obs
-            next_image_np = to_numpy(next_image)
+            next_image_np = to_numpy(next_obs)
         else:  # state_image
             next_state_np = to_numpy(next_obs["state"])
             next_image_np = to_numpy(next_obs["image"])
         
+        # Store transitions for each environment
         for i in range(num_envs):
+            # Only store if this environment's episode is still needed
             if env_episode_ids[i] < num_episodes:
+                # Store current observation
                 if obs_mode == "state":
-                    data["next_obs"].append(next_state_np[i].copy() if next_state_np.ndim > 1 else next_state_np.copy())
+                    data["obs"].append(state_np[i].copy())
                 elif obs_mode == "image":
-                    data["next_images"].append(next_image_np[i].copy() if next_image_np.ndim > 3 else next_image_np.copy())
+                    data["images"].append(image_np[i].copy())
+                else:  # state_image
+                    data["obs"].append(state_np[i].copy())
+                    data["images"].append(image_np[i].copy())
+                
+                # Store next observation
+                # For done environments, use final_observation from info
+                is_done = dones[i]
+                if is_done and final_obs_available:
+                    # Use final observation from the completed episode
+                    if obs_mode == "state":
+                        data["next_obs"].append(final_state_np[i].copy())
+                    elif obs_mode == "image":
+                        data["next_images"].append(final_image_np[i].copy() if final_image_np is not None else next_image_np[i].copy())
+                    else:
+                        data["next_obs"].append(final_state_np[i].copy())
+                        data["next_images"].append(final_image_np[i].copy() if final_image_np is not None else next_image_np[i].copy())
                 else:
-                    data["next_obs"].append(next_state_np[i].copy())
-                    data["next_images"].append(next_image_np[i].copy())
+                    # Use next_obs for continuing episodes
+                    if obs_mode == "state":
+                        data["next_obs"].append(next_state_np[i].copy())
+                    elif obs_mode == "image":
+                        data["next_images"].append(next_image_np[i].copy())
+                    else:
+                        data["next_obs"].append(next_state_np[i].copy())
+                        data["next_images"].append(next_image_np[i].copy())
                 
                 data["actions"].append(actions[i].copy())
                 data["rewards"].append(float(rewards[i]))
-                data["dones"].append(bool(dones[i]))
+                data["dones"].append(is_done)
                 data["episode_ids"].append(int(env_episode_ids[i]))
                 data["timesteps"].append(int(env_timesteps[i]))
                 
                 env_timesteps[i] += 1
                 
                 # Check if episode ended
-                if dones[i] or env_timesteps[i] >= max_episode_steps:
-                    # Check success
-                    if isinstance(info, dict):
-                        success = info.get("success", np.zeros(num_envs))
-                        if isinstance(success, torch.Tensor):
-                            success = success.cpu().numpy()
-                        if success[i] or rewards[i] > 0:
-                            successes += 1
+                if is_done:
+                    # Check success from final_info
+                    if "final_info" in info:
+                        final_info = info["final_info"]
+                        if isinstance(final_info, dict):
+                            success = final_info.get("success", np.zeros(num_envs))
+                            if isinstance(success, torch.Tensor):
+                                success = success.cpu().numpy()
+                            if hasattr(success, '__len__') and len(success) > i:
+                                if success[i]:
+                                    successes += 1
+                            elif success:
+                                successes += 1
                     
-                    # Reset this environment's tracking
-                    env_episode_ids[i] = current_episode + 1
-                    env_timesteps[i] = 0
-                    env_experts[i].reset()
-                    
-                    current_episode += 1
+                    completed_episodes += 1
                     if pbar:
                         pbar.update(1)
                     
-                    if current_episode >= num_episodes:
-                        break
+                    # Assign new episode ID to this environment
+                    if next_episode_id < num_episodes:
+                        env_episode_ids[i] = next_episode_id
+                        next_episode_id += 1
+                    else:
+                        env_episode_ids[i] = num_episodes  # Mark as done
+                    
+                    env_timesteps[i] = 0
+                    # Reset expert for this environment
+                    # next_obs[i] is already the new episode's initial observation
+                    env_experts[i].reset()
         
         obs = next_obs
+        
+        # Early exit if all needed episodes are collected
+        if completed_episodes >= num_episodes:
+            break
     
     if pbar:
         pbar.close()
@@ -485,8 +709,14 @@ def save_dataset(
         obs_mode: Observation mode
         compression: Compression algorithm
     """
+    import json
+    
     # Create output directory if needed
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    
+    # Compute episode statistics
+    episode_ids = np.array(data["episode_ids"])
+    unique_episodes = len(np.unique(episode_ids))
     
     with h5py.File(output_path, "w") as f:
         # Store observations
@@ -514,16 +744,26 @@ def save_dataset(
         f.create_dataset("episode_ids", data=np.array(data["episode_ids"], dtype=np.int32), compression=compression)
         f.create_dataset("timesteps", data=np.array(data["timesteps"], dtype=np.int32), compression=compression)
         
-        # Store metadata
+        # Store metadata as JSON string for compatibility with load_dataset
+        metadata = {
+            "obs_mode": obs_mode,
+            "num_episodes": unique_episodes,
+            "num_transitions": len(data["actions"]),
+            "task": "PickCube-v1",
+            "control_mode": "pd_ee_delta_pose",
+        }
+        f.attrs["metadata"] = json.dumps(metadata)
+        
+        # Also store as individual attrs for backwards compatibility
         f.attrs["obs_mode"] = obs_mode
-        f.attrs["num_episodes"] = len(set(data["episode_ids"]))
+        f.attrs["num_episodes"] = unique_episodes
         f.attrs["num_transitions"] = len(data["actions"])
         f.attrs["task"] = "PickCube-v1"
         f.attrs["control_mode"] = "pd_ee_delta_pose"
     
     print(f"\nDataset saved to: {output_path}")
     print(f"  - Observation mode: {obs_mode}")
-    print(f"  - Number of episodes: {len(set(data['episode_ids']))}")
+    print(f"  - Number of episodes: {unique_episodes}")
     print(f"  - Number of transitions: {len(data['actions'])}")
     
     if "obs" in data and data["obs"]:

@@ -225,6 +225,12 @@ class DiffusionDoubleQAgent:
         rewards = rewards.to(self.device)
         dones = dones.to(self.device)
         
+        # Ensure rewards and dones have shape (B, 1) for correct broadcasting with Q-values
+        if rewards.dim() == 1:
+            rewards = rewards.unsqueeze(-1)
+        if dones.dim() == 1:
+            dones = dones.unsqueeze(-1)
+        
         # Update Critics
         with torch.no_grad():
             next_obs_features = self.obs_encoder(state=next_states, image=next_images)

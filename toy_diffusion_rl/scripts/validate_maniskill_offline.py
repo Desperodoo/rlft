@@ -5,6 +5,11 @@ Validate All Diffusion/Flow RL Algorithms on ManiSkill3 PickCube Task (Offline)
 This script tests all unified algorithm implementations on the ManiSkill3 PickCube-v1
 robotics task with state_image (multimodal) observation mode.
 
+Features:
+- Video recording of evaluation episodes (first 3 episodes per eval)
+- Detailed loss metrics tracking (main_loss, bc_loss, q_loss, critic_loss, etc.)
+- Multi-panel training progress visualization
+
 Algorithms (Behavior Cloning / Offline RL):
 1. Diffusion Policy (BC baseline)
 2. Flow Matching Policy (BC baseline)
@@ -29,7 +34,9 @@ Usage:
         --dataset_path data/maniskill_pickcube_1000.h5 \
         --obs_mode state_image \
         --num_steps 50000 \
-        --eval_interval 5000
+        --eval_interval 5000 \
+        --record_video \
+        --video_dir ./results/videos
 """
 
 # Filter third-party deprecation warnings before imports
@@ -43,14 +50,17 @@ import os
 import sys
 import argparse
 import copy
+import json
 import numpy as np
 import torch
 import torch.nn.functional as F
 import h5py
+import cv2
 import matplotlib.pyplot as plt
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
 from tqdm import tqdm
+from collections import defaultdict
 
 # Add parent directory to path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -175,6 +185,31 @@ def prepare_batch(
     return batch
 
 
+def save_video(frames: List[np.ndarray], video_path: str, fps: int = 30) -> None:
+    """Save frames as video using OpenCV.
+    
+    Args:
+        frames: List of RGB frames, each (H, W, 3) numpy array
+        video_path: Output video path (.mp4)
+        fps: Frames per second
+    """
+    if not frames:
+        return
+    
+    os.makedirs(os.path.dirname(video_path), exist_ok=True)
+    
+    height, width = frames[0].shape[:2]
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+    
+    for frame in frames:
+        # Convert RGB to BGR for OpenCV
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        video_writer.write(frame_bgr)
+    
+    video_writer.release()
+
+
 def evaluate_agent(
     agent,
     env,
@@ -182,9 +217,14 @@ def evaluate_agent(
     num_episodes: int = 10,
     max_steps: int = 50,
     use_pretrain_sample: bool = False,
-    verbose: bool = False
-) -> Dict[str, float]:
-    """Evaluate agent on ManiSkill3 environment.
+    verbose: bool = False,
+    record_video: bool = False,
+    video_dir: Optional[str] = None,
+    algo_name: str = "Agent",
+    eval_step: int = 0,
+    num_video_episodes: int = 3,
+) -> Dict[str, Any]:
+    """Evaluate agent on ManiSkill3 environment with optional video recording.
     
     Args:
         agent: Agent to evaluate
@@ -194,23 +234,52 @@ def evaluate_agent(
         max_steps: Max steps per episode
         use_pretrain_sample: Use sample_action_pretrain for DPPO/ReinFlow
         verbose: Print per-episode info
+        record_video: Whether to record videos
+        video_dir: Directory to save videos
+        algo_name: Algorithm name for video naming
+        eval_step: Current training step (for video naming)
+        num_video_episodes: Number of episodes to record (hardcoded first N)
         
     Returns:
         Dict with:
             - success_rate: Fraction of successful episodes
             - avg_reward: Average episode reward
             - avg_length: Average episode length
+            - episode_rewards: List of per-episode rewards
+            - episode_successes: List of per-episode success flags
     """
     successes = 0
     total_reward = 0
     total_length = 0
+    episode_rewards = []
+    episode_successes = []
     
     for ep in range(num_episodes):
         obs, info = env.reset()
         ep_reward = 0
         success = False
+        frames = []
+        
+        # Record video only for first N episodes
+        should_record = record_video and ep < num_video_episodes and video_dir is not None
         
         for step in range(max_steps):
+            # Capture frame for video (before action)
+            if should_record:
+                try:
+                    frame = env.render()
+                    if frame is not None:
+                        if isinstance(frame, torch.Tensor):
+                            frame = frame.cpu().numpy()
+                        if frame.dtype != np.uint8:
+                            if frame.max() <= 1.0:
+                                frame = (frame * 255).astype(np.uint8)
+                            else:
+                                frame = frame.astype(np.uint8)
+                        frames.append(frame)
+                except Exception:
+                    pass  # Skip if render fails
+            
             # Prepare observation for agent
             if obs_mode == "state":
                 agent_obs = obs
@@ -239,13 +308,39 @@ def evaluate_agent(
                 success = True
             
             if terminated or truncated:
+                # Capture final frame
+                if should_record:
+                    try:
+                        frame = env.render()
+                        if frame is not None:
+                            if isinstance(frame, torch.Tensor):
+                                frame = frame.cpu().numpy()
+                            if frame.dtype != np.uint8:
+                                if frame.max() <= 1.0:
+                                    frame = (frame * 255).astype(np.uint8)
+                                else:
+                                    frame = frame.astype(np.uint8)
+                            frames.append(frame)
+                    except Exception:
+                        pass
                 break
         
         total_length += step + 1
         total_reward += ep_reward
+        episode_rewards.append(ep_reward)
+        episode_successes.append(success)
         
         if success:
             successes += 1
+        
+        # Save video for this episode
+        if should_record and frames:
+            status = "success" if success else "fail"
+            video_subdir = os.path.join(video_dir, algo_name, f"step_{eval_step:06d}")
+            video_path = os.path.join(video_subdir, f"ep_{ep+1:02d}_{status}.mp4")
+            save_video(frames, video_path, fps=30)
+            if verbose:
+                print(f"    Saved video: {video_path}")
         
         if verbose:
             print(f"  Episode {ep+1}: reward={ep_reward:.2f}, length={step+1}, success={success}")
@@ -254,6 +349,8 @@ def evaluate_agent(
         "success_rate": successes / num_episodes,
         "avg_reward": total_reward / num_episodes,
         "avg_length": total_length / num_episodes,
+        "episode_rewards": episode_rewards,
+        "episode_successes": episode_successes,
     }
 
 
@@ -270,6 +367,8 @@ def train_and_evaluate_all(
     seed: int = 42,
     checkpoint_dir: Optional[str] = None,
     max_episode_steps: int = 50,
+    record_video: bool = False,
+    video_dir: Optional[str] = None,
 ) -> Tuple[Dict[str, Dict[str, List]], Dict[str, Dict[str, Any]]]:
     """Train all algorithms and track metrics.
     
@@ -286,6 +385,8 @@ def train_and_evaluate_all(
         seed: Random seed
         checkpoint_dir: Directory to save best checkpoints
         max_episode_steps: Max steps per episode
+        record_video: Whether to record evaluation videos
+        video_dir: Directory to save videos (required if record_video=True)
         
     Returns:
         Tuple of:
@@ -296,6 +397,11 @@ def train_and_evaluate_all(
     best_checkpoints = {}
     batch_size = 128
     n_samples = len(dataset["actions"])
+    
+    # Setup video directory
+    if record_video and video_dir:
+        os.makedirs(video_dir, exist_ok=True)
+        print(f"Video recording enabled, saving to: {video_dir}")
     
     # Create checkpoint directory
     if checkpoint_dir:
@@ -340,22 +446,34 @@ def train_and_evaluate_all(
     print(f"Training {algo_name}...")
     print(f"{'='*60}")
     
-    results[algo_name] = {"steps": [], "success_rate": [], "avg_reward": []}
+    results[algo_name] = {
+        "steps": [], "success_rate": [], "avg_reward": [],
+        "main_loss": []  # Track main training loss
+    }
+    loss_buffer = []  # Buffer to collect losses between evals
     best_success = -1.0
     
     try:
         agent = DiffusionPolicyAgent(
-            num_diffusion_steps=20,
+            num_diffusion_steps=100,
             **common_kwargs
         )
         
         for step in tqdm(range(num_steps + 1), desc=algo_name):
             if step in eval_steps:
-                metrics = evaluate_agent(agent, eval_env, obs_mode, eval_episodes, max_episode_steps)
+                metrics = evaluate_agent(
+                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                    record_video=record_video, video_dir=video_dir,
+                    algo_name=algo_name, eval_step=step
+                )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
                 results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}")
+                # Record average loss since last eval
+                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                results[algo_name]["main_loss"].append(avg_loss)
+                loss_buffer.clear()
+                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
                 
                 if metrics["success_rate"] > best_success:
                     best_success = metrics["success_rate"]
@@ -367,14 +485,16 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": False,
                         "agent_class": "DiffusionPolicyAgent",
-                        "agent_kwargs": {"num_diffusion_steps": 20, **common_kwargs},
+                        "agent_kwargs": {"num_diffusion_steps": 100, **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
                 batch = prepare_batch(dataset, idx, obs_mode, device)
-                agent.train_step(batch)
+                train_info = agent.train_step(batch)
+                if train_info and "loss" in train_info:
+                    loss_buffer.append(train_info["loss"])
                 
     except Exception as e:
         print(f"  Error: {e}")
@@ -387,7 +507,11 @@ def train_and_evaluate_all(
     print(f"Training {algo_name}...")
     print(f"{'='*60}")
     
-    results[algo_name] = {"steps": [], "success_rate": [], "avg_reward": []}
+    results[algo_name] = {
+        "steps": [], "success_rate": [], "avg_reward": [],
+        "main_loss": []
+    }
+    loss_buffer = []
     best_success = -1.0
     
     try:
@@ -398,11 +522,18 @@ def train_and_evaluate_all(
         
         for step in tqdm(range(num_steps + 1), desc=algo_name):
             if step in eval_steps:
-                metrics = evaluate_agent(agent, eval_env, obs_mode, eval_episodes, max_episode_steps)
+                metrics = evaluate_agent(
+                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                    record_video=record_video, video_dir=video_dir,
+                    algo_name=algo_name, eval_step=step
+                )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
                 results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}")
+                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                results[algo_name]["main_loss"].append(avg_loss)
+                loss_buffer.clear()
+                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
                 
                 if metrics["success_rate"] > best_success:
                     best_success = metrics["success_rate"]
@@ -421,7 +552,9 @@ def train_and_evaluate_all(
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
                 batch = prepare_batch(dataset, idx, obs_mode, device)
-                agent.train_step(batch)
+                train_info = agent.train_step(batch)
+                if train_info and "loss" in train_info:
+                    loss_buffer.append(train_info["loss"])
                 
     except Exception as e:
         print(f"  Error: {e}")
@@ -434,7 +567,11 @@ def train_and_evaluate_all(
     print(f"Training {algo_name}...")
     print(f"{'='*60}")
     
-    results[algo_name] = {"steps": [], "success_rate": [], "avg_reward": []}
+    results[algo_name] = {
+        "steps": [], "success_rate": [], "avg_reward": [],
+        "main_loss": []
+    }
+    loss_buffer = []
     best_success = -1.0
     
     try:
@@ -447,11 +584,18 @@ def train_and_evaluate_all(
         
         for step in tqdm(range(num_steps + 1), desc=algo_name):
             if step in eval_steps:
-                metrics = evaluate_agent(agent, eval_env, obs_mode, eval_episodes, max_episode_steps)
+                metrics = evaluate_agent(
+                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                    record_video=record_video, video_dir=video_dir,
+                    algo_name=algo_name, eval_step=step
+                )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
                 results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}")
+                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                results[algo_name]["main_loss"].append(avg_loss)
+                loss_buffer.clear()
+                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
                 
                 if metrics["success_rate"] > best_success:
                     best_success = metrics["success_rate"]
@@ -470,7 +614,9 @@ def train_and_evaluate_all(
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
                 batch = prepare_batch(dataset, idx, obs_mode, device)
-                agent.train_step(batch)
+                train_info = agent.train_step(batch)
+                if train_info and "loss" in train_info:
+                    loss_buffer.append(train_info["loss"])
                 
     except Exception as e:
         print(f"  Error: {e}")
@@ -483,7 +629,11 @@ def train_and_evaluate_all(
     print(f"Training {algo_name}...")
     print(f"{'='*60}")
     
-    results[algo_name] = {"steps": [], "success_rate": [], "avg_reward": []}
+    results[algo_name] = {
+        "steps": [], "success_rate": [], "avg_reward": [],
+        "main_loss": []
+    }
+    loss_buffer = []
     best_success = -1.0
     
     try:
@@ -495,11 +645,18 @@ def train_and_evaluate_all(
         
         for step in tqdm(range(num_steps + 1), desc=algo_name):
             if step in eval_steps:
-                metrics = evaluate_agent(agent, eval_env, obs_mode, eval_episodes, max_episode_steps)
+                metrics = evaluate_agent(
+                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                    record_video=record_video, video_dir=video_dir,
+                    algo_name=algo_name, eval_step=step
+                )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
                 results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}")
+                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                results[algo_name]["main_loss"].append(avg_loss)
+                loss_buffer.clear()
+                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
                 
                 if metrics["success_rate"] > best_success:
                     best_success = metrics["success_rate"]
@@ -518,7 +675,9 @@ def train_and_evaluate_all(
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
                 batch = prepare_batch(dataset, idx, obs_mode, device)
-                agent.train_step(batch)
+                train_info = agent.train_step(batch)
+                if train_info and "loss" in train_info:
+                    loss_buffer.append(train_info["loss"])
                 
     except Exception as e:
         print(f"  Error: {e}")
@@ -531,22 +690,45 @@ def train_and_evaluate_all(
     print(f"Training {algo_name}...")
     print(f"{'='*60}")
     
-    results[algo_name] = {"steps": [], "success_rate": [], "avg_reward": []}
+    results[algo_name] = {
+        "steps": [], "success_rate": [], "avg_reward": [],
+        "main_loss": [], "critic_loss": [], "actor_loss": [],
+        "bc_loss": [], "q_loss": [], "q_mean": []
+    }
+    loss_buffers = defaultdict(list)
     best_success = -1.0
     
     try:
         agent = DiffusionDoubleQAgent(
-            num_diffusion_steps=20,
+            num_diffusion_steps=100,
             **common_kwargs
         )
         
         for step in tqdm(range(num_steps + 1), desc=algo_name):
             if step in eval_steps:
-                metrics = evaluate_agent(agent, eval_env, obs_mode, eval_episodes, max_episode_steps)
+                metrics = evaluate_agent(
+                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                    record_video=record_video, video_dir=video_dir,
+                    algo_name=algo_name, eval_step=step
+                )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
                 results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}")
+                
+                # Aggregate loss metrics
+                for key in ["critic_loss", "actor_loss", "bc_loss", "q_loss", "q_mean"]:
+                    avg_val = np.mean(loss_buffers[key]) if loss_buffers[key] else 0.0
+                    results[algo_name][key].append(avg_val)
+                # main_loss is the sum of critic_loss + actor_loss
+                main_loss = np.mean(loss_buffers["critic_loss"]) + np.mean(loss_buffers["actor_loss"]) if loss_buffers["critic_loss"] else 0.0
+                results[algo_name]["main_loss"].append(main_loss)
+                
+                # Clear buffers
+                for key in loss_buffers:
+                    loss_buffers[key].clear()
+                
+                q_mean_val = results[algo_name]["q_mean"][-1]
+                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={main_loss:.4f}, Q={q_mean_val:.2f}")
                 
                 if metrics["success_rate"] > best_success:
                     best_success = metrics["success_rate"]
@@ -558,14 +740,18 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": False,
                         "agent_class": "DiffusionDoubleQAgent",
-                        "agent_kwargs": {"num_diffusion_steps": 20, **common_kwargs},
+                        "agent_kwargs": {"num_diffusion_steps": 100, **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
                 batch = prepare_batch(dataset, idx, obs_mode, device)
-                agent.train_step(batch)
+                train_info = agent.train_step(batch)
+                if train_info:
+                    for key in ["critic_loss", "actor_loss", "bc_loss", "q_loss", "q_mean"]:
+                        if key in train_info:
+                            loss_buffers[key].append(train_info[key])
                 
     except Exception as e:
         print(f"  Error: {e}")
@@ -578,7 +764,11 @@ def train_and_evaluate_all(
     print(f"Training {algo_name}...")
     print(f"{'='*60}")
     
-    results[algo_name] = {"steps": [], "success_rate": [], "avg_reward": []}
+    results[algo_name] = {
+        "steps": [], "success_rate": [], "avg_reward": [],
+        "main_loss": [], "q_loss": [], "flow_loss": [], "consistency_loss": []
+    }
+    loss_buffers = defaultdict(list)
     best_success = -1.0
     
     try:
@@ -591,11 +781,29 @@ def train_and_evaluate_all(
         
         for step in tqdm(range(num_steps + 1), desc=algo_name):
             if step in eval_steps:
-                metrics = evaluate_agent(agent, eval_env, obs_mode, eval_episodes, max_episode_steps)
+                metrics = evaluate_agent(
+                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                    record_video=record_video, video_dir=video_dir,
+                    algo_name=algo_name, eval_step=step
+                )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
                 results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}")
+                
+                # Aggregate loss metrics
+                for key in ["q_loss", "flow_loss", "consistency_loss"]:
+                    avg_val = np.mean(loss_buffers[key]) if loss_buffers[key] else 0.0
+                    results[algo_name][key].append(avg_val)
+                # main_loss is the sum
+                main_loss = sum(np.mean(loss_buffers[k]) if loss_buffers[k] else 0.0 
+                               for k in ["q_loss", "flow_loss", "consistency_loss"])
+                results[algo_name]["main_loss"].append(main_loss)
+                
+                # Clear buffers
+                for key in loss_buffers:
+                    loss_buffers[key].clear()
+                
+                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={main_loss:.4f}")
                 
                 if metrics["success_rate"] > best_success:
                     best_success = metrics["success_rate"]
@@ -614,7 +822,11 @@ def train_and_evaluate_all(
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
                 batch = prepare_batch(dataset, idx, obs_mode, device)
-                agent.train_step(batch)
+                train_info = agent.train_step(batch)
+                if train_info:
+                    for key in ["q_loss", "flow_loss", "consistency_loss"]:
+                        if key in train_info:
+                            loss_buffers[key].append(train_info[key])
                 
     except Exception as e:
         print(f"  Error: {e}")
@@ -627,12 +839,16 @@ def train_and_evaluate_all(
     print(f"Training {algo_name} (BC pretrain only)...")
     print(f"{'='*60}")
     
-    results[algo_name] = {"steps": [], "success_rate": [], "avg_reward": []}
+    results[algo_name] = {
+        "steps": [], "success_rate": [], "avg_reward": [],
+        "main_loss": []
+    }
+    loss_buffer = []
     best_success = -1.0
     
     try:
         agent = DPPOAgent(
-            num_diffusion_steps=10,
+            num_diffusion_steps=100,
             ft_denoising_steps=5,
             **common_kwargs
         )
@@ -647,11 +863,18 @@ def train_and_evaluate_all(
         
         for step in tqdm(range(num_steps + 1), desc=algo_name):
             if step in eval_steps:
-                metrics = evaluate_agent(agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True)
+                metrics = evaluate_agent(
+                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True,
+                    record_video=record_video, video_dir=video_dir,
+                    algo_name=algo_name, eval_step=step
+                )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
                 results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}")
+                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                results[algo_name]["main_loss"].append(avg_loss)
+                loss_buffer.clear()
+                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
                 
                 if metrics["success_rate"] > best_success:
                     best_success = metrics["success_rate"]
@@ -663,7 +886,7 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": True,
                         "agent_class": "DPPOAgent",
-                        "agent_kwargs": {"num_diffusion_steps": 10, "ft_denoising_steps": 5, **common_kwargs},
+                        "agent_kwargs": {"num_diffusion_steps": 100, "ft_denoising_steps": 5, **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
@@ -690,6 +913,8 @@ def train_and_evaluate_all(
                 dppo_optimizer.zero_grad()
                 loss.backward()
                 dppo_optimizer.step()
+                
+                loss_buffer.append(loss.item())
         
         # Freeze actor after pretraining
         for p in agent.actor.parameters():
@@ -706,7 +931,11 @@ def train_and_evaluate_all(
     print(f"Training {algo_name} (BC pretrain only)...")
     print(f"{'='*60}")
     
-    results[algo_name] = {"steps": [], "success_rate": [], "avg_reward": []}
+    results[algo_name] = {
+        "steps": [], "success_rate": [], "avg_reward": [],
+        "main_loss": []
+    }
+    loss_buffer = []
     best_success = -1.0
     
     try:
@@ -723,11 +952,18 @@ def train_and_evaluate_all(
         
         for step in tqdm(range(num_steps + 1), desc=algo_name):
             if step in eval_steps:
-                metrics = evaluate_agent(agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True)
+                metrics = evaluate_agent(
+                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True,
+                    record_video=record_video, video_dir=video_dir,
+                    algo_name=algo_name, eval_step=step
+                )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
                 results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}")
+                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                results[algo_name]["main_loss"].append(avg_loss)
+                loss_buffer.clear()
+                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
                 
                 if metrics["success_rate"] > best_success:
                     best_success = metrics["success_rate"]
@@ -765,6 +1001,8 @@ def train_and_evaluate_all(
                 pretrain_optimizer.zero_grad()
                 loss.backward()
                 pretrain_optimizer.step()
+                
+                loss_buffer.append(loss.item())
                 
     except Exception as e:
         print(f"  Error: {e}")
@@ -816,7 +1054,12 @@ def plot_training_progress(
     save_path: str,
     title: str = "ManiSkill3 PickCube Training Progress"
 ):
-    """Plot training progress curves for all algorithms."""
+    """Plot training progress curves for all algorithms with multiple metrics.
+    
+    Creates a 2x3 grid showing:
+    - Success Rate, Average Reward, Main Training Loss (top row)
+    - BC/Actor Loss, Critic/Q Loss, Q Value Mean (bottom row)
+    """
     # Filter algorithms that have results
     algorithms = [name for name in results.keys() if results[name].get("steps")]
     
@@ -836,43 +1079,122 @@ def plot_training_progress(
         '#7f7f7f',  # Gray
     ]
     
-    # Create figure
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    # Create figure with 2x3 subplots
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     
-    # Plot Success Rate
-    ax1 = axes[0]
+    # ============ Row 1: Success Rate, Reward, Main Loss ============
+    
+    # Plot 1: Success Rate
+    ax1 = axes[0, 0]
     for i, algo_name in enumerate(algorithms):
         steps = results[algo_name]["steps"]
-        success_rates = results[algo_name]["success_rate"]
+        success_rates = results[algo_name].get("success_rate", [])
         if steps and success_rates:
             color = colors[i % len(colors)]
             ax1.plot(steps, [s * 100 for s in success_rates], 
-                    label=algo_name, color=color, marker='o', markersize=4, linewidth=2)
-    
-    ax1.set_xlabel("Training Steps", fontsize=12)
-    ax1.set_ylabel("Success Rate (%)", fontsize=12)
-    ax1.set_title("Success Rate vs Training Steps", fontsize=13)
-    ax1.legend(loc='best', fontsize=9)
+                    label=algo_name, color=color, marker='o', markersize=3, linewidth=1.5)
+    ax1.set_xlabel("Training Steps", fontsize=11)
+    ax1.set_ylabel("Success Rate (%)", fontsize=11)
+    ax1.set_title("Success Rate", fontsize=12, fontweight='bold')
+    ax1.legend(loc='best', fontsize=8)
     ax1.grid(True, alpha=0.3)
     ax1.set_ylim(-5, 105)
     
-    # Plot Average Reward
-    ax2 = axes[1]
+    # Plot 2: Average Reward
+    ax2 = axes[0, 1]
     for i, algo_name in enumerate(algorithms):
         steps = results[algo_name]["steps"]
-        avg_rewards = results[algo_name]["avg_reward"]
+        avg_rewards = results[algo_name].get("avg_reward", [])
         if steps and avg_rewards:
             color = colors[i % len(colors)]
             ax2.plot(steps, avg_rewards, 
-                    label=algo_name, color=color, marker='o', markersize=4, linewidth=2)
-    
-    ax2.set_xlabel("Training Steps", fontsize=12)
-    ax2.set_ylabel("Average Reward", fontsize=12)
-    ax2.set_title("Average Reward vs Training Steps", fontsize=13)
-    ax2.legend(loc='best', fontsize=9)
+                    label=algo_name, color=color, marker='o', markersize=3, linewidth=1.5)
+    ax2.set_xlabel("Training Steps", fontsize=11)
+    ax2.set_ylabel("Average Reward", fontsize=11)
+    ax2.set_title("Average Reward", fontsize=12, fontweight='bold')
+    ax2.legend(loc='best', fontsize=8)
     ax2.grid(True, alpha=0.3)
     
-    plt.suptitle(title, fontsize=14, y=1.02)
+    # Plot 3: Main Training Loss
+    ax3 = axes[0, 2]
+    for i, algo_name in enumerate(algorithms):
+        steps = results[algo_name]["steps"]
+        main_loss = results[algo_name].get("main_loss", [])
+        if steps and main_loss:
+            color = colors[i % len(colors)]
+            ax3.plot(steps, main_loss, 
+                    label=algo_name, color=color, marker='o', markersize=3, linewidth=1.5)
+    ax3.set_xlabel("Training Steps", fontsize=11)
+    ax3.set_ylabel("Loss", fontsize=11)
+    ax3.set_title("Main Training Loss", fontsize=12, fontweight='bold')
+    ax3.legend(loc='best', fontsize=8)
+    ax3.grid(True, alpha=0.3)
+    
+    # ============ Row 2: BC/Actor Loss, Critic/Q Loss, Q Mean ============
+    
+    # Plot 4: BC Loss / Actor Loss (for RL algorithms)
+    ax4 = axes[1, 0]
+    has_bc_data = False
+    for i, algo_name in enumerate(algorithms):
+        steps = results[algo_name]["steps"]
+        # Try bc_loss first, then actor_loss
+        bc_loss = results[algo_name].get("bc_loss", results[algo_name].get("actor_loss", []))
+        if steps and bc_loss and any(v != 0 for v in bc_loss):
+            color = colors[i % len(colors)]
+            ax4.plot(steps, bc_loss, 
+                    label=algo_name, color=color, marker='o', markersize=3, linewidth=1.5)
+            has_bc_data = True
+    ax4.set_xlabel("Training Steps", fontsize=11)
+    ax4.set_ylabel("Loss", fontsize=11)
+    ax4.set_title("BC / Actor Loss", fontsize=12, fontweight='bold')
+    if has_bc_data:
+        ax4.legend(loc='best', fontsize=8)
+    else:
+        ax4.text(0.5, 0.5, "No BC/Actor loss data", ha='center', va='center', transform=ax4.transAxes)
+    ax4.grid(True, alpha=0.3)
+    
+    # Plot 5: Critic / Q Loss
+    ax5 = axes[1, 1]
+    has_q_data = False
+    for i, algo_name in enumerate(algorithms):
+        steps = results[algo_name]["steps"]
+        # Try critic_loss first, then q_loss
+        q_loss = results[algo_name].get("critic_loss", results[algo_name].get("q_loss", []))
+        if steps and q_loss and any(v != 0 for v in q_loss):
+            color = colors[i % len(colors)]
+            ax5.plot(steps, q_loss, 
+                    label=algo_name, color=color, marker='o', markersize=3, linewidth=1.5)
+            has_q_data = True
+    ax5.set_xlabel("Training Steps", fontsize=11)
+    ax5.set_ylabel("Loss", fontsize=11)
+    ax5.set_title("Critic / Q Loss", fontsize=12, fontweight='bold')
+    if has_q_data:
+        ax5.legend(loc='best', fontsize=8)
+    else:
+        ax5.text(0.5, 0.5, "No Critic/Q loss data\n(BC algorithms only)", ha='center', va='center', transform=ax5.transAxes)
+    ax5.grid(True, alpha=0.3)
+    
+    # Plot 6: Q Value Mean
+    ax6 = axes[1, 2]
+    has_qval_data = False
+    for i, algo_name in enumerate(algorithms):
+        steps = results[algo_name]["steps"]
+        q_mean = results[algo_name].get("q_mean", [])
+        if steps and q_mean and any(v != 0 for v in q_mean):
+            color = colors[i % len(colors)]
+            ax6.plot(steps, q_mean, 
+                    label=algo_name, color=color, marker='o', markersize=3, linewidth=1.5)
+            has_qval_data = True
+    ax6.set_xlabel("Training Steps", fontsize=11)
+    ax6.set_ylabel("Q Value", fontsize=11)
+    ax6.set_title("Q Value Mean", fontsize=12, fontweight='bold')
+    if has_qval_data:
+        ax6.legend(loc='best', fontsize=8)
+    else:
+        ax6.text(0.5, 0.5, "No Q value data\n(BC algorithms only)", ha='center', va='center', transform=ax6.transAxes)
+    ax6.grid(True, alpha=0.3)
+    
+    plt.suptitle(title, fontsize=14, y=1.02, fontweight='bold')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -899,6 +1221,9 @@ def main():
     parser.add_argument("--device", type=str, default="auto", help="Device (auto/cuda/cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output_dir", type=str, default="./results", help="Output directory")
+    # New arguments for video recording
+    parser.add_argument("--record_video", action="store_true", help="Record evaluation videos (first 3 episodes per eval)")
+    parser.add_argument("--video_dir", type=str, default=None, help="Directory to save videos (default: output_dir/videos)")
     
     args = parser.parse_args()
     
@@ -937,6 +1262,13 @@ def main():
     else:
         image_shape = (128, 128, 3)
     
+    # Setup video directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.record_video:
+        video_dir = args.video_dir if args.video_dir else os.path.join(args.output_dir, f"videos_{timestamp}")
+    else:
+        video_dir = None
+    
     print(f"\nConfiguration:")
     print(f"  Dataset: {args.dataset_path}")
     print(f"  Observation mode: {args.obs_mode}")
@@ -946,9 +1278,11 @@ def main():
     print(f"  Training steps: {args.num_steps}")
     print(f"  Eval interval: {args.eval_interval}")
     print(f"  Eval episodes: {args.eval_episodes}")
+    print(f"  Record video: {args.record_video}")
+    if video_dir:
+        print(f"  Video directory: {video_dir}")
     
     # Create checkpoint directory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     checkpoint_dir = os.path.join(args.output_dir, f"maniskill_checkpoints_{timestamp}")
     
     # Train and evaluate
@@ -965,6 +1299,8 @@ def main():
         seed=args.seed,
         checkpoint_dir=checkpoint_dir,
         max_episode_steps=args.max_episode_steps,
+        record_video=args.record_video,
+        video_dir=video_dir,
     )
     
     # Print summary
@@ -977,6 +1313,14 @@ def main():
         f"maniskill_pickcube_{args.obs_mode}_{timestamp}.json"
     )
     save_results(results, output_path)
+    
+    # Save detailed metrics as JSON (includes all loss metrics)
+    detailed_path = os.path.join(
+        args.output_dir,
+        f"detailed_metrics_{timestamp}.json"
+    )
+    save_results(results, detailed_path)
+    print(f"Detailed metrics saved to {detailed_path}")
     
     # Plot training progress
     plot_path = os.path.join(
