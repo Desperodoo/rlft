@@ -51,7 +51,7 @@ def collect_rollout_vecenv(
     
     Example:
         >>> from envs.maniskill_env import make_maniskill_env
-        >>> vec_env = make_maniskill_env(obs_mode="state_image", num_envs=16, use_numpy=False)
+        >>> vec_env = make_maniskill_env(obs_mode="state_image", num_envs=16)
         >>> buffer = collect_rollout_vecenv(agent, vec_env, rollout_steps=256)
         >>> metrics = agent.update(buffer)
     """
@@ -77,10 +77,11 @@ def collect_rollout_vecenv(
     
     for step in range(rollout_steps):
         # Convert observation to proper format for agent
+        # Note: ManiSkill3 uses "rgb" key, but we support "image" for backward compatibility
         if obs_mode == "state_image":
             if isinstance(obs, dict):
                 state_batch = obs["state"]
-                image_batch = obs["image"]
+                image_batch = obs.get("rgb", obs.get("image"))
             else:
                 raise ValueError("Expected dict observation for state_image mode")
         elif obs_mode == "state":
@@ -88,7 +89,7 @@ def collect_rollout_vecenv(
             image_batch = None
         else:  # image
             state_batch = None
-            image_batch = obs if not isinstance(obs, dict) else obs.get("image", obs)
+            image_batch = obs if not isinstance(obs, dict) else obs.get("rgb", obs.get("image"))
         
         # Sample actions from agent (batched)
         with torch.no_grad():
@@ -174,11 +175,12 @@ def collect_rollout_vecenv(
     # Compute last values for GAE
     with torch.no_grad():
         if obs_mode == "state_image":
-            agent_obs = {"state": obs["state"], "image": obs["image"]}
+            image_batch = obs.get("rgb", obs.get("image"))
+            agent_obs = {"state": obs["state"], "image": image_batch}
         elif obs_mode == "state":
             agent_obs = obs if not isinstance(obs, dict) else obs.get("state", obs)
         else:
-            agent_obs = obs if not isinstance(obs, dict) else obs.get("image", obs)
+            agent_obs = obs if not isinstance(obs, dict) else obs.get("rgb", obs.get("image"))
         
         _, _, last_values = _sample_action_batched(agent, agent_obs, obs_mode, device)
         if isinstance(last_values, torch.Tensor):
@@ -230,17 +232,18 @@ def _sample_action_batched(
     """Sample actions for a batch of observations.
     
     Handles the batched input/output for vectorized environments.
+    Note: Supports both "rgb" (ManiSkill3) and "image" keys for compatibility.
     """
     # Parse observations based on mode
     if obs_mode == "state_image":
         state = obs["state"] if isinstance(obs, dict) else None
-        image = obs["image"] if isinstance(obs, dict) else None
+        image = obs.get("rgb", obs.get("image")) if isinstance(obs, dict) else None
     elif obs_mode == "state":
         state = obs
         image = None
     else:
         state = None
-        image = obs
+        image = obs.get("rgb", obs.get("image")) if isinstance(obs, dict) else obs
     
     # Convert to tensors if needed
     if state is not None:

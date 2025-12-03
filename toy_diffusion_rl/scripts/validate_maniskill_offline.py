@@ -81,6 +81,7 @@ from toy_diffusion_rl.algorithms.diffusion_double_q.agent import DiffusionDouble
 from toy_diffusion_rl.algorithms.cpql.agent import CPQLAgent
 from toy_diffusion_rl.algorithms.dppo.agent import DPPOAgent
 from toy_diffusion_rl.algorithms.reinflow.agent import ReinFlowAgent
+from toy_diffusion_rl.common.normalizer import DataNormalizer, create_normalizer_from_dataset
 
 
 def set_seed(seed: int):
@@ -145,7 +146,8 @@ def prepare_batch(
     dataset: Dict[str, np.ndarray],
     indices: np.ndarray,
     obs_mode: str,
-    device: str
+    device: str,
+    normalizer: Optional[DataNormalizer] = None
 ) -> Dict[str, torch.Tensor]:
     """Prepare a batch for training.
     
@@ -154,30 +156,53 @@ def prepare_batch(
         indices: Batch indices
         obs_mode: "state" or "state_image"
         device: Target device
+        normalizer: Optional normalizer for actions and states
         
     Returns:
-        Batch dictionary with tensors
+        Batch dictionary with tensors (normalized if normalizer provided)
     """
     batch = {}
     
     # Actions (always present)
-    batch["actions"] = torch.FloatTensor(dataset["actions"][indices]).to(device)
+    actions = torch.FloatTensor(dataset["actions"][indices]).to(device)
     batch["rewards"] = torch.FloatTensor(dataset["rewards"][indices]).to(device)
     batch["dones"] = torch.FloatTensor(dataset["dones"][indices]).to(device)
     
+    # Apply action normalization if normalizer is provided
+    if normalizer is not None:
+        batch["actions"] = normalizer.normalize_action(actions)
+    else:
+        batch["actions"] = actions
+    
     if obs_mode == "state":
-        batch["states"] = torch.FloatTensor(dataset["obs"][indices]).to(device)
+        states = torch.FloatTensor(dataset["obs"][indices]).to(device)
+        if normalizer is not None:
+            batch["states"] = normalizer.normalize_state(states)
+        else:
+            batch["states"] = states
         if "next_obs" in dataset:
-            batch["next_states"] = torch.FloatTensor(dataset["next_obs"][indices]).to(device)
+            next_states = torch.FloatTensor(dataset["next_obs"][indices]).to(device)
+            if normalizer is not None:
+                batch["next_states"] = normalizer.normalize_state(next_states)
+            else:
+                batch["next_states"] = next_states
     
     else:  # state_image
-        batch["states"] = torch.FloatTensor(dataset["obs"][indices]).to(device)
+        states = torch.FloatTensor(dataset["obs"][indices]).to(device)
+        if normalizer is not None:
+            batch["states"] = normalizer.normalize_state(states)
+        else:
+            batch["states"] = states
         
         images = dataset["images"][indices].astype(np.float32) / 255.0
         batch["images"] = torch.FloatTensor(images).permute(0, 3, 1, 2).contiguous().to(device)
         
         if "next_obs" in dataset:
-            batch["next_states"] = torch.FloatTensor(dataset["next_obs"][indices]).to(device)
+            next_states = torch.FloatTensor(dataset["next_obs"][indices]).to(device)
+            if normalizer is not None:
+                batch["next_states"] = normalizer.normalize_state(next_states)
+            else:
+                batch["next_states"] = next_states
         if "next_images" in dataset:
             next_images = dataset["next_images"][indices].astype(np.float32) / 255.0
             batch["next_images"] = torch.FloatTensor(next_images).permute(0, 3, 1, 2).contiguous().to(device)
@@ -223,22 +248,27 @@ def evaluate_agent(
     algo_name: str = "Agent",
     eval_step: int = 0,
     num_video_episodes: int = 3,
+    normalizer: Optional[DataNormalizer] = None,
 ) -> Dict[str, Any]:
-    """Evaluate agent on ManiSkill3 environment with optional video recording.
+    """Evaluate agent on ManiSkill3 VecEnv with optional video recording.
+    
+    Uses vectorized environment for efficient parallel evaluation. Handles
+    auto_reset by checking info["final_info"]["success"] for completed episodes.
     
     Args:
         agent: Agent to evaluate
-        env: ManiSkill3 environment (single env with use_numpy=True)
-        obs_mode: Observation mode
-        num_episodes: Number of evaluation episodes
-        max_steps: Max steps per episode
+        env: ManiSkill3 VecEnv (num_envs >= 1)
+        obs_mode: Observation mode ("state" or "state_image")
+        num_episodes: Total number of evaluation episodes to collect
+        max_steps: Max steps per episode (for timeout)
         use_pretrain_sample: Use sample_action_pretrain for DPPO/ReinFlow
         verbose: Print per-episode info
-        record_video: Whether to record videos
+        record_video: Whether to record videos (only for env 0)
         video_dir: Directory to save videos
         algo_name: Algorithm name for video naming
         eval_step: Current training step (for video naming)
-        num_video_episodes: Number of episodes to record (hardcoded first N)
+        num_video_episodes: Number of episodes to record
+        normalizer: Optional normalizer for unnormalizing actions
         
     Returns:
         Dict with:
@@ -248,102 +278,180 @@ def evaluate_agent(
             - episode_rewards: List of per-episode rewards
             - episode_successes: List of per-episode success flags
     """
-    successes = 0
-    total_reward = 0
-    total_length = 0
+    num_envs = getattr(env, 'num_envs', 1)
+    
+    # Per-environment tracking
+    env_rewards = np.zeros(num_envs)
+    env_lengths = np.zeros(num_envs, dtype=np.int32)
+    env_successes = [False] * num_envs
+    
+    # Collected episode results
     episode_rewards = []
     episode_successes = []
+    episode_lengths = []
+    completed_episodes = 0
     
-    for ep in range(num_episodes):
-        obs, info = env.reset()
-        ep_reward = 0
-        success = False
-        frames = []
+    # Video recording (only for env 0)
+    video_frames = []
+    videos_saved = 0
+    
+    obs, info = env.reset()
+    
+    # Detect device from observation
+    if obs_mode == "state":
+        device = obs.device if hasattr(obs, 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        device = obs["state"].device if hasattr(obs.get("state"), 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    while completed_episodes < num_episodes:
+        # Capture frame for video (env 0 only, before action)
+        should_record = record_video and videos_saved < num_video_episodes and video_dir is not None
+        if should_record:
+            try:
+                frame = env.render()
+                if frame is not None:
+                    if isinstance(frame, torch.Tensor):
+                        frame = frame.cpu().numpy()
+                    # For VecEnv, render may return batched frames - take first
+                    if frame.ndim == 4:
+                        frame = frame[0]
+                    if frame.dtype != np.uint8:
+                        if frame.max() <= 1.0:
+                            frame = (frame * 255).astype(np.uint8)
+                        else:
+                            frame = frame.astype(np.uint8)
+                    video_frames.append(frame)
+            except Exception:
+                pass
         
-        # Record video only for first N episodes
-        should_record = record_video and ep < num_video_episodes and video_dir is not None
+        # Prepare observation for agent (batched)
+        if obs_mode == "state":
+            agent_obs = obs
+            # Normalize state if normalizer provided
+            if normalizer is not None:
+                agent_obs = normalizer.normalize_state(obs)
+        else:  # state_image
+            image = obs.get("rgb", obs.get("image"))
+            state = obs["state"]
+            # Normalize state if normalizer provided
+            if normalizer is not None:
+                state = normalizer.normalize_state(state)
+            # Convert image from NHWC (env format) to NCHW (model format)
+            # and normalize from [0, 255] to [0, 1]
+            if image is not None:
+                if image.ndim == 4:  # (N, H, W, C)
+                    image = image.permute(0, 3, 1, 2).contiguous()  # -> (N, C, H, W)
+                elif image.ndim == 3:  # (H, W, C) - single env
+                    image = image.permute(2, 0, 1).unsqueeze(0).contiguous()  # -> (1, C, H, W)
+                # Normalize to [0, 1] if needed
+                if image.dtype == torch.uint8:
+                    image = image.float() / 255.0
+                elif image.max() > 1.0:
+                    image = image / 255.0
+            agent_obs = {"state": state, "image": image}
         
-        for step in range(max_steps):
-            # Capture frame for video (before action)
-            if should_record:
-                try:
-                    frame = env.render()
-                    if frame is not None:
-                        if isinstance(frame, torch.Tensor):
-                            frame = frame.cpu().numpy()
-                        if frame.dtype != np.uint8:
-                            if frame.max() <= 1.0:
-                                frame = (frame * 255).astype(np.uint8)
-                            else:
-                                frame = frame.astype(np.uint8)
-                        frames.append(frame)
-                except Exception:
-                    pass  # Skip if render fails
+        # Get batched actions from agent
+        with torch.no_grad():
+            if use_pretrain_sample and hasattr(agent, 'sample_action_pretrain'):
+                result = agent.sample_action_pretrain(agent_obs)
+            else:
+                result = agent.sample_action(agent_obs)
             
-            # Prepare observation for agent
-            if obs_mode == "state":
-                agent_obs = obs
-            else:  # state_image
-                agent_obs = {"state": obs["state"], "image": obs["image"]}
+            actions = result[0] if isinstance(result, tuple) else result
+            if isinstance(actions, np.ndarray):
+                actions = torch.from_numpy(actions).float().to(device)
+            elif isinstance(actions, torch.Tensor):
+                actions = actions.to(device)
             
-            # Get action
-            with torch.no_grad():
-                if use_pretrain_sample and hasattr(agent, 'sample_action_pretrain'):
-                    result = agent.sample_action_pretrain(agent_obs)
+            # Unnormalize actions if normalizer provided
+            # Model outputs are in [-1, 1], need to convert back to original action space
+            if normalizer is not None:
+                actions = normalizer.unnormalize_action(actions)
+            
+            # Ensure correct shape for VecEnv
+            if actions.ndim == 1:
+                actions = actions.unsqueeze(0)
+            if actions.shape[0] != num_envs:
+                # Broadcast single action to all envs (shouldn't happen normally)
+                actions = actions.expand(num_envs, -1)
+        
+        # Step all environments
+        obs, rewards, terminated, truncated, info = env.step(actions)
+        
+        # Convert to numpy for tracking
+        if isinstance(rewards, torch.Tensor):
+            rewards_np = rewards.cpu().numpy()
+        else:
+            rewards_np = np.array(rewards)
+        
+        if isinstance(terminated, torch.Tensor):
+            terminated_np = terminated.cpu().numpy()
+        else:
+            terminated_np = np.array(terminated)
+        
+        if isinstance(truncated, torch.Tensor):
+            truncated_np = truncated.cpu().numpy()
+        else:
+            truncated_np = np.array(truncated)
+        
+        dones = terminated_np | truncated_np
+        
+        # Update per-env tracking
+        env_rewards += rewards_np
+        env_lengths += 1
+        
+        # Check for completed episodes
+        # With auto_reset, success is in info["final_info"]["success"]
+        final_info = info.get("final_info", None)
+        
+        for i in range(num_envs):
+            if dones[i] and completed_episodes < num_episodes:
+                # Get success from final_info (correct for auto_reset)
+                if final_info is not None and "success" in final_info:
+                    success_tensor = final_info["success"]
+                    if hasattr(success_tensor, '__getitem__'):
+                        success = bool(success_tensor[i].item() if hasattr(success_tensor[i], 'item') else success_tensor[i])
+                    else:
+                        success = bool(success_tensor)
                 else:
-                    result = agent.sample_action(agent_obs)
+                    # Fallback for single env or no auto_reset
+                    success_tensor = info.get("success", None)
+                    if success_tensor is not None:
+                        if hasattr(success_tensor, '__getitem__'):
+                            success = bool(success_tensor[i].item() if hasattr(success_tensor[i], 'item') else success_tensor[i])
+                        else:
+                            success = bool(success_tensor)
+                    else:
+                        success = False
                 
-                action = result[0] if isinstance(result, tuple) else result
-                if isinstance(action, torch.Tensor):
-                    action = action.cpu().numpy()
-                if action.ndim > 1:
-                    action = action[0]
-            
-            # Step environment
-            obs, reward, terminated, truncated, info = env.step(action)
-            ep_reward += reward
-            
-            # Check for success
-            if info.get("success", False):
-                success = True
-            
-            if terminated or truncated:
-                # Capture final frame
-                if should_record:
-                    try:
-                        frame = env.render()
-                        if frame is not None:
-                            if isinstance(frame, torch.Tensor):
-                                frame = frame.cpu().numpy()
-                            if frame.dtype != np.uint8:
-                                if frame.max() <= 1.0:
-                                    frame = (frame * 255).astype(np.uint8)
-                                else:
-                                    frame = frame.astype(np.uint8)
-                            frames.append(frame)
-                    except Exception:
-                        pass
-                break
-        
-        total_length += step + 1
-        total_reward += ep_reward
-        episode_rewards.append(ep_reward)
-        episode_successes.append(success)
-        
-        if success:
-            successes += 1
-        
-        # Save video for this episode
-        if should_record and frames:
-            status = "success" if success else "fail"
-            video_subdir = os.path.join(video_dir, algo_name, f"step_{eval_step:06d}")
-            video_path = os.path.join(video_subdir, f"ep_{ep+1:02d}_{status}.mp4")
-            save_video(frames, video_path, fps=30)
-            if verbose:
-                print(f"    Saved video: {video_path}")
-        
-        if verbose:
-            print(f"  Episode {ep+1}: reward={ep_reward:.2f}, length={step+1}, success={success}")
+                # Record episode
+                episode_rewards.append(float(env_rewards[i]))
+                episode_successes.append(success)
+                episode_lengths.append(int(env_lengths[i]))
+                completed_episodes += 1
+                
+                if verbose:
+                    print(f"  Episode {completed_episodes}: reward={env_rewards[i]:.2f}, length={env_lengths[i]}, success={success}")
+                
+                # Save video for env 0
+                if i == 0 and should_record and video_frames:
+                    status = "success" if success else "fail"
+                    video_subdir = os.path.join(video_dir, algo_name, f"step_{eval_step:06d}")
+                    video_path = os.path.join(video_subdir, f"ep_{videos_saved+1:02d}_{status}.mp4")
+                    save_video(video_frames, video_path, fps=30)
+                    videos_saved += 1
+                    video_frames = []
+                    if verbose:
+                        print(f"    Saved video: {video_path}")
+                
+                # Reset tracking for this env (auto_reset already happened)
+                env_rewards[i] = 0
+                env_lengths[i] = 0
+                env_successes[i] = False
+    
+    successes = sum(episode_successes)
+    total_reward = sum(episode_rewards)
+    total_length = sum(episode_lengths)
     
     return {
         "success_rate": successes / num_episodes,
@@ -395,8 +503,26 @@ def train_and_evaluate_all(
     """
     results = {}
     best_checkpoints = {}
-    batch_size = 128
+    batch_size = 256
     n_samples = len(dataset["actions"])
+    
+    # Create and fit data normalizer
+    print("Creating data normalizer...")
+    normalizer = DataNormalizer(action_mode='limits', obs_mode='limits')
+    normalizer.fit(actions=dataset["actions"], states=dataset.get("obs"))
+    normalizer = normalizer.to(device)
+    
+    # Print normalization statistics
+    action_stats = normalizer.get_action_stats()
+    print(f"  Action normalization (limits mode):")
+    print(f"    Input range: [{action_stats['min'].min():.3f}, {action_stats['max'].max():.3f}]")
+    print(f"    Output range: [-1, 1]")
+    
+    if dataset.get("obs") is not None:
+        state_stats = normalizer.get_state_stats()
+        print(f"  State normalization (limits mode):")
+        print(f"    Input range: [{state_stats['min'].min():.3f}, {state_stats['max'].max():.3f}]")
+        print(f"    Output range: [-1, 1]")
     
     # Setup video directory
     if record_video and video_dir:
@@ -411,16 +537,17 @@ def train_and_evaluate_all(
     import tempfile
     temp_ckpt_dir = tempfile.mkdtemp(prefix="best_ckpt_ms3_")
     
-    # Create evaluation environment (single env with numpy)
-    print("Creating evaluation environment...")
+    # Create evaluation environment (VecEnv for parallel evaluation)
+    # Use multiple envs for faster evaluation
+    num_eval_envs = 20  # Can increase for faster eval, but 4 is reasonable default
+    print(f"Creating evaluation environment (num_envs={num_eval_envs})...")
     eval_env = make_maniskill_env(
         task="PickCube-v1",
         obs_mode=obs_mode,
-        num_envs=1,
+        num_envs=num_eval_envs,
         seed=seed + 1000,
         max_episode_steps=max_episode_steps,
         image_size=image_shape[0],
-        use_numpy=True,
     )
     print("Evaluation environment created!")
     
@@ -464,7 +591,8 @@ def train_and_evaluate_all(
                 metrics = evaluate_agent(
                     agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
                     record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step
+                    algo_name=algo_name, eval_step=step,
+                    normalizer=normalizer
                 )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
@@ -485,13 +613,14 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": False,
                         "agent_class": "DiffusionPolicyAgent",
+                        "normalizer_state": normalizer.state_dict(),
                         "agent_kwargs": {"num_diffusion_steps": 100, **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device)
+                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
                 train_info = agent.train_step(batch)
                 if train_info and "loss" in train_info:
                     loss_buffer.append(train_info["loss"])
@@ -525,7 +654,8 @@ def train_and_evaluate_all(
                 metrics = evaluate_agent(
                     agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
                     record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step
+                    algo_name=algo_name, eval_step=step,
+                    normalizer=normalizer
                 )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
@@ -545,13 +675,14 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": False,
                         "agent_class": "FlowMatchingPolicy",
+                        "normalizer_state": normalizer.state_dict(),
                         "agent_kwargs": {"num_inference_steps": 20, **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device)
+                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
                 train_info = agent.train_step(batch)
                 if train_info and "loss" in train_info:
                     loss_buffer.append(train_info["loss"])
@@ -587,7 +718,8 @@ def train_and_evaluate_all(
                 metrics = evaluate_agent(
                     agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
                     record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step
+                    algo_name=algo_name, eval_step=step,
+                    normalizer=normalizer
                 )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
@@ -607,13 +739,14 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": False,
                         "agent_class": "ConsistencyFlowPolicy",
+                        "normalizer_state": normalizer.state_dict(),
                         "agent_kwargs": {"num_inference_steps": 5, "flow_batch_ratio": 0.7, "consistency_batch_ratio": 0.3, **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device)
+                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
                 train_info = agent.train_step(batch)
                 if train_info and "loss" in train_info:
                     loss_buffer.append(train_info["loss"])
@@ -648,7 +781,8 @@ def train_and_evaluate_all(
                 metrics = evaluate_agent(
                     agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
                     record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step
+                    algo_name=algo_name, eval_step=step,
+                    normalizer=normalizer
                 )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
@@ -668,13 +802,14 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": False,
                         "agent_class": "ReflectedFlowPolicy",
+                        "normalizer_state": normalizer.state_dict(),
                         "agent_kwargs": {"num_inference_steps": 20, "reflection_mode": "hard", **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device)
+                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
                 train_info = agent.train_step(batch)
                 if train_info and "loss" in train_info:
                     loss_buffer.append(train_info["loss"])
@@ -709,7 +844,8 @@ def train_and_evaluate_all(
                 metrics = evaluate_agent(
                     agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
                     record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step
+                    algo_name=algo_name, eval_step=step,
+                    normalizer=normalizer
                 )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
@@ -740,13 +876,14 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": False,
                         "agent_class": "DiffusionDoubleQAgent",
+                        "normalizer_state": normalizer.state_dict(),
                         "agent_kwargs": {"num_diffusion_steps": 100, **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device)
+                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
                 train_info = agent.train_step(batch)
                 if train_info:
                     for key in ["critic_loss", "actor_loss", "bc_loss", "q_loss", "q_mean"]:
@@ -784,7 +921,8 @@ def train_and_evaluate_all(
                 metrics = evaluate_agent(
                     agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
                     record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step
+                    algo_name=algo_name, eval_step=step,
+                    normalizer=normalizer
                 )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
@@ -815,13 +953,14 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": False,
                         "agent_class": "CPQLAgent",
+                        "normalizer_state": normalizer.state_dict(),
                         "agent_kwargs": {"sigma_max": 80.0, "sigma_min": 0.002, "rho": 7.0, **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device)
+                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
                 train_info = agent.train_step(batch)
                 if train_info:
                     for key in ["q_loss", "flow_loss", "consistency_loss"]:
@@ -866,7 +1005,8 @@ def train_and_evaluate_all(
                 metrics = evaluate_agent(
                     agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True,
                     record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step
+                    algo_name=algo_name, eval_step=step,
+                    normalizer=normalizer
                 )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
@@ -886,13 +1026,14 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": True,
                         "agent_class": "DPPOAgent",
+                        "normalizer_state": normalizer.state_dict(),
                         "agent_kwargs": {"num_diffusion_steps": 100, "ft_denoising_steps": 5, **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device)
+                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
                 batch_actions = batch["actions"]
                 
                 # Get observation features
@@ -955,7 +1096,8 @@ def train_and_evaluate_all(
                 metrics = evaluate_agent(
                     agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True,
                     record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step
+                    algo_name=algo_name, eval_step=step,
+                    normalizer=normalizer
                 )
                 results[algo_name]["steps"].append(step)
                 results[algo_name]["success_rate"].append(metrics["success_rate"])
@@ -975,13 +1117,14 @@ def train_and_evaluate_all(
                         "success_rate": best_success,
                         "use_pretrain": True,
                         "agent_class": "ReinFlowAgent",
+                        "normalizer_state": normalizer.state_dict(),
                         "agent_kwargs": {"num_flow_steps": 10, "noise_scheduler_type": "learn", **common_kwargs},
                     }
                     print(f"    -> New best! Saving checkpoint at step {step}")
             
             if step < num_steps:
                 idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device)
+                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
                 batch_actions = batch["actions"]
                 
                 # Get observation features
@@ -1216,7 +1359,7 @@ def main():
     )
     parser.add_argument("--num_steps", type=int, default=50000, help="Training steps")
     parser.add_argument("--eval_interval", type=int, default=5000, help="Steps between evaluations")
-    parser.add_argument("--eval_episodes", type=int, default=10, help="Episodes per evaluation")
+    parser.add_argument("--eval_episodes", type=int, default=40, help="Episodes per evaluation")
     parser.add_argument("--max_episode_steps", type=int, default=50, help="Max steps per episode")
     parser.add_argument("--device", type=str, default="auto", help="Device (auto/cuda/cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")

@@ -471,14 +471,96 @@ class SimplifiedVecObsWrapper(gym.Wrapper):
         
         return rgb
     
+    def _flatten_obs_batch(self, obs) -> torch.Tensor:
+        """Flatten ManiSkill3 observation dict into a state vector.
+        
+        ManiSkill3 with obs_mode="state_dict" or "state_dict+rgb" returns:
+            obs = {
+                "agent": {
+                    "qpos": (num_envs, 9),  # joint positions
+                    "qvel": (num_envs, 9),  # joint velocities
+                },
+                "extra": {
+                    "tcp_pose": (num_envs, 7),  # end-effector pose (pos + quat)
+                    "obj_pose": (num_envs, 7),  # object pose
+                    "goal_pos": (num_envs, 3),  # goal position
+                    "tcp_to_obj_pos": (num_envs, 3),  # relative position
+                    "obj_to_goal_pos": (num_envs, 3),  # relative position
+                    ... (may have additional fields)
+                },
+                "sensor_data": {...}  # camera data, ignored for state
+            }
+        
+        This method extracts and concatenates all numeric fields from "agent" and "extra"
+        to create a flat state vector.
+        
+        Returns:
+            state: (num_envs, state_dim) flattened state tensor
+        """
+        if not isinstance(obs, dict):
+            # Already a tensor
+            if isinstance(obs, torch.Tensor):
+                return obs
+            return torch.from_numpy(obs) if isinstance(obs, np.ndarray) else torch.zeros(self.num_envs, self.state_dim)
+        
+        # If obs already has a "state" key (e.g., from obs_mode="state"), use it directly
+        if "state" in obs:
+            state = obs["state"]
+            if isinstance(state, np.ndarray):
+                state = torch.from_numpy(state)
+            return state
+        
+        # Extract from agent and extra dicts
+        state_parts = []
+        device = None
+        
+        # Process "agent" dict
+        if "agent" in obs:
+            agent = obs["agent"]
+            for key in sorted(agent.keys()):  # Sort for deterministic order
+                val = agent[key]
+                if isinstance(val, (torch.Tensor, np.ndarray)):
+                    if isinstance(val, np.ndarray):
+                        val = torch.from_numpy(val)
+                    if device is None:
+                        device = val.device
+                    # Flatten to (num_envs, -1)
+                    if val.dim() == 1:
+                        val = val.unsqueeze(-1)
+                    elif val.dim() > 2:
+                        val = val.view(val.shape[0], -1)
+                    state_parts.append(val.float())
+        
+        # Process "extra" dict
+        if "extra" in obs:
+            extra = obs["extra"]
+            for key in sorted(extra.keys()):  # Sort for deterministic order
+                val = extra[key]
+                if isinstance(val, (torch.Tensor, np.ndarray)):
+                    if isinstance(val, np.ndarray):
+                        val = torch.from_numpy(val)
+                    if device is None:
+                        device = val.device
+                    # Flatten to (num_envs, -1)
+                    if val.dim() == 1:
+                        val = val.unsqueeze(-1)
+                    elif val.dim() > 2:
+                        val = val.view(val.shape[0], -1)
+                    state_parts.append(val.float())
+        
+        if state_parts:
+            state = torch.cat(state_parts, dim=-1)
+            return state
+        else:
+            # Fallback: return zeros if no state data found
+            return torch.zeros(self.num_envs, self.state_dim, device=device or "cpu")
+    
     def _make_obs(self, obs):
         if self.obs_mode == "image":
             return self._extract_rgb_batch(obs)
         else:
-            if isinstance(obs, dict) and "state" in obs:
-                state = obs["state"]
-            else:
-                state = obs if not isinstance(obs, dict) else torch.zeros(self.num_envs, self.state_dim)
+            # Use the new _flatten_obs_batch to correctly extract state
+            state = self._flatten_obs_batch(obs)
             
             return {
                 "state": state,

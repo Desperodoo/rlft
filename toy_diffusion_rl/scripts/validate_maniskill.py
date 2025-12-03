@@ -101,12 +101,13 @@ def test_environment_creation(verbose: bool = True) -> bool:
             task="PickCube-v1",
             obs_mode="state",
             num_envs=1,
-            use_numpy=True,
             seed=42,
         )
         
-        print(f"  State dim: {env.state_dim}")
-        print(f"  Action dim: {env.action_dim}")
+        state_dim = getattr(env, 'state_dim', env.observation_space.shape[-1])
+        action_dim = env.action_space.shape[-1]
+        print(f"  State dim: {state_dim}")
+        print(f"  Action dim: {action_dim}")
         # Use get_wrapper_attr to avoid deprecation warning
         try:
             max_steps = env.get_wrapper_attr('max_episode_steps')
@@ -130,18 +131,19 @@ def test_environment_creation(verbose: bool = True) -> bool:
             task="PickCube-v1",
             obs_mode="state_image",
             num_envs=1,
-            use_numpy=True,
             image_size=64,
             seed=42,
         )
         
-        print(f"  State dim: {env.state_dim}")
-        print(f"  Image shape: {env.image_shape}")
+        state_dim = getattr(env, 'state_dim', None)
+        image_shape = getattr(env, 'image_shape', None)
+        print(f"  State dim: {state_dim}")
+        print(f"  Image shape: {image_shape}")
         
         obs, info = env.reset()
         if isinstance(obs, dict):
             print(f"  State obs shape: {obs['state'].shape}")
-            print(f"  Image obs shape: {obs['image'].shape}")
+            print(f"  Image obs shape: {obs['rgb'].shape}")
         
         env.close()
         print("✓ Single environment (state_image mode) passed")
@@ -152,7 +154,7 @@ def test_environment_creation(verbose: bool = True) -> bool:
         if torch.cuda.is_available():
             print("\n1c. VecEnv test skipped (PhysX cannot switch between CPU/GPU in same process)")
             print("    To test VecEnv, run in a fresh Python process:")
-            print("    python -c \"from envs import make_maniskill_env; env = make_maniskill_env(num_envs=4, use_numpy=False); print('VecEnv OK')\"")
+            print("    python -c \"from envs import make_maniskill_env; env = make_maniskill_env(num_envs=4); print('VecEnv OK')\"")
         else:
             print("\n1c. Skipping VecEnv test (CUDA not available)")
         
@@ -173,7 +175,7 @@ def test_expert_policy(verbose: bool = True) -> bool:
     
     try:
         from envs.maniskill_env import make_maniskill_env
-        from scripts.generate_maniskill_dataset import ManiSkillScriptedExpert
+        from envs.maniskill_env import make_maniskill_env, ManiSkillExpertPolicy
         
         print("\n2a. Testing scripted expert on PickCube-v1...")
         
@@ -181,12 +183,11 @@ def test_expert_policy(verbose: bool = True) -> bool:
             task="PickCube-v1",
             obs_mode="state",
             num_envs=1,
-            use_numpy=True,
             max_episode_steps=50,
             seed=42,
         )
         
-        expert = ManiSkillScriptedExpert()
+        expert = ManiSkillExpertPolicy()
         
         # Run a few episodes
         successes = 0
@@ -199,7 +200,7 @@ def test_expert_policy(verbose: bool = True) -> bool:
             total_reward = 0
             for step in range(50):
                 raw_obs = info.get("raw_obs", obs)
-                action = expert.get_action(raw_obs)
+                action = expert.get_action(raw_obs, info)
                 
                 next_obs, reward, terminated, truncated, info = env.step(action)
                 total_reward += reward
@@ -241,9 +242,8 @@ def test_dataset_generation(verbose: bool = True) -> bool:
     print("=" * 60)
     
     try:
-        from envs.maniskill_env import make_maniskill_env
+        from envs.maniskill_env import make_maniskill_env, ManiSkillExpertPolicy
         from scripts.generate_maniskill_dataset import (
-            ManiSkillScriptedExpert,
             collect_episodes_single,
             save_dataset,
         )
@@ -256,12 +256,11 @@ def test_dataset_generation(verbose: bool = True) -> bool:
             task="PickCube-v1",
             obs_mode="state_image",
             num_envs=1,
-            use_numpy=True,
             image_size=64,
             seed=42,
         )
         
-        expert = ManiSkillScriptedExpert()
+        expert = ManiSkillExpertPolicy()
         
         # Collect a few episodes
         data = collect_episodes_single(
@@ -325,9 +324,8 @@ def test_offline_training(verbose: bool = True) -> bool:
     print("=" * 60)
     
     try:
-        from envs.maniskill_env import make_maniskill_env
+        from envs.maniskill_env import make_maniskill_env, ManiSkillExpertPolicy
         from scripts.generate_maniskill_dataset import (
-            ManiSkillScriptedExpert,
             collect_episodes_single,
             save_dataset,
         )
@@ -341,12 +339,11 @@ def test_offline_training(verbose: bool = True) -> bool:
             task="PickCube-v1",
             obs_mode="state_image",
             num_envs=1,
-            use_numpy=True,
             image_size=64,
             seed=42,
         )
         
-        expert = ManiSkillScriptedExpert()
+        expert = ManiSkillExpertPolicy()
         
         # Collect data
         data = collect_episodes_single(
@@ -440,13 +437,15 @@ def test_vecenv_rollout(verbose: bool = True) -> bool:
             task="PickCube-v1",
             obs_mode="state",
             num_envs=num_envs,
-            use_numpy=False,
             seed=42,
         )
         
+        state_dim = getattr(env, 'state_dim', env.single_observation_space.shape[-1])
+        action_dim = env.single_action_space.shape[-1]
+        
         print(f"  Num envs: {num_envs}")
-        print(f"  State dim: {env.state_dim}")
-        print(f"  Action dim: {env.action_dim}")
+        print(f"  State dim: {state_dim}")
+        print(f"  Action dim: {action_dim}")
         
         print("\n5b. Creating simple policy...")
         
@@ -454,22 +453,28 @@ def test_vecenv_rollout(verbose: bool = True) -> bool:
         class RandomPolicy(torch.nn.Module):
             def __init__(self, action_dim):
                 super().__init__()
-                self.action_dim = action_dim
+                self._action_dim = action_dim
             
             def get_action(self, obs, deterministic=False):
                 batch_size = obs.shape[0]
-                return torch.randn(batch_size, self.action_dim, device=obs.device)
+                return torch.randn(batch_size, self._action_dim, device=obs.device)
+            
+            def sample_action(self, obs, deterministic=False):
+                """For compatibility with collect_rollout_vecenv."""
+                action = self.get_action(obs, deterministic)
+                log_prob = torch.zeros(obs.shape[0], device=obs.device)
+                value = torch.zeros(obs.shape[0], device=obs.device)
+                return action, log_prob, value
         
-        policy = RandomPolicy(env.action_dim).cuda()
+        policy = RandomPolicy(action_dim).cuda()
+        policy.obs_mode = "state"  # For the rollout function
         
         print("\n5c. Collecting rollout...")
         
         rollout_data = collect_rollout_vecenv(
-            env=env,
             agent=policy,
-            num_steps=20,
-            gamma=0.99,
-            gae_lambda=0.95,
+            vec_env=env,
+            rollout_steps=20,
             device="cuda",
         )
         
