@@ -1,26 +1,25 @@
 """
-Unified Flow Matching Policy
+Consistency Flow Policy V2 - Aligned with CPQL Implementation
 
-Standard flow matching policy with multi-modal observation support.
-Uses the Conditional Flow Matching (CFM) objective to learn
-a velocity field that transports Gaussian noise to the action distribution.
+This version aligns with CPQL's consistency flow implementation:
+1. Uses MultiModalVelocityPredictor (simple linear time embedding)
+2. Same training data distribution (full batch for both flow + consistency)
+3. Same linear interpolation without sigma_min
+4. Same inference procedure
 
-Supports multiple observation modes:
-- "state": State vector only
-- "image": Image observation only  
-- "state_image": Both state and image (multimodal)
+This provides a fair BC-only baseline for comparing against CPQL.
 
 References:
-- Flow Matching for Generative Modeling (Lipman et al., 2022)
-- Optimal Transport Flow Matching
+- Consistency Models (Song et al., 2023)
+- ManiFlow: https://github.com/allenai/maniflow
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import copy
 from typing import Dict, Optional, List, Tuple, Union
+import copy
 
 try:
     from ...common.networks import MLP, MultiModalVelocityPredictor
@@ -37,21 +36,28 @@ except ImportError:
         from common.obs_encoder import ObservationEncoder, create_obs_encoder
 
 
-class FlowMatchingPolicy:
-    """Unified Flow Matching Policy with multi-modal observation support.
+class ConsistencyFlowPolicyV2:
+    """Consistency Flow Policy V2 - Aligned with CPQL implementation.
     
-    Uses CFM objective to learn a velocity field for action generation.
-    Supports state-only, image-only, or state+image observations.
+    Key differences from original ConsistencyFlowPolicy:
+    1. Uses MultiModalVelocityPredictor (same as CPQL) with simple linear time embedding
+    2. Full batch is used for both flow and consistency losses (shared x_0)
+    3. No sigma_min in interpolation (standard linear flow)
+    4. Same network architecture as CPQL policy
+    
+    This provides a fair BC-only baseline for comparing against CPQL.
     
     Args:
         action_dim: Dimension of action space
         obs_mode: Observation mode ("state", "image", or "state_image")
         state_dim: Dimension of state space (required for state/state_image)
         image_shape: Image shape as (H, W, C) (required for image/state_image)
-        hidden_dims: Hidden layer dimensions
-        num_inference_steps: Number of ODE integration steps
-        use_ema: Whether to use EMA for inference
+        hidden_dims: Hidden layer dimensions (will append 256 to match CPQL)
+        bc_weight: Weight for flow matching (BC) loss
+        consistency_weight: Weight for consistency loss
+        use_ema_teacher: Use EMA model as teacher for consistency
         ema_decay: Decay rate for EMA
+        num_flow_steps: Number of ODE steps for inference
         vision_encoder_type: Type of vision encoder ("cnn" or "dinov2")
         vision_output_dim: Output dimension of vision encoder
         freeze_vision_encoder: Whether to freeze vision encoder
@@ -65,10 +71,12 @@ class FlowMatchingPolicy:
         obs_mode: str = "state",
         state_dim: Optional[int] = None,
         image_shape: Optional[Tuple[int, int, int]] = None,
-        hidden_dims: List[int] = [256, 256, 256],
-        num_inference_steps: int = 10,
-        use_ema: bool = True,
+        hidden_dims: List[int] = [256, 256],
+        bc_weight: float = 1.0,
+        consistency_weight: float = 1.0,
+        use_ema_teacher: bool = True,
         ema_decay: float = 0.999,
+        num_flow_steps: int = 10,
         vision_encoder_type: str = "cnn",
         vision_output_dim: int = 128,
         freeze_vision_encoder: bool = False,
@@ -79,12 +87,14 @@ class FlowMatchingPolicy:
         self.obs_mode = obs_mode
         self.state_dim = state_dim
         self.image_shape = image_shape
-        self.num_inference_steps = num_inference_steps
-        self.use_ema = use_ema
+        self.bc_weight = bc_weight
+        self.consistency_weight = consistency_weight
+        self.use_ema_teacher = use_ema_teacher
         self.ema_decay = ema_decay
+        self.num_flow_steps = num_flow_steps
         self.device = device
         
-        # Create observation encoder
+        # Create observation encoder (same as CPQL)
         self.obs_encoder = create_obs_encoder(
             obs_mode=obs_mode,
             state_dim=state_dim,
@@ -95,41 +105,41 @@ class FlowMatchingPolicy:
         ).to(device)
         
         # Velocity network
-        self.velocity_net = MultiModalVelocityPredictor(
+        self.policy = MultiModalVelocityPredictor(
             action_dim=action_dim,
             hidden_dims=hidden_dims,
             obs_encoder=self.obs_encoder,
         ).to(device)
         
-        # EMA velocity network for stable inference
-        if use_ema:
-            self.velocity_net_ema = copy.deepcopy(self.velocity_net)
-            for p in self.velocity_net_ema.parameters():
+        # EMA policy for consistency training (same as CPQL)
+        if use_ema_teacher:
+            self.policy_ema = copy.deepcopy(self.policy)
+            for p in self.policy_ema.parameters():
                 p.requires_grad = False
         else:
-            self.velocity_net_ema = None
+            self.policy_ema = None
         
-        # Collect trainable parameters
-        trainable_params = list(self.velocity_net.parameters())
+        # Collect trainable parameters (same as CPQL)
+        policy_params = list(self.policy.parameters())
         
         if obs_mode in ["image", "state_image"] and not freeze_vision_encoder:
             vision_params = [p for p in self.obs_encoder.vision_encoder.parameters() if p.requires_grad]
-            trainable_params.extend(vision_params)
+            policy_params.extend(vision_params)
         
-        self.optimizer = torch.optim.Adam(trainable_params, lr=learning_rate)
+        self.optimizer = torch.optim.Adam(policy_params, lr=learning_rate)
         self.total_steps = 0
     
     def _update_ema(self):
-        """Update EMA velocity network."""
-        if not self.use_ema or self.velocity_net_ema is None:
+        """Update EMA policy (same as CPQL)."""
+        if not self.use_ema_teacher or self.policy_ema is None:
             return
         
         with torch.no_grad():
-            for ema_p, p in zip(self.velocity_net_ema.parameters(), self.velocity_net.parameters()):
+            for ema_p, p in zip(self.policy_ema.parameters(), self.policy.parameters()):
                 ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
     
     def _linear_interpolate(self, x_0: torch.Tensor, x_1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Linear interpolation (no sigma_min)."""
+        """Linear interpolation (same as CPQL, no sigma_min)."""
         t_expand = t.unsqueeze(-1) if t.dim() == 1 else t
         return (1 - t_expand) * x_0 + t_expand * x_1
     
@@ -137,7 +147,7 @@ class FlowMatchingPolicy:
         self,
         obs: Union[np.ndarray, Dict[str, np.ndarray], torch.Tensor],
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Parse observation into state and image tensors."""
+        """Parse observation into state and image tensors (same as CPQL)."""
         state = None
         image = None
         
@@ -193,7 +203,12 @@ class FlowMatchingPolicy:
         return state, image
     
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Perform one training step using CFM objective.
+        """Train with combined flow matching and consistency loss (aligned with CPQL).
+        
+        Key alignment with CPQL:
+        1. Full batch used for both losses (shared x_0)
+        2. Same flow matching formula (no sigma_min)
+        3. Same consistency training procedure
         
         Args:
             batch: Dictionary with observation and action tensors
@@ -218,51 +233,75 @@ class FlowMatchingPolicy:
         
         batch_size = actions.shape[0]
         
-        # Sample noise x_0 ~ N(0, I)
+        # Pre-compute observation features (same as CPQL)
+        obs_features = self.obs_encoder(state=states, image=images)
+        
+        # ============ Flow Matching Loss (same as CPQL) ============
+        # Sample shared x_0 for both losses
         x_0 = torch.randn_like(actions)
-        
-        # Sample random timesteps t ~ U(0, 1)
         t = torch.rand(batch_size, device=self.device)
-        
-        # Compute linear interpolation (no sigma_min)
         x_t = self._linear_interpolate(x_0, actions, t)
         
-        # Target velocity: v = x_1 - x_0 (standard flow matching)
-        target_velocity = actions - x_0
+        # Target: v = x_1 - x_0 (no sigma_min, same as CPQL)
+        v_target = actions - x_0
         
         # Predict velocity
-        predicted_velocity = self.velocity_net(x_t, t, state=states, image=images)
+        v_pred = self.policy(x_t, t, obs_features=obs_features)
+        flow_loss = F.mse_loss(v_pred, v_target)
         
-        # MSE loss
-        loss = F.mse_loss(predicted_velocity, target_velocity)
+        # ============ Consistency Loss (same as CPQL) ============
+        # Sample t for consistency (avoid boundaries)
+        t_cons = 0.05 + torch.rand(batch_size, device=self.device) * 0.9
+        delta_t = torch.rand(batch_size, device=self.device) * (0.99 - t_cons)
+        delta_t = torch.clamp(delta_t, min=0.02)
+        t_next = torch.clamp(t_cons + delta_t, max=0.99)
         
-        # Optimize
+        # Interpolate using shared x_0 (same as CPQL)
+        x_t_cons = self._linear_interpolate(x_0, actions, t_cons)
+        x_t_next = self._linear_interpolate(x_0, actions, t_next)
+        
+        # Use EMA teacher to predict velocity at t_next
+        with torch.no_grad():
+            teacher = self.policy_ema if self.use_ema_teacher else self.policy
+            v_teacher = teacher(x_t_next, t_next, obs_features=obs_features)
+            t_next_expand = t_next.unsqueeze(-1)
+            pred_x1 = x_t_next + (1 - t_next_expand) * v_teacher
+        
+        # Target velocity at t_cons should point to pred_x1
+        v_cons_target = pred_x1 - x_0
+        v_cons_pred = self.policy(x_t_cons, t_cons, obs_features=obs_features)
+        consistency_loss = F.mse_loss(v_cons_pred, v_cons_target)
+        
+        # ============ Total Loss (same weighting as CPQL) ============
+        total_loss = self.bc_weight * flow_loss + self.consistency_weight * consistency_loss
+        
         self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.velocity_net.parameters(), 1.0)
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
         self.optimizer.step()
         
         # Update EMA
         self._update_ema()
+        
         self.total_steps += 1
         
-        return {"loss": loss.item()}
+        return {
+            "loss": total_loss.item(),
+            "bc_loss": flow_loss.item(),
+            "consistency_loss": consistency_loss.item(),
+        }
     
     @torch.no_grad()
     def sample_action(
         self, 
         obs: Union[np.ndarray, Dict[str, np.ndarray]],
-        num_steps: Optional[int] = None,
-        use_rk4: bool = False,
         deterministic: bool = True
     ) -> np.ndarray:
-        """Sample an action by integrating the learned ODE.
+        """Sample action using ODE integration (same as CPQL).
         
         Args:
             obs: Current observation
-            num_steps: Number of integration steps
-            use_rk4: Use RK4 integrator
-            deterministic: If True, use EMA model for stable inference
+            deterministic: If True, use EMA model (same as CPQL)
             
         Returns:
             Sampled action
@@ -270,106 +309,28 @@ class FlowMatchingPolicy:
         state, image = self._parse_observation(obs)
         batch_size = state.shape[0] if state is not None else image.shape[0]
         
-        # Use EMA model for deterministic sampling
-        net = self.velocity_net_ema if (deterministic and self.use_ema and self.velocity_net_ema is not None) else self.velocity_net
-        net.eval()
-        num_steps = num_steps or self.num_inference_steps
-        
-        # Pre-compute observation features
         obs_features = self.obs_encoder(state=state, image=image)
         
-        if use_rk4:
-            action = self._rk4_integrate(obs_features, batch_size, num_steps, net)
-        else:
-            action = self._euler_integrate(obs_features, batch_size, num_steps, net)
+        # Use EMA for deterministic sampling (same as CPQL)
+        net = self.policy_ema if (deterministic and self.use_ema_teacher) else self.policy
         
-        return action.cpu().numpy().squeeze()
-    
-    def _euler_integrate(
-        self,
-        obs_features: torch.Tensor,
-        batch_size: int,
-        num_steps: int,
-        net: nn.Module = None,
-    ) -> torch.Tensor:
-        """Integrate using Euler method."""
-        if net is None:
-            net = self.velocity_net
-        dt = 1.0 / num_steps
+        # Start from noise
         x = torch.randn(batch_size, self.action_dim, device=self.device)
+        dt = 1.0 / self.num_flow_steps
         
-        for i in range(num_steps):
+        # Euler ODE integration (same as CPQL)
+        for i in range(self.num_flow_steps):
             t = torch.full((batch_size,), i * dt, device=self.device)
             v = net(x, t, obs_features=obs_features)
             x = x + v * dt
         
-        return torch.clamp(x, -1.0, 1.0)
-    
-    def _rk4_integrate(
-        self,
-        obs_features: torch.Tensor,
-        batch_size: int,
-        num_steps: int,
-        net: nn.Module = None,
-    ) -> torch.Tensor:
-        """Integrate using RK4 method."""
-        if net is None:
-            net = self.velocity_net
-        dt = 1.0 / num_steps
-        x = torch.randn(batch_size, self.action_dim, device=self.device)
-        
-        for i in range(num_steps):
-            t = i * dt
-            t_tensor = torch.full((batch_size,), t, device=self.device)
-            
-            k1 = net(x, t_tensor, obs_features=obs_features)
-            
-            t_mid = torch.full((batch_size,), t + dt/2, device=self.device)
-            k2 = net(x + k1 * dt/2, t_mid, obs_features=obs_features)
-            k3 = net(x + k2 * dt/2, t_mid, obs_features=obs_features)
-            
-            t_end = torch.full((batch_size,), t + dt, device=self.device)
-            k4 = net(x + k3 * dt, t_end, obs_features=obs_features)
-            
-            x = x + (k1 + 2*k2 + 2*k3 + k4) * dt / 6
-        
-        return torch.clamp(x, -1.0, 1.0)
-    
-    @torch.no_grad()
-    def sample_action_stochastic(
-        self,
-        obs: Union[np.ndarray, Dict[str, np.ndarray]],
-        num_steps: Optional[int] = None,
-        temperature: float = 0.1
-    ) -> np.ndarray:
-        """Sample action with stochastic noise injection."""
-        state, image = self._parse_observation(obs)
-        batch_size = state.shape[0] if state is not None else image.shape[0]
-        
-        self.velocity_net.eval()
-        num_steps = num_steps or self.num_inference_steps
-        
-        obs_features = self.obs_encoder(state=state, image=image)
-        
-        dt = 1.0 / num_steps
-        x = torch.randn(batch_size, self.action_dim, device=self.device)
-        
-        for i in range(num_steps):
-            t = torch.full((batch_size,), i * dt, device=self.device)
-            v = self.velocity_net(x, t, obs_features=obs_features)
-            
-            noise_scale = temperature * (1 - i / num_steps)
-            noise = noise_scale * torch.randn_like(x)
-            
-            x = x + v * dt + noise * np.sqrt(dt)
-        
-        x = torch.clamp(x, -1.0, 1.0)
-        return x.cpu().numpy().squeeze()
+        action = torch.clamp(x, -1.0, 1.0)
+        return action.cpu().numpy().squeeze()
     
     def save(self, path: str):
         """Save model checkpoint."""
         checkpoint = {
-            "velocity_net": self.velocity_net.state_dict(),
+            "policy": self.policy.state_dict(),
             "obs_encoder": self.obs_encoder.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "total_steps": self.total_steps,
@@ -378,21 +339,22 @@ class FlowMatchingPolicy:
                 "action_dim": self.action_dim,
                 "state_dim": self.state_dim,
                 "image_shape": self.image_shape,
-                "num_inference_steps": self.num_inference_steps,
-                "use_ema": self.use_ema,
+                "num_flow_steps": self.num_flow_steps,
+                "bc_weight": self.bc_weight,
+                "consistency_weight": self.consistency_weight,
                 "ema_decay": self.ema_decay,
             },
         }
-        if self.use_ema and self.velocity_net_ema is not None:
-            checkpoint["velocity_net_ema"] = self.velocity_net_ema.state_dict()
+        if self.use_ema_teacher and self.policy_ema is not None:
+            checkpoint["policy_ema"] = self.policy_ema.state_dict()
         torch.save(checkpoint, path)
     
     def load(self, path: str):
         """Load model checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
-        self.velocity_net.load_state_dict(checkpoint["velocity_net"])
+        self.policy.load_state_dict(checkpoint["policy"])
         self.obs_encoder.load_state_dict(checkpoint["obs_encoder"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.total_steps = checkpoint.get("total_steps", 0)
-        if self.use_ema and "velocity_net_ema" in checkpoint and self.velocity_net_ema is not None:
-            self.velocity_net_ema.load_state_dict(checkpoint["velocity_net_ema"])
+        if self.use_ema_teacher and "policy_ema" in checkpoint and self.policy_ema is not None:
+            self.policy_ema.load_state_dict(checkpoint["policy_ema"])

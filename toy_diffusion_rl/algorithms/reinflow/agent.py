@@ -30,7 +30,8 @@ import copy
 try:
     from ...common.networks import (
         FlowVelocityPredictor, ValueNetwork, MLP,
-        MultiModalVelocityPredictor, MultiModalNoisyFlowMLP, MultiModalValueNetwork
+        MultiModalVelocityPredictor, MultiModalNoisyFlowMLP, MultiModalValueNetwork,
+        MultiModalShortCutVelocityPredictor, MultiModalNoisyShortCutFlowMLP
     )
     from ...common.replay_buffer import RolloutBuffer
     from ...common.obs_encoder import ObservationEncoder, create_obs_encoder
@@ -38,7 +39,8 @@ except ImportError:
     try:
         from toy_diffusion_rl.common.networks import (
             FlowVelocityPredictor, ValueNetwork, MLP,
-            MultiModalVelocityPredictor, MultiModalNoisyFlowMLP, MultiModalValueNetwork
+            MultiModalVelocityPredictor, MultiModalNoisyFlowMLP, MultiModalValueNetwork,
+            MultiModalShortCutVelocityPredictor, MultiModalNoisyShortCutFlowMLP
         )
         from toy_diffusion_rl.common.replay_buffer import RolloutBuffer
         from toy_diffusion_rl.common.obs_encoder import ObservationEncoder, create_obs_encoder
@@ -48,7 +50,8 @@ except ImportError:
         sys.path.insert(0, str(Path(__file__).parent.parent.parent))
         from common.networks import (
             FlowVelocityPredictor, ValueNetwork, MLP,
-            MultiModalVelocityPredictor, MultiModalNoisyFlowMLP, MultiModalValueNetwork
+            MultiModalVelocityPredictor, MultiModalNoisyFlowMLP, MultiModalValueNetwork,
+            MultiModalShortCutVelocityPredictor, MultiModalNoisyShortCutFlowMLP
         )
         from common.replay_buffer import RolloutBuffer
         from common.obs_encoder import ObservationEncoder, create_obs_encoder
@@ -114,7 +117,13 @@ class ReinFlowAgent:
         max_grad_norm: float = 0.5,
         ppo_epochs: int = 10,
         batch_size: int = 64,
-        device: str = "cpu"
+        device: str = "cpu",
+        use_ema: bool = True,
+        ema_decay: float = 0.999,
+        use_shortcut: bool = False,
+        self_consistency_k: float = 0.25,
+        max_denoising_steps: int = 8,
+        delta: float = 1e-5
     ):
         self.action_dim = action_dim
         self.obs_mode = obs_mode
@@ -122,6 +131,8 @@ class ReinFlowAgent:
         self.image_shape = image_shape
         self.num_flow_steps = num_flow_steps
         self.noise_scheduler_type = noise_scheduler_type
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.clip_ratio = clip_ratio
@@ -131,6 +142,12 @@ class ReinFlowAgent:
         self.ppo_epochs = ppo_epochs
         self.batch_size = batch_size
         self.device = device
+        
+        # ShortCut flow settings
+        self.use_shortcut = use_shortcut
+        self.self_consistency_k = self_consistency_k
+        self.max_denoising_steps = max_denoising_steps
+        self.delta = delta
         
         # Create observation encoder
         self.obs_encoder = create_obs_encoder(
@@ -142,13 +159,29 @@ class ReinFlowAgent:
             freeze_vision=freeze_vision_encoder,
         ).to(device)
         
-        # Policy with noisy flow
-        self.policy = MultiModalNoisyFlowMLP(
-            action_dim=action_dim,
-            hidden_dims=hidden_dims + [256],
-            noise_scheduler_type=noise_scheduler_type,
-            obs_encoder=self.obs_encoder,
-        ).to(device)
+        # Policy with noisy flow (choose ShortCut or standard based on use_shortcut)
+        if use_shortcut:
+            self.policy = MultiModalNoisyShortCutFlowMLP(
+                action_dim=action_dim,
+                hidden_dims=hidden_dims,
+                noise_scheduler_type=noise_scheduler_type,
+                obs_encoder=self.obs_encoder,
+            ).to(device)
+        else:
+            self.policy = MultiModalNoisyFlowMLP(
+                action_dim=action_dim,
+                hidden_dims=hidden_dims,
+                noise_scheduler_type=noise_scheduler_type,
+                obs_encoder=self.obs_encoder,
+            ).to(device)
+        
+        # Create EMA network for base_net
+        if use_ema:
+            self.base_net_ema = copy.deepcopy(self.policy.base_net)
+            for param in self.base_net_ema.parameters():
+                param.requires_grad = False
+        else:
+            self.base_net_ema = None
         
         # Value network (shares encoder with policy)
         self.value_net = MultiModalValueNetwork(
@@ -156,13 +189,21 @@ class ReinFlowAgent:
             obs_encoder=self.obs_encoder,
         ).to(device)
         
-        # Old policy for PPO
-        self.old_policy = MultiModalNoisyFlowMLP(
-            action_dim=action_dim,
-            hidden_dims=hidden_dims + [256],
-            noise_scheduler_type=noise_scheduler_type,
-            obs_encoder=self.obs_encoder,
-        ).to(device)
+        # Old policy for PPO (match the policy type)
+        if use_shortcut:
+            self.old_policy = MultiModalNoisyShortCutFlowMLP(
+                action_dim=action_dim,
+                hidden_dims=hidden_dims,
+                noise_scheduler_type=noise_scheduler_type,
+                obs_encoder=self.obs_encoder,
+            ).to(device)
+        else:
+            self.old_policy = MultiModalNoisyFlowMLP(
+                action_dim=action_dim,
+                hidden_dims=hidden_dims,
+                noise_scheduler_type=noise_scheduler_type,
+                obs_encoder=self.obs_encoder,
+            ).to(device)
         self._sync_old_policy()
         for p in self.old_policy.parameters():
             p.requires_grad = False
@@ -192,6 +233,14 @@ class ReinFlowAgent:
         self.old_policy.time_embed.load_state_dict(self.policy.time_embed.state_dict())
         self.old_policy.obs_embed.load_state_dict(self.policy.obs_embed.state_dict())
         self.old_policy.explore_noise_net.load_state_dict(self.policy.explore_noise_net.state_dict())
+    
+    def _update_ema(self):
+        """Update EMA network with exponential moving average of base_net weights."""
+        if self.base_net_ema is None:
+            return
+        with torch.no_grad():
+            for ema_param, param in zip(self.base_net_ema.parameters(), self.policy.base_net.parameters()):
+                ema_param.data.mul_(self.ema_decay).add_(param.data, alpha=1.0 - self.ema_decay)
     
     def _parse_observation(
         self,
@@ -301,9 +350,16 @@ class ReinFlowAgent:
             t = torch.full((batch_size,), i * dt, device=self.device)
             
             # Get velocity and learned noise scale
-            velocity, noise, noise_std = self.policy(
-                x, t, obs_features=obs_features, sample_noise=sample_noise
-            )
+            if self.use_shortcut:
+                # ShortCut model needs step size d
+                d = torch.full((batch_size,), dt, device=self.device)
+                velocity, noise, noise_std = self.policy(
+                    x, t, d, obs_features=obs_features, sample_noise=sample_noise
+                )
+            else:
+                velocity, noise, noise_std = self.policy(
+                    x, t, obs_features=obs_features, sample_noise=sample_noise
+                )
             
             # Deterministic update
             x_mean = x + velocity * dt
@@ -373,7 +429,12 @@ class ReinFlowAgent:
         
         for i in range(self.num_flow_steps):
             t = torch.full((batch_size,), i * dt, device=self.device)
-            velocity, _, noise_std = policy(x, t, obs_features=obs_features, sample_noise=False)
+            
+            if self.use_shortcut:
+                d = torch.full((batch_size,), dt, device=self.device)
+                velocity, _, noise_std = policy(x, t, d, obs_features=obs_features, sample_noise=False)
+            else:
+                velocity, _, noise_std = policy(x, t, obs_features=obs_features, sample_noise=False)
             
             # Accumulate variance from stochastic steps
             # Each step contributes noise_std^2 to total variance
@@ -413,18 +474,26 @@ class ReinFlowAgent:
         """Sample action using only base velocity network (deterministic ODE).
         
         Use for evaluation after pretrain but before fine-tuning.
+        Uses EMA network if available for more stable inference.
         """
         state, image = self._parse_observation(obs)
         batch_size = state.shape[0] if state is not None else image.shape[0]
         
         obs_features = self.obs_encoder(state=state, image=image)
         
+        # Use EMA network if available, otherwise use base_net
+        velocity_net = self.base_net_ema if self.base_net_ema is not None else self.policy.base_net
+        
         dt = 1.0 / self.num_flow_steps
         x = torch.randn(batch_size, self.action_dim, device=self.device)
         
         for i in range(self.num_flow_steps):
             t = torch.full((batch_size,), i * dt, device=self.device)
-            velocity = self.policy.base_net(x, t, obs_features=obs_features)
+            if self.use_shortcut:
+                d = torch.full((batch_size,), dt, device=self.device)
+                velocity = velocity_net(x, t, d, obs_features=obs_features)
+            else:
+                velocity = velocity_net(x, t, obs_features=obs_features)
             x = x + velocity * dt
         
         action = torch.clamp(x, -1.0, 1.0)
@@ -648,19 +717,77 @@ class ReinFlowAgent:
             "entropy": total_entropy / num_updates
         }
     
-    def pretrain_bc(
+    def pretrain_bc_step(
         self,
-        dataloader,
-        num_steps: int = 1000,
+        actions: torch.Tensor,
+        obs_features: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        max_grad_norm: float = 1.0,
     ) -> Dict[str, float]:
-        """Pretrain with behavior cloning using flow matching objective.
+        """Single step of BC pretraining with ShortCut flow support.
+        
+        This method is designed for external training loops that need
+        intermediate evaluation. Use this when you need fine-grained control
+        over the training process.
         
         Args:
-            dataloader: PyTorch DataLoader yielding batches
-            num_steps: Number of BC steps
+            actions: Target actions (B, action_dim)
+            obs_features: Pre-computed observation features from obs_encoder
+            optimizer: External optimizer for updating parameters
+            max_grad_norm: Maximum gradient norm for clipping
             
         Returns:
-            Dictionary with BC metrics
+            Dictionary with step metrics:
+            - 'loss': Total loss value
+            - 'fm_loss': Flow matching loss (if use_shortcut)
+            - 'sc_loss': Self-consistency loss (if use_shortcut)
+        """
+        if self.use_shortcut:
+            # ShortCut flow with self-consistency loss
+            loss, fm_loss, sc_loss = self._compute_shortcut_loss(
+                actions, obs_features
+            )
+            result = {
+                'loss': loss.item(),
+                'fm_loss': fm_loss,
+                'sc_loss': sc_loss
+            }
+        else:
+            # Standard flow matching loss (no sigma_min)
+            batch_size = actions.shape[0]
+            x_0 = torch.randn_like(actions)
+            t = torch.rand(batch_size, device=self.device)
+            
+            t_expand = t.unsqueeze(-1)
+            x_t = (1 - t_expand) * x_0 + t_expand * actions
+            target_v = actions - x_0
+            
+            pred_v = self.policy.base_net(x_t, t, obs_features=obs_features)
+            loss = F.mse_loss(pred_v, target_v)
+            result = {'loss': loss.item()}
+        
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Get trainable params for gradient clipping
+        bc_params = list(self.policy.base_net.parameters())
+        if self.obs_mode in ["image", "state_image"] and self.obs_encoder.vision_encoder is not None:
+            vision_params = [p for p in self.obs_encoder.vision_encoder.parameters() if p.requires_grad]
+            bc_params.extend(vision_params)
+        
+        torch.nn.utils.clip_grad_norm_(bc_params, max_grad_norm)
+        optimizer.step()
+        
+        # Update EMA
+        self._update_ema()
+        
+        return result
+    
+    def get_pretrain_parameters(self) -> list:
+        """Get parameters for BC pretraining optimizer.
+        
+        Returns:
+            List of parameters to optimize during pretraining
         """
         bc_params = list(self.policy.base_net.parameters())
         
@@ -669,10 +796,35 @@ class ReinFlowAgent:
             vision_params = [p for p in self.obs_encoder.vision_encoder.parameters() if p.requires_grad]
             bc_params.extend(vision_params)
         
-        bc_optimizer = torch.optim.Adam(bc_params, lr=1e-4)
+        return bc_params
+    
+    def pretrain_bc(
+        self,
+        dataloader,
+        num_steps: int = 1000,
+        learning_rate: float = 3e-4,
+        max_grad_norm: float = 1.0,
+    ) -> Dict[str, float]:
+        """Pretrain with behavior cloning using flow matching objective.
         
-        sigma_min = 0.001
+        If use_shortcut is True, uses ShortCut flow with self-consistency loss:
+        - 25% of batch: self-consistency loss (two-step velocity average target)
+        - 75% of batch: standard flow matching loss
+        
+        Args:
+            dataloader: PyTorch DataLoader yielding batches
+            num_steps: Number of BC steps
+            learning_rate: Learning rate for BC optimizer
+            max_grad_norm: Maximum gradient norm for clipping
+            
+        Returns:
+            Dictionary with BC metrics
+        """
+        bc_optimizer = torch.optim.Adam(self.get_pretrain_parameters(), lr=learning_rate)
+        
         total_loss = 0
+        total_fm_loss = 0
+        total_sc_loss = 0
         step = 0
         data_iter = iter(dataloader)
         
@@ -693,35 +845,126 @@ class ReinFlowAgent:
                 images = images.to(self.device)
             
             actions = batch["action"].to(self.device)
-            batch_size = actions.shape[0]
             
             # Compute observation features
             obs_features = self.obs_encoder(state=states, image=images)
             
-            # Flow matching loss
-            x_0 = torch.randn_like(actions)
-            t = torch.rand(batch_size, device=self.device)
+            # Use pretrain_bc_step for single step training
+            step_metrics = self.pretrain_bc_step(
+                actions=actions,
+                obs_features=obs_features,
+                optimizer=bc_optimizer,
+                max_grad_norm=max_grad_norm
+            )
             
-            t_expand = t.unsqueeze(-1)
-            sigma_t = 1 - (1 - sigma_min) * t_expand
-            x_t = sigma_t * x_0 + t_expand * actions
+            total_loss += step_metrics['loss']
+            if 'fm_loss' in step_metrics:
+                total_fm_loss += step_metrics['fm_loss']
+            if 'sc_loss' in step_metrics:
+                total_sc_loss += step_metrics['sc_loss']
             
-            target_v = actions - (1 - sigma_min) * x_0
-            
-            pred_v = self.policy.base_net(x_t, t, obs_features=obs_features)
-            
-            loss = F.mse_loss(pred_v, target_v)
-            
-            bc_optimizer.zero_grad()
-            loss.backward()
-            bc_optimizer.step()
-            
-            total_loss += loss.item()
             step += 1
         
         self._sync_old_policy()
         
-        return {"bc_loss": total_loss / num_steps}
+        result = {"bc_loss": total_loss / num_steps}
+        if self.use_shortcut:
+            result["fm_loss"] = total_fm_loss / num_steps
+            result["sc_loss"] = total_sc_loss / num_steps
+        return result
+    
+    def _compute_shortcut_loss(
+        self,
+        actions: torch.Tensor,
+        obs_features: torch.Tensor
+    ) -> Tuple[torch.Tensor, float, float]:
+        """Compute ShortCut flow loss with self-consistency.
+        
+        Following ReinFlow's ShortCutFlow:
+        - 25% of batch uses self-consistency loss (two-step velocity average as target)
+        - 75% of batch uses standard flow matching loss
+        
+        Args:
+            actions: Target actions (B, action_dim), i.e., x_1
+            obs_features: Pre-computed observation features
+            
+        Returns:
+            Tuple of (total_loss, fm_loss_value, sc_loss_value)
+        """
+        B = actions.shape[0]
+        k_num = int(B * self.self_consistency_k)  # Number for self-consistency
+        
+        # ============================================================
+        # Self-consistency part (first k_num samples)
+        # ============================================================
+        x_sc_1 = actions[:k_num]
+        obs_sc = obs_features[:k_num]
+        
+        # Sample step size: d = 1 / 2^d_base, where d_base in [0, max_denoising_steps-1)
+        d_base_sc = torch.randint(0, self.max_denoising_steps - 1, (k_num,), device=self.device)
+        d_sc = 1.0 / (2 ** d_base_sc.float())  # Step size for prediction
+        d_bootstrap_sc = d_sc / 2  # Half step size for bootstrap
+        dt_sections_sc = 2 ** d_base_sc  # Number of time sections
+        
+        # Sample time t from discrete grid compatible with step size
+        t_idx_sc = torch.cat([
+            torch.randint(0, max(1, int(dt_sections_sc[i])), (1,), device=self.device) 
+            for i in range(k_num)
+        ], dim=0)
+        t_sc = t_idx_sc.float() / dt_sections_sc.float()
+        
+        # Sample initial noise
+        x0_sc = torch.randn_like(x_sc_1)
+        
+        # Interpolate to get x_t
+        t_expand_sc = t_sc.unsqueeze(-1)
+        x_t_sc = (1 - (1 - self.delta) * t_expand_sc) * x0_sc + t_expand_sc * x_sc_1
+        
+        # Two-step velocity averaging (self-consistency target)
+        with torch.no_grad():
+            # First step: velocity at (x_t, t) with half step size
+            v_t_sc = self.policy.base_net(x_t_sc, t_sc, d_bootstrap_sc, obs_features=obs_sc)
+            
+            # Advance by d_bootstrap
+            d_bootstrap_expand = d_bootstrap_sc.unsqueeze(-1)
+            x_t2_sc = x_t_sc + v_t_sc * d_bootstrap_expand
+            t2_sc = t_sc + d_bootstrap_sc
+            
+            # Second step: velocity at (x_t2, t2) with half step size
+            v_t2_sc = self.policy.base_net(x_t2_sc, t2_sc, d_bootstrap_sc, obs_features=obs_sc)
+            
+            # Target: average of two velocities (self-consistency)
+            v_target_sc = (v_t_sc + v_t2_sc) / 2
+        
+        # Predict velocity with full step size d_sc
+        v_pred_sc = self.policy.base_net(x_t_sc, t_sc, d_sc, obs_features=obs_sc)
+        sc_loss = F.mse_loss(v_pred_sc, v_target_sc)
+        
+        # ============================================================
+        # Flow matching part (remaining B - k_num samples)
+        # ============================================================
+        x_fm_1 = actions[k_num:]
+        obs_fm = obs_features[k_num:]
+        fm_batch_size = B - k_num
+        
+        # Standard flow matching: d=0 means no self-consistency
+        t_fm = torch.rand(fm_batch_size, device=self.device)
+        x0_fm = torch.randn_like(x_fm_1)
+        
+        t_expand_fm = t_fm.unsqueeze(-1)
+        x_t_fm = (1 - (1 - self.delta) * t_expand_fm) * x0_fm + t_expand_fm * x_fm_1
+        v_target_fm = x_fm_1 - (1 - self.delta) * x0_fm
+        
+        # For flow matching, d=0 (or very small)
+        d_fm = torch.zeros(fm_batch_size, device=self.device)
+        
+        v_pred_fm = self.policy.base_net(x_t_fm, t_fm, d_fm, obs_features=obs_fm)
+        fm_loss = F.mse_loss(v_pred_fm, v_target_fm)
+        
+        # Combined loss
+        total_loss = sc_loss + fm_loss
+        
+        return total_loss, fm_loss.item(), sc_loss.item()
     
     def save(self, path: str):
         """Save model checkpoint."""
@@ -733,13 +976,21 @@ class ReinFlowAgent:
             "total_steps": self.total_steps,
             "obs_mode": self.obs_mode,
             "noise_scheduler_type": self.noise_scheduler_type,
+            "use_ema": self.use_ema,
+            "ema_decay": self.ema_decay,
+            "use_shortcut": self.use_shortcut,
             "config": {
                 "action_dim": self.action_dim,
                 "state_dim": self.state_dim,
                 "image_shape": self.image_shape,
                 "num_flow_steps": self.num_flow_steps,
+                "self_consistency_k": self.self_consistency_k,
+                "max_denoising_steps": self.max_denoising_steps,
+                "delta": self.delta,
             },
         }
+        if self.base_net_ema is not None:
+            checkpoint["base_net_ema"] = self.base_net_ema.state_dict()
         torch.save(checkpoint, path)
     
     def load(self, path: str):
@@ -750,6 +1001,9 @@ class ReinFlowAgent:
         self.obs_encoder.load_state_dict(checkpoint["obs_encoder"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
         self.total_steps = checkpoint["total_steps"]
+        # Load EMA if available
+        if "base_net_ema" in checkpoint and self.base_net_ema is not None:
+            self.base_net_ema.load_state_dict(checkpoint["base_net_ema"])
         self._sync_old_policy()
     
     def load_pretrained(self, checkpoint_path: str):

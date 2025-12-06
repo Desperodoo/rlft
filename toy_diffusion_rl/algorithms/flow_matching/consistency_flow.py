@@ -164,7 +164,7 @@ class ConsistencyFlowPolicy:
         vision_encoder_type: str = "cnn",
         vision_output_dim: int = 128,
         freeze_vision_encoder: bool = False,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 3e-4,
         device: str = "cpu"
     ):
         self.action_dim = action_dim
@@ -501,40 +501,6 @@ class ConsistencyFlowPolicy:
             x = x + v * dt
         
         action = torch.clamp(x, -1.0, 1.0)
-        return action.cpu().numpy().squeeze()
-    
-    @torch.no_grad()
-    def sample_action_single_step(
-        self,
-        obs: Union[np.ndarray, Dict[str, np.ndarray]],
-        use_ema: bool = True
-    ) -> np.ndarray:
-        """Sample action in a single step (consistency model style).
-        
-        Args:
-            obs: Current observation
-            use_ema: If True, use EMA model
-            
-        Returns:
-            Sampled action
-        """
-        state, image = self._parse_observation(obs)
-        batch_size = state.shape[0] if state is not None else image.shape[0]
-        
-        net = self.ema_velocity_net if (use_ema and self.use_ema_teacher) else self.velocity_net
-        net.eval()
-        
-        obs_features = self.obs_encoder(state=state, image=image)
-        
-        # Start from noise
-        x_0 = torch.randn(batch_size, self.action_dim, device=self.device)
-        
-        # Single step at t=0: x_1 = x_0 + v(x_0, t=0)
-        t = torch.zeros(batch_size, device=self.device)
-        v = net(x_0, t, obs_features=obs_features)
-        x_1 = x_0 + v
-        
-        action = torch.clamp(x_1, -1.0, 1.0)
         return action.cpu().numpy().squeeze()
     
     def save(self, path: str):

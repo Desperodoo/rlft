@@ -19,100 +19,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import copy
 from typing import Dict, Optional, List, Tuple, Union
 
 try:
-    from ...common.networks import MLP, TimestepEmbedding
+    from ...common.networks import MLP, MultiModalVelocityPredictor
     from ...common.obs_encoder import ObservationEncoder, create_obs_encoder
 except ImportError:
     try:
-        from toy_diffusion_rl.common.networks import MLP, TimestepEmbedding
+        from toy_diffusion_rl.common.networks import MLP, MultiModalVelocityPredictor
         from toy_diffusion_rl.common.obs_encoder import ObservationEncoder, create_obs_encoder
     except ImportError:
         import sys
         from pathlib import Path
         sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-        from common.networks import MLP, TimestepEmbedding
+        from common.networks import MLP, MultiModalVelocityPredictor
         from common.obs_encoder import ObservationEncoder, create_obs_encoder
-
-
-class MultiModalReflectedVelocityPredictor(nn.Module):
-    """Velocity predictor with multi-modal observation support for reflected flow.
-    
-    Uses TimestepEmbedding (sinusoidal + MLP) for consistency with
-    non-multimodal FlowVelocityPredictor.
-    
-    Args:
-        action_dim: Dimension of action space
-        hidden_dims: Hidden layer dimensions
-        time_embed_dim: Dimension of timestep embedding
-        obs_encoder: ObservationEncoder for processing observations
-        obs_dim: Fallback observation dimension if no encoder
-    """
-    
-    def __init__(
-        self,
-        action_dim: int,
-        hidden_dims: List[int] = [256, 256, 256],
-        time_embed_dim: int = 64,
-        obs_encoder: Optional[ObservationEncoder] = None,
-        obs_dim: int = 0,
-    ):
-        super().__init__()
-        
-        self.action_dim = action_dim
-        self.obs_encoder = obs_encoder
-        
-        if obs_encoder is not None:
-            obs_feature_dim = obs_encoder.output_dim
-        else:
-            obs_feature_dim = obs_dim
-        
-        self.obs_feature_dim = obs_feature_dim
-        
-        # Use TimestepEmbedding for consistency with non-multimodal version
-        self.time_embed = TimestepEmbedding(time_embed_dim)
-        
-        # Velocity prediction network
-        input_dim = obs_feature_dim + action_dim + time_embed_dim
-        self.net = MLP(
-            input_dim=input_dim,
-            output_dim=action_dim,
-            hidden_dims=hidden_dims,
-            activation=nn.SiLU(),
-        )
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        state: Optional[torch.Tensor] = None,
-        image: Optional[torch.Tensor] = None,
-        obs_features: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Predict velocity at position x and time t.
-        
-        Args:
-            x: Current position in flow (B, action_dim)
-            t: Current timestep in [0, 1] (B,)
-            state: Optional state vector (B, state_dim)
-            image: Optional image tensor (B, C, H, W)
-            obs_features: Pre-computed observation features
-        
-        Returns:
-            Predicted velocity (B, action_dim)
-        """
-        if obs_features is not None:
-            features = obs_features
-        elif self.obs_encoder is not None:
-            features = self.obs_encoder(state=state, image=image)
-        else:
-            features = state
-        
-        # Use TimestepEmbedding (takes raw t, handles conversion internally)
-        t_embed = self.time_embed(t)
-        combined = torch.cat([features, x, t_embed], dim=-1)
-        return self.net(combined)
 
 
 class ReflectedFlowPolicy:
@@ -136,6 +58,8 @@ class ReflectedFlowPolicy:
         reflection_mode: 'hard' or 'soft'
         action_bounds: Action bounds (default: [-1, 1])
         boundary_regularization: Weight for boundary regularization loss
+        use_ema: Whether to use EMA for inference
+        ema_decay: Decay rate for EMA
         vision_encoder_type: Type of vision encoder ("cnn" or "dinov2")
         vision_output_dim: Output dimension of vision encoder
         freeze_vision_encoder: Whether to freeze vision encoder
@@ -154,11 +78,12 @@ class ReflectedFlowPolicy:
         reflection_mode: str = "hard",
         action_bounds: Tuple[float, float] = (-1.0, 1.0),
         boundary_regularization: float = 0.1,
-        sigma_min: float = 0.001,
+        use_ema: bool = True,
+        ema_decay: float = 0.999,
         vision_encoder_type: str = "cnn",
         vision_output_dim: int = 128,
         freeze_vision_encoder: bool = False,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 3e-4,
         device: str = "cpu"
     ):
         self.action_dim = action_dim
@@ -170,7 +95,8 @@ class ReflectedFlowPolicy:
         self.action_low = action_bounds[0]
         self.action_high = action_bounds[1]
         self.boundary_regularization = boundary_regularization
-        self.sigma_min = sigma_min
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
         self.device = device
         
         # Create observation encoder
@@ -183,12 +109,20 @@ class ReflectedFlowPolicy:
             freeze_vision=freeze_vision_encoder,
         ).to(device)
         
-        # Velocity network
-        self.velocity_net = MultiModalReflectedVelocityPredictor(
+        # Velocity network (use same as FlowMatching for consistency)
+        self.velocity_net = MultiModalVelocityPredictor(
             action_dim=action_dim,
             hidden_dims=hidden_dims,
             obs_encoder=self.obs_encoder,
         ).to(device)
+        
+        # EMA velocity network for stable inference
+        if use_ema:
+            self.velocity_net_ema = copy.deepcopy(self.velocity_net)
+            for p in self.velocity_net_ema.parameters():
+                p.requires_grad = False
+        else:
+            self.velocity_net_ema = None
         
         # Collect trainable parameters
         trainable_params = list(self.velocity_net.parameters())
@@ -198,6 +132,16 @@ class ReflectedFlowPolicy:
             trainable_params.extend(vision_params)
         
         self.optimizer = torch.optim.Adam(trainable_params, lr=learning_rate)
+        self.total_steps = 0
+    
+    def _update_ema(self):
+        """Update EMA velocity network."""
+        if not self.use_ema or self.velocity_net_ema is None:
+            return
+        
+        with torch.no_grad():
+            for ema_p, p in zip(self.velocity_net_ema.parameters(), self.velocity_net.parameters()):
+                ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
     
     def _parse_observation(
         self,
@@ -408,19 +352,25 @@ class ReflectedFlowPolicy:
         torch.nn.utils.clip_grad_norm_(self.velocity_net.parameters(), 1.0)
         self.optimizer.step()
         
+        # Update EMA
+        self._update_ema()
+        self.total_steps += 1
+        
         return {"loss": loss.item()}
     
     @torch.no_grad()
     def sample_action(
         self,
         obs: Union[np.ndarray, Dict[str, np.ndarray]],
-        num_steps: Optional[int] = None
+        num_steps: Optional[int] = None,
+        deterministic: bool = True
     ) -> np.ndarray:
         """Sample action with reflected integration.
         
         Args:
             obs: Current observation
             num_steps: Number of integration steps
+            deterministic: If True, use EMA model for stable inference
             
         Returns:
             Sampled action
@@ -428,7 +378,9 @@ class ReflectedFlowPolicy:
         state, image = self._parse_observation(obs)
         batch_size = state.shape[0] if state is not None else image.shape[0]
         
-        self.velocity_net.eval()
+        # Use EMA model for deterministic sampling
+        net = self.velocity_net_ema if (deterministic and self.use_ema and self.velocity_net_ema is not None) else self.velocity_net
+        net.eval()
         num_steps = num_steps or self.num_inference_steps
         
         # Pre-compute observation features
@@ -441,7 +393,7 @@ class ReflectedFlowPolicy:
         
         for i in range(num_steps):
             t = torch.full((batch_size,), i * dt, device=self.device)
-            v = self.velocity_net(x, t, obs_features=obs_features)
+            v = net(x, t, obs_features=obs_features)
             
             # Apply reflection during integration
             x = self._reflect_trajectory(x, v, dt)
@@ -457,6 +409,7 @@ class ReflectedFlowPolicy:
             "velocity_net": self.velocity_net.state_dict(),
             "obs_encoder": self.obs_encoder.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "total_steps": self.total_steps,
             "obs_mode": self.obs_mode,
             "config": {
                 "action_dim": self.action_dim,
@@ -465,8 +418,12 @@ class ReflectedFlowPolicy:
                 "num_inference_steps": self.num_inference_steps,
                 "reflection_mode": self.reflection_mode,
                 "action_bounds": (self.action_low, self.action_high),
+                "use_ema": self.use_ema,
+                "ema_decay": self.ema_decay,
             },
         }
+        if self.use_ema and self.velocity_net_ema is not None:
+            checkpoint["velocity_net_ema"] = self.velocity_net_ema.state_dict()
         torch.save(checkpoint, path)
         
     def load(self, path: str):
@@ -475,3 +432,6 @@ class ReflectedFlowPolicy:
         self.velocity_net.load_state_dict(checkpoint["velocity_net"])
         self.obs_encoder.load_state_dict(checkpoint["obs_encoder"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.total_steps = checkpoint.get("total_steps", 0)
+        if self.use_ema and "velocity_net_ema" in checkpoint and self.velocity_net_ema is not None:
+            self.velocity_net_ema.load_state_dict(checkpoint["velocity_net_ema"])

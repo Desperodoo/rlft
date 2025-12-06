@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Validate All Diffusion/Flow RL Algorithms on ManiSkill3 PickCube Task (Offline)
+Validate All Diffusion/Flow RL Algorithms on ManiSkill3 Tasks (Offline)
 
-This script tests all unified algorithm implementations on the ManiSkill3 PickCube-v1
-robotics task with state_image (multimodal) observation mode.
+This script tests all unified algorithm implementations on ManiSkill3
+robotics tasks with state_image (multimodal) observation mode.
+
+Supported Tasks:
+- PickCube-v1: Pick up a cube and place it at a goal position
+- PegInsertionSide-v1: Insert a peg into a box from the side
 
 Features:
 - Video recording of evaluation episodes (first 3 episodes per eval)
@@ -21,22 +25,26 @@ Algorithms (Behavior Cloning / Offline RL):
 8. ReinFlow (pretrain only, no online finetuning)
 
 Observation modes:
-- "state": State vector only (dim=42)
+- "state": State vector only (dim depends on task)
 - "state_image": Both state and image (multimodal)
 
-Evaluation:
-- Success Rate: Percentage of episodes where cube is successfully picked
-- Average Reward: Mean episode reward
-
 Usage:
-    # Train and evaluate all algorithms on ManiSkill3 dataset
+    # Train and evaluate all algorithms on ManiSkill3 PickCube dataset
     python scripts/validate_maniskill_offline.py \
+        --task PickCube-v1 \
         --dataset_path data/maniskill_pickcube_1000.h5 \
         --obs_mode state_image \
         --num_steps 50000 \
         --eval_interval 5000 \
         --record_video \
         --video_dir ./results/videos
+    
+    # Train on PegInsertionSide with filtered dataset
+    python scripts/validate_maniskill_offline.py \
+        --task PegInsertionSide-v1 \
+        --dataset_path data/peg_insertion_side_filtered.h5 \
+        --obs_mode state_image \
+        --num_steps 100000
 """
 
 # Filter third-party deprecation warnings before imports
@@ -70,12 +78,13 @@ sys.path.insert(0, parent_dir)
 sys.path.insert(0, workspace_dir)
 
 # Import ManiSkill environment
-from toy_diffusion_rl.envs.maniskill_env import make_maniskill_env, check_maniskill_available
+from toy_diffusion_rl.envs.maniskill_env import make_maniskill_env, check_maniskill_available, TASK_DEFAULTS
 
 # Import agents
 from toy_diffusion_rl.algorithms.diffusion_policy.agent import DiffusionPolicyAgent
 from toy_diffusion_rl.algorithms.flow_matching.fm_policy import FlowMatchingPolicy
 from toy_diffusion_rl.algorithms.flow_matching.consistency_flow import ConsistencyFlowPolicy
+from toy_diffusion_rl.algorithms.flow_matching.consistency_flow_v2 import ConsistencyFlowPolicyV2
 from toy_diffusion_rl.algorithms.flow_matching.reflected_flow import ReflectedFlowPolicy
 from toy_diffusion_rl.algorithms.diffusion_double_q.agent import DiffusionDoubleQAgent
 from toy_diffusion_rl.algorithms.cpql.agent import CPQLAgent
@@ -430,9 +439,6 @@ def evaluate_agent(
                 episode_lengths.append(int(env_lengths[i]))
                 completed_episodes += 1
                 
-                if verbose:
-                    print(f"  Episode {completed_episodes}: reward={env_rewards[i]:.2f}, length={env_lengths[i]}, success={success}")
-                
                 # Save video for env 0
                 if i == 0 and should_record and video_frames:
                     status = "success" if success else "fail"
@@ -453,10 +459,17 @@ def evaluate_agent(
     total_reward = sum(episode_rewards)
     total_length = sum(episode_lengths)
     
+    success_rate = successes / num_episodes
+    avg_reward = total_reward / num_episodes
+    avg_length = total_length / num_episodes
+    
+    if verbose:
+        print(f"  Eval ({num_episodes} episodes): Success={success_rate:.1%}, AvgReward={avg_reward:.2f}, AvgLength={avg_length:.1f}")
+    
     return {
-        "success_rate": successes / num_episodes,
-        "avg_reward": total_reward / num_episodes,
-        "avg_length": total_length / num_episodes,
+        "success_rate": success_rate,
+        "avg_reward": avg_reward,
+        "avg_length": avg_length,
         "episode_rewards": episode_rewards,
         "episode_successes": episode_successes,
     }
@@ -477,8 +490,10 @@ def train_and_evaluate_all(
     max_episode_steps: int = 50,
     record_video: bool = False,
     video_dir: Optional[str] = None,
+    algorithms: Optional[List[str]] = None,
+    task: str = "PickCube-v1",
 ) -> Tuple[Dict[str, Dict[str, List]], Dict[str, Dict[str, Any]]]:
-    """Train all algorithms and track metrics.
+    """Train specified algorithms and track metrics.
     
     Args:
         dataset: Training dataset
@@ -495,12 +510,20 @@ def train_and_evaluate_all(
         max_episode_steps: Max steps per episode
         record_video: Whether to record evaluation videos
         video_dir: Directory to save videos (required if record_video=True)
+        algorithms: List of algorithm names to train (None = all)
+        task: ManiSkill3 task name (PickCube-v1, PegInsertionSide-v1, etc.)
         
     Returns:
         Tuple of:
         - results: Dict[algo_name -> Dict[metric_name -> List[values]]]
         - best_checkpoints: Dict[algo_name -> Dict with 'state_dict', 'step', 'success_rate', 'use_pretrain']
     """
+    # Default to all algorithms if not specified
+    if algorithms is None:
+        algorithms = [
+            "DiffusionPolicy", "FlowMatching", "ConsistencyFlow", "ConsistencyFlowV2", "ReflectedFlow",
+            "DiffusionQL", "CPQL", "DPPO", "ReinFlow"
+        ]
     results = {}
     best_checkpoints = {}
     batch_size = 256
@@ -539,10 +562,10 @@ def train_and_evaluate_all(
     
     # Create evaluation environment (VecEnv for parallel evaluation)
     # Use multiple envs for faster evaluation
-    num_eval_envs = 20  # Can increase for faster eval, but 4 is reasonable default
-    print(f"Creating evaluation environment (num_envs={num_eval_envs})...")
+    num_eval_envs = 40  # Can increase for faster eval, but 4 is reasonable default
+    print(f"Creating evaluation environment (task={task}, num_envs={num_eval_envs})...")
     eval_env = make_maniskill_env(
-        task="PickCube-v1",
+        task=task,
         obs_mode=obs_mode,
         num_envs=num_eval_envs,
         seed=seed + 1000,
@@ -569,588 +592,720 @@ def train_and_evaluate_all(
     
     # ==================== 1. Diffusion Policy ====================
     algo_name = "DiffusionPolicy"
-    print(f"\n{'='*60}")
-    print(f"Training {algo_name}...")
-    print(f"{'='*60}")
+    if algo_name in algorithms:
+        print(f"\n{'='*60}")
+        print(f"Training {algo_name}...")
+        print(f"{'='*60}")
     
-    results[algo_name] = {
-        "steps": [], "success_rate": [], "avg_reward": [],
-        "main_loss": []  # Track main training loss
-    }
-    loss_buffer = []  # Buffer to collect losses between evals
-    best_success = -1.0
-    
-    try:
-        agent = DiffusionPolicyAgent(
-            num_diffusion_steps=100,
-            **common_kwargs
-        )
+        results[algo_name] = {
+            "steps": [], "success_rate": [], "avg_reward": [],
+            "main_loss": []  # Track main training loss
+        }
+        loss_buffer = []  # Buffer to collect losses between evals
+        best_success = -1.0
         
-        for step in tqdm(range(num_steps + 1), desc=algo_name):
-            if step in eval_steps:
-                metrics = evaluate_agent(
-                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
-                    record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step,
-                    normalizer=normalizer
-                )
-                results[algo_name]["steps"].append(step)
-                results[algo_name]["success_rate"].append(metrics["success_rate"])
-                results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                # Record average loss since last eval
-                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
-                results[algo_name]["main_loss"].append(avg_loss)
-                loss_buffer.clear()
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
-                
-                if metrics["success_rate"] > best_success:
-                    best_success = metrics["success_rate"]
-                    temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
-                    agent.save(temp_path)
-                    best_checkpoints[algo_name] = {
-                        "temp_path": temp_path,
-                        "step": step,
-                        "success_rate": best_success,
-                        "use_pretrain": False,
-                        "agent_class": "DiffusionPolicyAgent",
-                        "normalizer_state": normalizer.state_dict(),
-                        "agent_kwargs": {"num_diffusion_steps": 100, **common_kwargs},
-                    }
-                    print(f"    -> New best! Saving checkpoint at step {step}")
+        try:
+            agent = DiffusionPolicyAgent(
+                num_diffusion_steps=100,
+                **common_kwargs
+            )
             
-            if step < num_steps:
-                idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
-                train_info = agent.train_step(batch)
-                if train_info and "loss" in train_info:
-                    loss_buffer.append(train_info["loss"])
+            for step in tqdm(range(num_steps + 1), desc=algo_name):
+                if step in eval_steps:
+                    metrics = evaluate_agent(
+                        agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                        record_video=record_video, video_dir=video_dir,
+                        algo_name=algo_name, eval_step=step,
+                        normalizer=normalizer
+                    )
+                    results[algo_name]["steps"].append(step)
+                    results[algo_name]["success_rate"].append(metrics["success_rate"])
+                    results[algo_name]["avg_reward"].append(metrics["avg_reward"])
+                    # Record average loss since last eval
+                    avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                    results[algo_name]["main_loss"].append(avg_loss)
+                    loss_buffer.clear()
+                    print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
+                    
+                    if metrics["success_rate"] > best_success:
+                        best_success = metrics["success_rate"]
+                        temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
+                        agent.save(temp_path)
+                        best_checkpoints[algo_name] = {
+                            "temp_path": temp_path,
+                            "step": step,
+                            "success_rate": best_success,
+                            "use_pretrain": False,
+                            "agent_class": "DiffusionPolicyAgent",
+                            "normalizer_state": normalizer.state_dict(),
+                            "agent_kwargs": {"num_diffusion_steps": 100, **common_kwargs},
+                        }
+                        print(f"    -> New best! Saving checkpoint at step {step}")
                 
-    except Exception as e:
-        print(f"  Error: {e}")
-        import traceback
-        traceback.print_exc()
+                if step < num_steps:
+                    idx = np.random.randint(0, n_samples, batch_size)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    train_info = agent.train_step(batch)
+                    if train_info and "loss" in train_info:
+                        loss_buffer.append(train_info["loss"])
+                    
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"Skipping {algo_name} (not in selected algorithms)")
     
     # ==================== 2. Flow Matching ====================
     algo_name = "FlowMatching"
-    print(f"\n{'='*60}")
-    print(f"Training {algo_name}...")
-    print(f"{'='*60}")
+    if algo_name in algorithms:
+        print(f"\n{'='*60}")
+        print(f"Training {algo_name}...")
+        print(f"{'='*60}")
     
-    results[algo_name] = {
-        "steps": [], "success_rate": [], "avg_reward": [],
-        "main_loss": []
-    }
-    loss_buffer = []
-    best_success = -1.0
-    
-    try:
-        agent = FlowMatchingPolicy(
-            num_inference_steps=20,
-            **common_kwargs
-        )
+        results[algo_name] = {
+            "steps": [], "success_rate": [], "avg_reward": [],
+            "main_loss": []
+        }
+        loss_buffer = []
+        best_success = -1.0
         
-        for step in tqdm(range(num_steps + 1), desc=algo_name):
-            if step in eval_steps:
-                metrics = evaluate_agent(
-                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
-                    record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step,
-                    normalizer=normalizer
-                )
-                results[algo_name]["steps"].append(step)
-                results[algo_name]["success_rate"].append(metrics["success_rate"])
-                results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
-                results[algo_name]["main_loss"].append(avg_loss)
-                loss_buffer.clear()
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
-                
-                if metrics["success_rate"] > best_success:
-                    best_success = metrics["success_rate"]
-                    temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
-                    agent.save(temp_path)
-                    best_checkpoints[algo_name] = {
-                        "temp_path": temp_path,
-                        "step": step,
-                        "success_rate": best_success,
-                        "use_pretrain": False,
-                        "agent_class": "FlowMatchingPolicy",
-                        "normalizer_state": normalizer.state_dict(),
-                        "agent_kwargs": {"num_inference_steps": 20, **common_kwargs},
-                    }
-                    print(f"    -> New best! Saving checkpoint at step {step}")
+        try:
+            agent = FlowMatchingPolicy(
+                num_inference_steps=10,
+                **common_kwargs
+            )
             
-            if step < num_steps:
-                idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
-                train_info = agent.train_step(batch)
-                if train_info and "loss" in train_info:
-                    loss_buffer.append(train_info["loss"])
+            for step in tqdm(range(num_steps + 1), desc=algo_name):
+                if step in eval_steps:
+                    metrics = evaluate_agent(
+                        agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                        record_video=record_video, video_dir=video_dir,
+                        algo_name=algo_name, eval_step=step,
+                        normalizer=normalizer
+                    )
+                    results[algo_name]["steps"].append(step)
+                    results[algo_name]["success_rate"].append(metrics["success_rate"])
+                    results[algo_name]["avg_reward"].append(metrics["avg_reward"])
+                    avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                    results[algo_name]["main_loss"].append(avg_loss)
+                    loss_buffer.clear()
+                    print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
+                    
+                    if metrics["success_rate"] > best_success:
+                        best_success = metrics["success_rate"]
+                        temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
+                        agent.save(temp_path)
+                        best_checkpoints[algo_name] = {
+                            "temp_path": temp_path,
+                            "step": step,
+                            "success_rate": best_success,
+                            "use_pretrain": False,
+                            "agent_class": "FlowMatchingPolicy",
+                            "normalizer_state": normalizer.state_dict(),
+                            "agent_kwargs": {"num_inference_steps": 10, **common_kwargs},
+                        }
+                        print(f"    -> New best! Saving checkpoint at step {step}")
                 
-    except Exception as e:
-        print(f"  Error: {e}")
-        import traceback
-        traceback.print_exc()
+                if step < num_steps:
+                    idx = np.random.randint(0, n_samples, batch_size)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    train_info = agent.train_step(batch)
+                    if train_info and "loss" in train_info:
+                        loss_buffer.append(train_info["loss"])
+                    
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"Skipping {algo_name} (not in selected algorithms)")
     
     # ==================== 3. Consistency Flow ====================
     algo_name = "ConsistencyFlow"
-    print(f"\n{'='*60}")
-    print(f"Training {algo_name}...")
-    print(f"{'='*60}")
+    if algo_name in algorithms:
+        print(f"\n{'='*60}")
+        print(f"Training {algo_name}...")
+        print(f"{'='*60}")
     
-    results[algo_name] = {
-        "steps": [], "success_rate": [], "avg_reward": [],
-        "main_loss": []
-    }
-    loss_buffer = []
-    best_success = -1.0
-    
-    try:
-        agent = ConsistencyFlowPolicy(
-            num_inference_steps=5,
-            flow_batch_ratio=0.7,
-            consistency_batch_ratio=0.3,
-            **common_kwargs
-        )
+        results[algo_name] = {
+            "steps": [], "success_rate": [], "avg_reward": [],
+            "main_loss": []
+        }
+        loss_buffer = []
+        best_success = -1.0
         
-        for step in tqdm(range(num_steps + 1), desc=algo_name):
-            if step in eval_steps:
-                metrics = evaluate_agent(
-                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
-                    record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step,
-                    normalizer=normalizer
-                )
-                results[algo_name]["steps"].append(step)
-                results[algo_name]["success_rate"].append(metrics["success_rate"])
-                results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
-                results[algo_name]["main_loss"].append(avg_loss)
-                loss_buffer.clear()
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
-                
-                if metrics["success_rate"] > best_success:
-                    best_success = metrics["success_rate"]
-                    temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
-                    agent.save(temp_path)
-                    best_checkpoints[algo_name] = {
-                        "temp_path": temp_path,
-                        "step": step,
-                        "success_rate": best_success,
-                        "use_pretrain": False,
-                        "agent_class": "ConsistencyFlowPolicy",
-                        "normalizer_state": normalizer.state_dict(),
-                        "agent_kwargs": {"num_inference_steps": 5, "flow_batch_ratio": 0.7, "consistency_batch_ratio": 0.3, **common_kwargs},
-                    }
-                    print(f"    -> New best! Saving checkpoint at step {step}")
+        try:
+            agent = ConsistencyFlowPolicy(
+                num_inference_steps=10,
+                flow_batch_ratio=0.7,
+                consistency_batch_ratio=0.3,
+                **common_kwargs
+            )
             
-            if step < num_steps:
-                idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
-                train_info = agent.train_step(batch)
-                if train_info and "loss" in train_info:
-                    loss_buffer.append(train_info["loss"])
+            for step in tqdm(range(num_steps + 1), desc=algo_name):
+                if step in eval_steps:
+                    metrics = evaluate_agent(
+                        agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                        record_video=record_video, video_dir=video_dir,
+                        algo_name=algo_name, eval_step=step,
+                        normalizer=normalizer
+                    )
+                    results[algo_name]["steps"].append(step)
+                    results[algo_name]["success_rate"].append(metrics["success_rate"])
+                    results[algo_name]["avg_reward"].append(metrics["avg_reward"])
+                    avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                    results[algo_name]["main_loss"].append(avg_loss)
+                    loss_buffer.clear()
+                    print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
+                    
+                    if metrics["success_rate"] > best_success:
+                        best_success = metrics["success_rate"]
+                        temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
+                        agent.save(temp_path)
+                        best_checkpoints[algo_name] = {
+                            "temp_path": temp_path,
+                            "step": step,
+                            "success_rate": best_success,
+                            "use_pretrain": False,
+                            "agent_class": "ConsistencyFlowPolicy",
+                            "normalizer_state": normalizer.state_dict(),
+                            "agent_kwargs": {"num_inference_steps": 10, "flow_batch_ratio": 0.7, "consistency_batch_ratio": 0.3, **common_kwargs},
+                        }
+                        print(f"    -> New best! Saving checkpoint at step {step}")
                 
-    except Exception as e:
-        print(f"  Error: {e}")
-        import traceback
-        traceback.print_exc()
+                if step < num_steps:
+                    idx = np.random.randint(0, n_samples, batch_size)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    train_info = agent.train_step(batch)
+                    if train_info and "loss" in train_info:
+                        loss_buffer.append(train_info["loss"])
+                    
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"Skipping {algo_name} (not in selected algorithms)")
+    
+    # ==================== 3.5. Consistency Flow V2 (aligned with CPQL) ====================
+    algo_name = "ConsistencyFlowV2"
+    if algo_name in algorithms:
+        print(f"\n{'='*60}")
+        print(f"Training {algo_name} (aligned with CPQL)...")
+        print(f"{'='*60}")
+    
+        results[algo_name] = {
+            "steps": [], "success_rate": [], "avg_reward": [],
+            "main_loss": [], "bc_loss": [], "consistency_loss": []
+        }
+        loss_buffers = defaultdict(list)
+        best_success = -1.0
+        
+        try:
+            agent = ConsistencyFlowPolicyV2(
+                num_flow_steps=10,  # Same as CPQL
+                bc_weight=1.0,
+                consistency_weight=1.0,
+                learning_rate=3e-4,  # Same as CPQL
+                **common_kwargs
+            )
+            
+            for step in tqdm(range(num_steps + 1), desc=algo_name):
+                if step in eval_steps:
+                    metrics = evaluate_agent(
+                        agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                        record_video=record_video, video_dir=video_dir,
+                        algo_name=algo_name, eval_step=step,
+                        normalizer=normalizer
+                    )
+                    results[algo_name]["steps"].append(step)
+                    results[algo_name]["success_rate"].append(metrics["success_rate"])
+                    results[algo_name]["avg_reward"].append(metrics["avg_reward"])
+                    
+                    # Aggregate loss metrics
+                    for key in ["bc_loss", "consistency_loss"]:
+                        avg_val = np.mean(loss_buffers[key]) if loss_buffers[key] else 0.0
+                        results[algo_name][key].append(avg_val)
+                    main_loss = np.mean(loss_buffers["loss"]) if loss_buffers["loss"] else 0.0
+                    results[algo_name]["main_loss"].append(main_loss)
+                    
+                    # Clear buffers
+                    for key in loss_buffers:
+                        loss_buffers[key].clear()
+                    
+                    print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={main_loss:.4f}")
+                    
+                    if metrics["success_rate"] > best_success:
+                        best_success = metrics["success_rate"]
+                        temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
+                        agent.save(temp_path)
+                        best_checkpoints[algo_name] = {
+                            "temp_path": temp_path,
+                            "step": step,
+                            "success_rate": best_success,
+                            "use_pretrain": False,
+                            "agent_class": "ConsistencyFlowPolicyV2",
+                            "normalizer_state": normalizer.state_dict(),
+                            "agent_kwargs": {"num_flow_steps": 10, "bc_weight": 1.0, "consistency_weight": 1.0, **common_kwargs},
+                        }
+                        print(f"    -> New best! Saving checkpoint at step {step}")
+                
+                if step < num_steps:
+                    idx = np.random.randint(0, n_samples, batch_size)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    train_info = agent.train_step(batch)
+                    if train_info:
+                        for key in ["loss", "bc_loss", "consistency_loss"]:
+                            if key in train_info:
+                                loss_buffers[key].append(train_info[key])
+                    
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"Skipping {algo_name} (not in selected algorithms)")
     
     # ==================== 4. Reflected Flow ====================
     algo_name = "ReflectedFlow"
-    print(f"\n{'='*60}")
-    print(f"Training {algo_name}...")
-    print(f"{'='*60}")
+    if algo_name in algorithms:
+        print(f"\n{'='*60}")
+        print(f"Training {algo_name}...")
+        print(f"{'='*60}")
     
-    results[algo_name] = {
-        "steps": [], "success_rate": [], "avg_reward": [],
-        "main_loss": []
-    }
-    loss_buffer = []
-    best_success = -1.0
-    
-    try:
-        agent = ReflectedFlowPolicy(
-            num_inference_steps=20,
-            reflection_mode="hard",
-            **common_kwargs
-        )
+        results[algo_name] = {
+            "steps": [], "success_rate": [], "avg_reward": [],
+            "main_loss": []
+        }
+        loss_buffer = []
+        best_success = -1.0
         
-        for step in tqdm(range(num_steps + 1), desc=algo_name):
-            if step in eval_steps:
-                metrics = evaluate_agent(
-                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
-                    record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step,
-                    normalizer=normalizer
-                )
-                results[algo_name]["steps"].append(step)
-                results[algo_name]["success_rate"].append(metrics["success_rate"])
-                results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
-                results[algo_name]["main_loss"].append(avg_loss)
-                loss_buffer.clear()
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
-                
-                if metrics["success_rate"] > best_success:
-                    best_success = metrics["success_rate"]
-                    temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
-                    agent.save(temp_path)
-                    best_checkpoints[algo_name] = {
-                        "temp_path": temp_path,
-                        "step": step,
-                        "success_rate": best_success,
-                        "use_pretrain": False,
-                        "agent_class": "ReflectedFlowPolicy",
-                        "normalizer_state": normalizer.state_dict(),
-                        "agent_kwargs": {"num_inference_steps": 20, "reflection_mode": "hard", **common_kwargs},
-                    }
-                    print(f"    -> New best! Saving checkpoint at step {step}")
+        try:
+            agent = ReflectedFlowPolicy(
+                num_inference_steps=10,
+                reflection_mode="hard",
+                **common_kwargs
+            )
             
-            if step < num_steps:
-                idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
-                train_info = agent.train_step(batch)
-                if train_info and "loss" in train_info:
-                    loss_buffer.append(train_info["loss"])
+            for step in tqdm(range(num_steps + 1), desc=algo_name):
+                if step in eval_steps:
+                    metrics = evaluate_agent(
+                        agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                        record_video=record_video, video_dir=video_dir,
+                        algo_name=algo_name, eval_step=step,
+                        normalizer=normalizer
+                    )
+                    results[algo_name]["steps"].append(step)
+                    results[algo_name]["success_rate"].append(metrics["success_rate"])
+                    results[algo_name]["avg_reward"].append(metrics["avg_reward"])
+                    avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                    results[algo_name]["main_loss"].append(avg_loss)
+                    loss_buffer.clear()
+                    print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
+                    
+                    if metrics["success_rate"] > best_success:
+                        best_success = metrics["success_rate"]
+                        temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
+                        agent.save(temp_path)
+                        best_checkpoints[algo_name] = {
+                            "temp_path": temp_path,
+                            "step": step,
+                            "success_rate": best_success,
+                            "use_pretrain": False,
+                            "agent_class": "ReflectedFlowPolicy",
+                            "normalizer_state": normalizer.state_dict(),
+                            "agent_kwargs": {"num_inference_steps": 10, "reflection_mode": "hard", **common_kwargs},
+                        }
+                        print(f"    -> New best! Saving checkpoint at step {step}")
                 
-    except Exception as e:
-        print(f"  Error: {e}")
-        import traceback
-        traceback.print_exc()
+                if step < num_steps:
+                    idx = np.random.randint(0, n_samples, batch_size)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    train_info = agent.train_step(batch)
+                    if train_info and "loss" in train_info:
+                        loss_buffer.append(train_info["loss"])
+                    
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"Skipping {algo_name} (not in selected algorithms)")
     
     # ==================== 5. Diffusion QL ====================
     algo_name = "DiffusionQL"
-    print(f"\n{'='*60}")
-    print(f"Training {algo_name}...")
-    print(f"{'='*60}")
+    if algo_name in algorithms:
+        print(f"\n{'='*60}")
+        print(f"Training {algo_name}...")
+        print(f"{'='*60}")
     
-    results[algo_name] = {
-        "steps": [], "success_rate": [], "avg_reward": [],
-        "main_loss": [], "critic_loss": [], "actor_loss": [],
-        "bc_loss": [], "q_loss": [], "q_mean": []
-    }
-    loss_buffers = defaultdict(list)
-    best_success = -1.0
-    
-    try:
-        agent = DiffusionDoubleQAgent(
-            num_diffusion_steps=100,
-            **common_kwargs
-        )
+        results[algo_name] = {
+            "steps": [], "success_rate": [], "avg_reward": [],
+            "main_loss": [], "critic_loss": [], "actor_loss": [],
+            "bc_loss": [], "q_loss": [], "q_mean": []
+        }
+        loss_buffers = defaultdict(list)
+        best_success = -1.0
         
-        for step in tqdm(range(num_steps + 1), desc=algo_name):
-            if step in eval_steps:
-                metrics = evaluate_agent(
-                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
-                    record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step,
-                    normalizer=normalizer
-                )
-                results[algo_name]["steps"].append(step)
-                results[algo_name]["success_rate"].append(metrics["success_rate"])
-                results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                
-                # Aggregate loss metrics
-                for key in ["critic_loss", "actor_loss", "bc_loss", "q_loss", "q_mean"]:
-                    avg_val = np.mean(loss_buffers[key]) if loss_buffers[key] else 0.0
-                    results[algo_name][key].append(avg_val)
-                # main_loss is the sum of critic_loss + actor_loss
-                main_loss = np.mean(loss_buffers["critic_loss"]) + np.mean(loss_buffers["actor_loss"]) if loss_buffers["critic_loss"] else 0.0
-                results[algo_name]["main_loss"].append(main_loss)
-                
-                # Clear buffers
-                for key in loss_buffers:
-                    loss_buffers[key].clear()
-                
-                q_mean_val = results[algo_name]["q_mean"][-1]
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={main_loss:.4f}, Q={q_mean_val:.2f}")
-                
-                if metrics["success_rate"] > best_success:
-                    best_success = metrics["success_rate"]
-                    temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
-                    agent.save(temp_path)
-                    best_checkpoints[algo_name] = {
-                        "temp_path": temp_path,
-                        "step": step,
-                        "success_rate": best_success,
-                        "use_pretrain": False,
-                        "agent_class": "DiffusionDoubleQAgent",
-                        "normalizer_state": normalizer.state_dict(),
-                        "agent_kwargs": {"num_diffusion_steps": 100, **common_kwargs},
-                    }
-                    print(f"    -> New best! Saving checkpoint at step {step}")
+        try:
+            agent = DiffusionDoubleQAgent(
+                num_diffusion_steps=100,
+                **common_kwargs
+            )
             
-            if step < num_steps:
-                idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
-                train_info = agent.train_step(batch)
-                if train_info:
+            for step in tqdm(range(num_steps + 1), desc=algo_name):
+                if step in eval_steps:
+                    metrics = evaluate_agent(
+                        agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                        record_video=record_video, video_dir=video_dir,
+                        algo_name=algo_name, eval_step=step,
+                        normalizer=normalizer
+                    )
+                    results[algo_name]["steps"].append(step)
+                    results[algo_name]["success_rate"].append(metrics["success_rate"])
+                    results[algo_name]["avg_reward"].append(metrics["avg_reward"])
+                    
+                    # Aggregate loss metrics
                     for key in ["critic_loss", "actor_loss", "bc_loss", "q_loss", "q_mean"]:
-                        if key in train_info:
-                            loss_buffers[key].append(train_info[key])
+                        avg_val = np.mean(loss_buffers[key]) if loss_buffers[key] else 0.0
+                        results[algo_name][key].append(avg_val)
+                    # main_loss is the sum of critic_loss + actor_loss
+                    main_loss = np.mean(loss_buffers["critic_loss"]) + np.mean(loss_buffers["actor_loss"]) if loss_buffers["critic_loss"] else 0.0
+                    results[algo_name]["main_loss"].append(main_loss)
+                    
+                    # Clear buffers
+                    for key in loss_buffers:
+                        loss_buffers[key].clear()
+                    
+                    q_mean_val = results[algo_name]["q_mean"][-1]
+                    print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={main_loss:.4f}, Q={q_mean_val:.2f}")
+                    
+                    if metrics["success_rate"] > best_success:
+                        best_success = metrics["success_rate"]
+                        temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
+                        agent.save(temp_path)
+                        best_checkpoints[algo_name] = {
+                            "temp_path": temp_path,
+                            "step": step,
+                            "success_rate": best_success,
+                            "use_pretrain": False,
+                            "agent_class": "DiffusionDoubleQAgent",
+                            "normalizer_state": normalizer.state_dict(),
+                            "agent_kwargs": {"num_diffusion_steps": 100, **common_kwargs},
+                        }
+                        print(f"    -> New best! Saving checkpoint at step {step}")
                 
-    except Exception as e:
-        print(f"  Error: {e}")
-        import traceback
-        traceback.print_exc()
+                if step < num_steps:
+                    idx = np.random.randint(0, n_samples, batch_size)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    train_info = agent.train_step(batch)
+                    if train_info:
+                        for key in ["critic_loss", "actor_loss", "bc_loss", "q_loss", "q_mean"]:
+                            if key in train_info:
+                                loss_buffers[key].append(train_info[key])
+                    
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"Skipping {algo_name} (not in selected algorithms)")
     
     # ==================== 6. CPQL ====================
     algo_name = "CPQL"
-    print(f"\n{'='*60}")
-    print(f"Training {algo_name}...")
-    print(f"{'='*60}")
+    if algo_name in algorithms:
+        print(f"\n{'='*60}")
+        print(f"Training {algo_name}...")
+        print(f"{'='*60}")
     
-    results[algo_name] = {
-        "steps": [], "success_rate": [], "avg_reward": [],
-        "main_loss": [], "q_loss": [], "flow_loss": [], "consistency_loss": []
-    }
-    loss_buffers = defaultdict(list)
-    best_success = -1.0
-    
-    try:
-        agent = CPQLAgent(
-            sigma_max=80.0,
-            sigma_min=0.002,
-            rho=7.0,
-            **common_kwargs
-        )
+        results[algo_name] = {
+            "steps": [], "success_rate": [], "avg_reward": [],
+            "main_loss": [], "q_loss": [], "flow_loss": [], "consistency_loss": []
+        }
+        loss_buffers = defaultdict(list)
+        best_success = -1.0
         
-        for step in tqdm(range(num_steps + 1), desc=algo_name):
-            if step in eval_steps:
-                metrics = evaluate_agent(
-                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
-                    record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step,
-                    normalizer=normalizer
-                )
-                results[algo_name]["steps"].append(step)
-                results[algo_name]["success_rate"].append(metrics["success_rate"])
-                results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                
-                # Aggregate loss metrics
-                for key in ["q_loss", "flow_loss", "consistency_loss"]:
-                    avg_val = np.mean(loss_buffers[key]) if loss_buffers[key] else 0.0
-                    results[algo_name][key].append(avg_val)
-                # main_loss is the sum
-                main_loss = sum(np.mean(loss_buffers[k]) if loss_buffers[k] else 0.0 
-                               for k in ["q_loss", "flow_loss", "consistency_loss"])
-                results[algo_name]["main_loss"].append(main_loss)
-                
-                # Clear buffers
-                for key in loss_buffers:
-                    loss_buffers[key].clear()
-                
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={main_loss:.4f}")
-                
-                if metrics["success_rate"] > best_success:
-                    best_success = metrics["success_rate"]
-                    temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
-                    agent.save(temp_path)
-                    best_checkpoints[algo_name] = {
-                        "temp_path": temp_path,
-                        "step": step,
-                        "success_rate": best_success,
-                        "use_pretrain": False,
-                        "agent_class": "CPQLAgent",
-                        "normalizer_state": normalizer.state_dict(),
-                        "agent_kwargs": {"sigma_max": 80.0, "sigma_min": 0.002, "rho": 7.0, **common_kwargs},
-                    }
-                    print(f"    -> New best! Saving checkpoint at step {step}")
+        try:
+            agent = CPQLAgent(
+                sigma_max=80.0,
+                sigma_min=0.002,
+                rho=7.0,
+                num_flow_steps=10,
+                **common_kwargs
+            )
             
-            if step < num_steps:
-                idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
-                train_info = agent.train_step(batch)
-                if train_info:
+            for step in tqdm(range(num_steps + 1), desc=algo_name):
+                if step in eval_steps:
+                    metrics = evaluate_agent(
+                        agent, eval_env, obs_mode, eval_episodes, max_episode_steps,
+                        record_video=record_video, video_dir=video_dir,
+                        algo_name=algo_name, eval_step=step,
+                        normalizer=normalizer
+                    )
+                    results[algo_name]["steps"].append(step)
+                    results[algo_name]["success_rate"].append(metrics["success_rate"])
+                    results[algo_name]["avg_reward"].append(metrics["avg_reward"])
+                    
+                    # Aggregate loss metrics
                     for key in ["q_loss", "flow_loss", "consistency_loss"]:
-                        if key in train_info:
-                            loss_buffers[key].append(train_info[key])
+                        avg_val = np.mean(loss_buffers[key]) if loss_buffers[key] else 0.0
+                        results[algo_name][key].append(avg_val)
+                    # main_loss is the sum
+                    main_loss = sum(np.mean(loss_buffers[k]) if loss_buffers[k] else 0.0 
+                                for k in ["q_loss", "flow_loss", "consistency_loss"])
+                    results[algo_name]["main_loss"].append(main_loss)
+                    
+                    # Clear buffers
+                    for key in loss_buffers:
+                        loss_buffers[key].clear()
+                    
+                    print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={main_loss:.4f}")
+                    
+                    if metrics["success_rate"] > best_success:
+                        best_success = metrics["success_rate"]
+                        temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
+                        agent.save(temp_path)
+                        best_checkpoints[algo_name] = {
+                            "temp_path": temp_path,
+                            "step": step,
+                            "success_rate": best_success,
+                            "use_pretrain": False,
+                            "agent_class": "CPQLAgent",
+                            "normalizer_state": normalizer.state_dict(),
+                            "agent_kwargs": {"sigma_max": 80.0, "sigma_min": 0.002, "rho": 7.0, "num_flow_steps": 10, **common_kwargs},
+                        }
+                        print(f"    -> New best! Saving checkpoint at step {step}")
                 
-    except Exception as e:
-        print(f"  Error: {e}")
-        import traceback
-        traceback.print_exc()
+                if step < num_steps:
+                    idx = np.random.randint(0, n_samples, batch_size)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    train_info = agent.train_step(batch)
+                    if train_info:
+                        for key in ["q_loss", "flow_loss", "consistency_loss"]:
+                            if key in train_info:
+                                loss_buffers[key].append(train_info[key])
+                    
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"Skipping {algo_name} (not in selected algorithms)")
     
     # ==================== 7. DPPO (pretrain only) ====================
     algo_name = "DPPO"
-    print(f"\n{'='*60}")
-    print(f"Training {algo_name} (BC pretrain only)...")
-    print(f"{'='*60}")
+    if algo_name in algorithms:
+        print(f"\n{'='*60}")
+        print(f"Training {algo_name} (BC pretrain only)...")
+        print(f"{'='*60}")
     
-    results[algo_name] = {
-        "steps": [], "success_rate": [], "avg_reward": [],
-        "main_loss": []
-    }
-    loss_buffer = []
-    best_success = -1.0
-    
-    try:
-        agent = DPPOAgent(
-            num_diffusion_steps=100,
-            ft_denoising_steps=5,
-            **common_kwargs
-        )
+        results[algo_name] = {
+            "steps": [], "success_rate": [], "avg_reward": [],
+            "main_loss": []
+        }
+        loss_buffer = []
+        best_success = -1.0
         
-        # Enable gradients for pretraining
-        for p in agent.actor.parameters():
-            p.requires_grad = True
-        dppo_optimizer = torch.optim.Adam(
-            list(agent.actor.parameters()) + list(agent.actor_ft.parameters()),
-            lr=1e-4
-        )
-        
-        for step in tqdm(range(num_steps + 1), desc=algo_name):
-            if step in eval_steps:
-                metrics = evaluate_agent(
-                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True,
-                    record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step,
-                    normalizer=normalizer
-                )
-                results[algo_name]["steps"].append(step)
-                results[algo_name]["success_rate"].append(metrics["success_rate"])
-                results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
-                results[algo_name]["main_loss"].append(avg_loss)
-                loss_buffer.clear()
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
-                
-                if metrics["success_rate"] > best_success:
-                    best_success = metrics["success_rate"]
-                    temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
-                    agent.save(temp_path)
-                    best_checkpoints[algo_name] = {
-                        "temp_path": temp_path,
-                        "step": step,
-                        "success_rate": best_success,
-                        "use_pretrain": True,
-                        "agent_class": "DPPOAgent",
-                        "normalizer_state": normalizer.state_dict(),
-                        "agent_kwargs": {"num_diffusion_steps": 100, "ft_denoising_steps": 5, **common_kwargs},
-                    }
-                    print(f"    -> New best! Saving checkpoint at step {step}")
+        try:
+            agent = DPPOAgent(
+                num_diffusion_steps=100,
+                ft_denoising_steps=5,
+                **common_kwargs
+            )
             
-            if step < num_steps:
-                idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
-                batch_actions = batch["actions"]
-                
-                # Get observation features
-                state_input = batch.get("states")
-                image_input = batch.get("images")
-                obs_features = agent.obs_encoder(state=state_input, image=image_input)
-                
-                # Diffusion BC loss
-                t = torch.randint(0, agent.num_diffusion_steps, (len(batch_actions),), device=device)
-                noise = torch.randn_like(batch_actions)
-                noisy_actions = agent.diffusion.q_sample(batch_actions, t, noise)
-                t_normalized = t.float() / agent.num_diffusion_steps
-                
-                pred_noise = agent.actor(noisy_actions, t_normalized, obs_features=obs_features)
-                pred_noise_ft = agent.actor_ft(noisy_actions, t_normalized, obs_features=obs_features)
-                loss = F.mse_loss(pred_noise, noise) + F.mse_loss(pred_noise_ft, noise)
-                
-                dppo_optimizer.zero_grad()
-                loss.backward()
-                dppo_optimizer.step()
-                
-                loss_buffer.append(loss.item())
-        
-        # Freeze actor after pretraining
-        for p in agent.actor.parameters():
-            p.requires_grad = False
+            # Enable gradients for pretraining - only train actor (same as DiffusionPolicy)
+            for p in agent.actor.parameters():
+                p.requires_grad = True
+            # Collect parameters to optimize: actor + obs_encoder (if trainable)
+            params_to_train = list(agent.actor.parameters())
+            if agent.obs_mode in ["image", "state_image"]:
+                vision_params = [p for p in agent.obs_encoder.vision_encoder.parameters() if p.requires_grad]
+                params_to_train.extend(vision_params)
+            dppo_optimizer = torch.optim.Adam(params_to_train, lr=1e-4)
             
-    except Exception as e:
-        print(f"  Error: {e}")
-        import traceback
-        traceback.print_exc()
+            for step in tqdm(range(num_steps + 1), desc=algo_name):
+                if step in eval_steps:
+                    metrics = evaluate_agent(
+                        agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True,
+                        record_video=record_video, video_dir=video_dir,
+                        algo_name=algo_name, eval_step=step,
+                        normalizer=normalizer
+                    )
+                    results[algo_name]["steps"].append(step)
+                    results[algo_name]["success_rate"].append(metrics["success_rate"])
+                    results[algo_name]["avg_reward"].append(metrics["avg_reward"])
+                    avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                    results[algo_name]["main_loss"].append(avg_loss)
+                    loss_buffer.clear()
+                    print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
+                    
+                    if metrics["success_rate"] > best_success:
+                        best_success = metrics["success_rate"]
+                        temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
+                        agent.save(temp_path)
+                        best_checkpoints[algo_name] = {
+                            "temp_path": temp_path,
+                            "step": step,
+                            "success_rate": best_success,
+                            "use_pretrain": True,
+                            "agent_class": "DPPOAgent",
+                            "normalizer_state": normalizer.state_dict(),
+                            "agent_kwargs": {"num_diffusion_steps": 100, "ft_denoising_steps": 5, **common_kwargs},
+                        }
+                        print(f"    -> New best! Saving checkpoint at step {step}")
+                
+                if step < num_steps:
+                    idx = np.random.randint(0, n_samples, batch_size)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    batch_actions = batch["actions"]
+                    
+                    # Get observation features
+                    state_input = batch.get("states")
+                    image_input = batch.get("images")
+                    obs_features = agent.obs_encoder(state=state_input, image=image_input)
+                    
+                    # Diffusion BC loss - only train self.actor (same as DiffusionPolicy)
+                    # Note: actor_ft will be initialized from actor before online fine-tuning
+                    t = torch.randint(0, agent.num_diffusion_steps, (len(batch_actions),), device=device)
+                    noise = torch.randn_like(batch_actions)
+                    noisy_actions = agent.diffusion.q_sample(batch_actions, t, noise)
+                    t_normalized = t.float() / agent.num_diffusion_steps
+                    
+                    pred_noise = agent.actor(noisy_actions, t_normalized, obs_features=obs_features)
+                    loss = F.mse_loss(pred_noise, noise)
+                    
+                    dppo_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1.0)
+                    dppo_optimizer.step()
+                    
+                    loss_buffer.append(loss.item())
+            
+            # After pretraining: freeze actor and sync to actor_ft for future fine-tuning
+            for p in agent.actor.parameters():
+                p.requires_grad = False
+            # Initialize actor_ft from pretrained actor for online fine-tuning
+            agent.actor_ft.load_state_dict(agent.actor.state_dict())
+            agent._sync_old_policy()
+                
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"Skipping {algo_name} (not in selected algorithms)")
     
-    # ==================== 8. ReinFlow (pretrain only) ====================
+    # ==================== 8. ReinFlow (pretrain only, with ShortCut) ====================
     algo_name = "ReinFlow"
-    print(f"\n{'='*60}")
-    print(f"Training {algo_name} (BC pretrain only)...")
-    print(f"{'='*60}")
+    if algo_name in algorithms:
+        print(f"\n{'='*60}")
+        print(f"Training {algo_name} (BC pretrain with ShortCut flow)...")
+        print(f"{'='*60}")
     
-    results[algo_name] = {
-        "steps": [], "success_rate": [], "avg_reward": [],
-        "main_loss": []
-    }
-    loss_buffer = []
-    best_success = -1.0
-    
-    try:
-        agent = ReinFlowAgent(
-            num_flow_steps=10,
-            noise_scheduler_type="learn",
-            **common_kwargs
-        )
+        results[algo_name] = {
+            "steps": [], "success_rate": [], "avg_reward": [],
+            "main_loss": [], "fm_loss": [], "sc_loss": []
+        }
+        loss_buffer = []
+        fm_loss_buffer = []
+        sc_loss_buffer = []
+        best_success = -1.0
         
-        # Create optimizer for pretrain
-        pretrain_optimizer = torch.optim.Adam(
-            agent.policy.base_net.parameters(), lr=1e-4
-        )
-        
-        for step in tqdm(range(num_steps + 1), desc=algo_name):
-            if step in eval_steps:
-                metrics = evaluate_agent(
-                    agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True,
-                    record_video=record_video, video_dir=video_dir,
-                    algo_name=algo_name, eval_step=step,
-                    normalizer=normalizer
-                )
-                results[algo_name]["steps"].append(step)
-                results[algo_name]["success_rate"].append(metrics["success_rate"])
-                results[algo_name]["avg_reward"].append(metrics["avg_reward"])
-                avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
-                results[algo_name]["main_loss"].append(avg_loss)
-                loss_buffer.clear()
-                print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f}")
-                
-                if metrics["success_rate"] > best_success:
-                    best_success = metrics["success_rate"]
-                    temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
-                    agent.save(temp_path)
-                    best_checkpoints[algo_name] = {
-                        "temp_path": temp_path,
-                        "step": step,
-                        "success_rate": best_success,
-                        "use_pretrain": True,
-                        "agent_class": "ReinFlowAgent",
-                        "normalizer_state": normalizer.state_dict(),
-                        "agent_kwargs": {"num_flow_steps": 10, "noise_scheduler_type": "learn", **common_kwargs},
-                    }
-                    print(f"    -> New best! Saving checkpoint at step {step}")
+        try:
+            # Create ReinFlow agent with ShortCut mode enabled (default)
+            agent = ReinFlowAgent(
+                num_flow_steps=10,
+                noise_scheduler_type="learn",
+                use_ema=True,
+                use_shortcut=True,  # Enable ShortCut flow with self-consistency
+                self_consistency_k=0.25,  # 25% batch uses self-consistency
+                max_denoising_steps=8,
+                **common_kwargs
+            )
             
-            if step < num_steps:
-                idx = np.random.randint(0, n_samples, batch_size)
-                batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
-                batch_actions = batch["actions"]
+            # Create optimizer using agent's helper method
+            pretrain_optimizer = torch.optim.Adam(
+                agent.get_pretrain_parameters(), lr=3e-4
+            )
+            
+            print(f"  ShortCut mode: enabled (self_consistency_k=0.25, max_denoising_steps=8)")
+            
+            for step in tqdm(range(num_steps + 1), desc=algo_name):
+                if step in eval_steps:
+                    metrics = evaluate_agent(
+                        agent, eval_env, obs_mode, eval_episodes, max_episode_steps, use_pretrain_sample=True,
+                        record_video=record_video, video_dir=video_dir,
+                        algo_name=algo_name, eval_step=step,
+                        normalizer=normalizer
+                    )
+                    results[algo_name]["steps"].append(step)
+                    results[algo_name]["success_rate"].append(metrics["success_rate"])
+                    results[algo_name]["avg_reward"].append(metrics["avg_reward"])
+                    avg_loss = np.mean(loss_buffer) if loss_buffer else 0.0
+                    avg_fm_loss = np.mean(fm_loss_buffer) if fm_loss_buffer else 0.0
+                    avg_sc_loss = np.mean(sc_loss_buffer) if sc_loss_buffer else 0.0
+                    results[algo_name]["main_loss"].append(avg_loss)
+                    results[algo_name]["fm_loss"].append(avg_fm_loss)
+                    results[algo_name]["sc_loss"].append(avg_sc_loss)
+                    loss_buffer.clear()
+                    fm_loss_buffer.clear()
+                    sc_loss_buffer.clear()
+                    print(f"  Step {step}: Success={metrics['success_rate']:.2%}, Reward={metrics['avg_reward']:.2f}, Loss={avg_loss:.4f} (FM={avg_fm_loss:.4f}, SC={avg_sc_loss:.4f})")
+                    
+                    if metrics["success_rate"] > best_success:
+                        best_success = metrics["success_rate"]
+                        temp_path = os.path.join(temp_ckpt_dir, f"{algo_name}_best.pt")
+                        agent.save(temp_path)
+                        best_checkpoints[algo_name] = {
+                            "temp_path": temp_path,
+                            "step": step,
+                            "success_rate": best_success,
+                            "use_pretrain": True,
+                            "agent_class": "ReinFlowAgent",
+                            "normalizer_state": normalizer.state_dict(),
+                            "agent_kwargs": {
+                                "num_flow_steps": 10, 
+                                "noise_scheduler_type": "learn", 
+                                "use_ema": True, 
+                                "use_shortcut": True,
+                                "self_consistency_k": 0.25,
+                                "max_denoising_steps": 8,
+                                **common_kwargs
+                            },
+                        }
+                        print(f"    -> New best! Saving checkpoint at step {step}")
                 
-                # Get observation features
-                state_input = batch.get("states")
-                image_input = batch.get("images")
-                obs_features = agent.obs_encoder(state=state_input, image=image_input)
-                
-                # Flow matching loss
-                x_0 = torch.randn_like(batch_actions)
-                t = torch.rand(len(batch_actions), device=device)
-                t_expand = t.unsqueeze(-1)
-                x_t = (1 - t_expand) * x_0 + t_expand * batch_actions
-                target_v = batch_actions - x_0
-                pred_v = agent.policy.base_net(x_t, t, obs_features=obs_features)
-                loss = F.mse_loss(pred_v, target_v)
-                
-                pretrain_optimizer.zero_grad()
-                loss.backward()
-                pretrain_optimizer.step()
-                
-                loss_buffer.append(loss.item())
-                
-    except Exception as e:
-        print(f"  Error: {e}")
-        import traceback
-        traceback.print_exc()
+                if step < num_steps:
+                    idx = np.random.randint(0, n_samples, batch_size)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    batch_actions = batch["actions"]
+                    
+                    # Get observation features
+                    state_input = batch.get("states")
+                    image_input = batch.get("images")
+                    obs_features = agent.obs_encoder(state=state_input, image=image_input)
+                    
+                    # Use pretrain_bc_step for ShortCut flow training
+                    step_metrics = agent.pretrain_bc_step(
+                        actions=batch_actions,
+                        obs_features=obs_features,
+                        optimizer=pretrain_optimizer,
+                        max_grad_norm=1.0
+                    )
+                    
+                    loss_buffer.append(step_metrics['loss'])
+                    if 'fm_loss' in step_metrics:
+                        fm_loss_buffer.append(step_metrics['fm_loss'])
+                    if 'sc_loss' in step_metrics:
+                        sc_loss_buffer.append(step_metrics['sc_loss'])
+                    
+        except Exception as e:
+            print(f"  Error: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"Skipping {algo_name} (not in selected algorithms)")
     
     eval_env.close()
     return results, best_checkpoints
@@ -1345,8 +1500,24 @@ def plot_training_progress(
 
 
 def main():
+    # All available algorithms
+    # ALL_ALGORITHMS = [
+    #     "DiffusionPolicy", "FlowMatching", "ConsistencyFlow", "ConsistencyFlowV2", "ReflectedFlow",
+    #     "DiffusionQL", "CPQL", "DPPO", "ReinFlow"
+    # ]
+    ALL_ALGORITHMS = [
+        "CPQL"
+        "ConsistencyFlowV2",
+        "ReinFlow",
+        "FlowMatching",
+    ]
     parser = argparse.ArgumentParser(
-        description="Validate all algorithms on ManiSkill3 PickCube task (offline)"
+        description="Validate algorithms on ManiSkill3 PickCube task (offline)"
+    )
+    parser.add_argument(
+        "--task", type=str, default="PickCube-v1",
+        choices=["PickCube-v1", "PegInsertionSide-v1"],
+        help="ManiSkill3 task name"
     )
     parser.add_argument(
         "--dataset_path", type=str, required=True,
@@ -1357,10 +1528,15 @@ def main():
         choices=["state", "state_image"],
         help="Observation mode"
     )
+    parser.add_argument(
+        "--algorithm", type=str, default="all",
+        help=f"Algorithm to train. Options: {', '.join(ALL_ALGORITHMS)}, or 'all' for all algorithms"
+    )
     parser.add_argument("--num_steps", type=int, default=50000, help="Training steps")
     parser.add_argument("--eval_interval", type=int, default=5000, help="Steps between evaluations")
     parser.add_argument("--eval_episodes", type=int, default=40, help="Episodes per evaluation")
-    parser.add_argument("--max_episode_steps", type=int, default=50, help="Max steps per episode")
+    parser.add_argument("--max_episode_steps", type=int, default=None, 
+                       help="Max steps per episode (default: task-dependent, PickCube=50, PegInsertion=600)")
     parser.add_argument("--device", type=str, default="auto", help="Device (auto/cuda/cpu)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output_dir", type=str, default="./results", help="Output directory")
@@ -1375,6 +1551,12 @@ def main():
         print("Error: ManiSkill3 is not available.")
         print("Please run this script in the rlft_ms3 conda environment.")
         sys.exit(1)
+    
+    # Set max_episode_steps from task defaults if not specified
+    if args.max_episode_steps is None:
+        task_config = TASK_DEFAULTS.get(args.task, {})
+        args.max_episode_steps = task_config.get("max_episode_steps", 50)
+        print(f"Using task default max_episode_steps={args.max_episode_steps} for {args.task}")
     
     # Set device
     if args.device == "auto":
@@ -1395,7 +1577,7 @@ def main():
     # Load dataset
     dataset = load_dataset(args.dataset_path)
     
-    # Get dimensions
+    # Get dimensions from dataset
     state_dim = dataset["obs"].shape[1] if "obs" in dataset else 42
     action_dim = dataset["actions"].shape[1]
     
@@ -1413,11 +1595,13 @@ def main():
         video_dir = None
     
     print(f"\nConfiguration:")
+    print(f"  Task: {args.task}")
     print(f"  Dataset: {args.dataset_path}")
     print(f"  Observation mode: {args.obs_mode}")
     print(f"  State dim: {state_dim}")
     print(f"  Action dim: {action_dim}")
     print(f"  Image shape: {image_shape}")
+    print(f"  Max episode steps: {args.max_episode_steps}")
     print(f"  Training steps: {args.num_steps}")
     print(f"  Eval interval: {args.eval_interval}")
     print(f"  Eval episodes: {args.eval_episodes}")
@@ -1425,8 +1609,24 @@ def main():
     if video_dir:
         print(f"  Video directory: {video_dir}")
     
+    # Parse algorithm selection
+    if args.algorithm.lower() == "all":
+        algorithms_to_train = ALL_ALGORITHMS
+    else:
+        # Support comma-separated list
+        algorithms_to_train = [a.strip() for a in args.algorithm.split(",")]
+        # Validate algorithm names
+        for algo in algorithms_to_train:
+            if algo not in ALL_ALGORITHMS:
+                print(f"Error: Unknown algorithm '{algo}'")
+                print(f"Available algorithms: {', '.join(ALL_ALGORITHMS)}")
+                sys.exit(1)
+    
+    print(f"  Algorithms: {', '.join(algorithms_to_train)}")
+    
     # Create checkpoint directory
-    checkpoint_dir = os.path.join(args.output_dir, f"maniskill_checkpoints_{timestamp}")
+    task_short = args.task.replace("-v1", "").lower()
+    checkpoint_dir = os.path.join(args.output_dir, f"maniskill_{task_short}_checkpoints_{timestamp}")
     
     # Train and evaluate
     results, best_checkpoints = train_and_evaluate_all(
@@ -1444,6 +1644,8 @@ def main():
         max_episode_steps=args.max_episode_steps,
         record_video=args.record_video,
         video_dir=video_dir,
+        algorithms=algorithms_to_train,
+        task=args.task,
     )
     
     # Print summary
@@ -1453,14 +1655,14 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     output_path = os.path.join(
         args.output_dir,
-        f"maniskill_pickcube_{args.obs_mode}_{timestamp}.json"
+        f"maniskill_{task_short}_{args.obs_mode}_{timestamp}.json"
     )
     save_results(results, output_path)
     
     # Save detailed metrics as JSON (includes all loss metrics)
     detailed_path = os.path.join(
         args.output_dir,
-        f"detailed_metrics_{timestamp}.json"
+        f"detailed_metrics_{task_short}_{timestamp}.json"
     )
     save_results(results, detailed_path)
     print(f"Detailed metrics saved to {detailed_path}")
@@ -1468,12 +1670,12 @@ def main():
     # Plot training progress
     plot_path = os.path.join(
         args.output_dir,
-        f"maniskill_pickcube_{args.obs_mode}_{timestamp}.png"
+        f"maniskill_{task_short}_{args.obs_mode}_{timestamp}.png"
     )
     plot_training_progress(
         results=results,
         save_path=plot_path,
-        title=f"ManiSkill3 PickCube Training Progress ({args.obs_mode} mode)"
+        title=f"ManiSkill3 {args.task} Training Progress ({args.obs_mode} mode)"
     )
     
     # Save best checkpoints info

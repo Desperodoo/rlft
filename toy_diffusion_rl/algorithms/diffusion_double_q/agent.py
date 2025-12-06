@@ -54,8 +54,11 @@ class DiffusionDoubleQAgent:
         learning_rate_critic: Learning rate for critics
         gamma: Discount factor
         tau: Soft update coefficient
-        alpha: Weight for Q-value term
+        alpha: Weight for Q-value term (reduced for stability)
         bc_weight: Weight for BC loss
+        reward_scale: Scale factor for rewards (default 0.1 for stability)
+        max_q_backup: Whether to use max Q backup for target
+        q_target_clip: Clip range for Q target (None to disable)
         device: Device for computation
     """
     
@@ -66,7 +69,7 @@ class DiffusionDoubleQAgent:
         state_dim: Optional[int] = None,
         image_shape: Optional[Tuple[int, int, int]] = None,
         hidden_dims: List[int] = [256, 256],
-        num_diffusion_steps: int = 10,
+        num_diffusion_steps: int = 100,
         vision_encoder_type: str = "cnn",
         vision_output_dim: int = 128,
         freeze_vision_encoder: bool = False,
@@ -74,9 +77,12 @@ class DiffusionDoubleQAgent:
         learning_rate_critic: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 0.005,
-        alpha: float = 1.0,
+        alpha: float = 0.1,  # Reduced from 1.0 for stability
         bc_weight: float = 1.0,
         noise_schedule: str = "linear",
+        reward_scale: float = 0.1,  # Scale down rewards for Q-value stability
+        max_q_backup: bool = False,  # Whether to use max Q backup
+        q_target_clip: Optional[float] = 100.0,  # Clip Q targets to prevent explosion
         device: str = "cpu"
     ):
         self.action_dim = action_dim
@@ -88,6 +94,9 @@ class DiffusionDoubleQAgent:
         self.tau = tau
         self.alpha = alpha
         self.bc_weight = bc_weight
+        self.reward_scale = reward_scale
+        self.max_q_backup = max_q_backup
+        self.q_target_clip = q_target_clip
         self.device = device
         
         # Create observation encoder
@@ -103,7 +112,7 @@ class DiffusionDoubleQAgent:
         # Actor: Diffusion noise predictor
         self.actor = MultiModalNoisePredictor(
             action_dim=action_dim,
-            hidden_dims=hidden_dims + [256],
+            hidden_dims=hidden_dims,
             obs_encoder=self.obs_encoder,
         ).to(device)
         
@@ -231,6 +240,9 @@ class DiffusionDoubleQAgent:
         if dones.dim() == 1:
             dones = dones.unsqueeze(-1)
         
+        # Scale rewards for Q-value stability
+        scaled_rewards = rewards * self.reward_scale
+        
         # Update Critics
         with torch.no_grad():
             next_obs_features = self.obs_encoder(state=next_states, image=next_images)
@@ -240,7 +252,13 @@ class DiffusionDoubleQAgent:
                 next_actions, obs_features=next_obs_features
             )
             target_q = torch.min(target_q1, target_q2)
-            target_q = rewards + self.gamma * (1 - dones) * target_q
+            
+            # TD target with scaled rewards
+            target_q = scaled_rewards + self.gamma * (1 - dones) * target_q
+            
+            # Clip Q targets to prevent explosion
+            if self.q_target_clip is not None:
+                target_q = torch.clamp(target_q, -self.q_target_clip, self.q_target_clip)
         
         obs_features = self.obs_encoder(state=states, image=images)
         current_q1, current_q2 = self.critic(actions, obs_features=obs_features)

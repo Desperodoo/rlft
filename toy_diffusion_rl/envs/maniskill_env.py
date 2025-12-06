@@ -1,22 +1,19 @@
 """
-ManiSkill3 Environment Wrappers for PickCube Task.
+ManiSkill3 Environment Wrappers.
 
-This module provides simplified environment wrappers for ManiSkill3's PickCube-v1 task,
+This module provides simplified environment wrappers for ManiSkill3 tasks,
 following official ManiSkill3 patterns and using official wrappers.
+
+Supported Tasks:
+    - PickCube-v1: Pick up a cube and place it at a goal position
+    - PegInsertionSide-v1: Insert a peg into a box from the side (high precision)
 
 Reference:
     https://maniskill.readthedocs.io/en/latest/user_guide/reinforcement_learning/setup.html
-    https://maniskill.readthedocs.io/en/latest/tasks/table_top_gripper/index.html
 
 Note:
     This module requires the rlft_ms3 conda environment (not rlft).
     ManiSkill3 uses SAPIEN physics engine instead of MuJoCo.
-
-PickCube-v1 Success Conditions (from official docs):
-    - the cube position is within goal_thresh (default 0.025m) euclidean distance of the goal position
-    - the robot is static (q velocity < 0.2)
-    
-    Note: The task does NOT require holding the cube until max_steps.
 """
 
 import warnings
@@ -27,7 +24,7 @@ warnings.filterwarnings("ignore", message=".*env\\..*to get variables from other
 import gymnasium as gym
 import numpy as np
 import torch
-from typing import Optional, Tuple, Dict, Any, Union
+from typing import Optional, Tuple, Dict, Any, Union, List
 import cv2
 
 # Import ManiSkill3 - will fail if not installed
@@ -42,18 +39,38 @@ except ImportError:
     print("Warning: ManiSkill3 not installed. Install with: pip install mani_skill")
 
 
+# Default configurations for different tasks
+TASK_DEFAULTS = {
+    "PickCube-v1": {
+        "control_mode": "pd_ee_delta_pose",
+        "max_episode_steps": 50,
+        "reward_mode": "dense",
+        "state_dim": 42,
+        "action_dim": 7,
+    },
+    "PegInsertionSide-v1": {
+        "control_mode": "pd_joint_pos",  # Use original demo control mode for best replay
+        "max_episode_steps": 600,  # Longer episodes for this task
+        "reward_mode": "dense",  # Use dense reward (same as demo data)
+        "state_dim": 18,  # qpos(9) + qvel(9)
+        "action_dim": 8,  # 7 joints + 1 gripper
+    },
+}
+
+
 def make_maniskill_env(
     task: str = "PickCube-v1",
     obs_mode: str = "state_image",
     num_envs: int = 1,
     seed: int = 0,
-    max_episode_steps: int = 50,
+    max_episode_steps: Optional[int] = None,
     image_size: int = 128,
-    control_mode: str = "pd_ee_delta_pose",
-    reward_mode: str = "dense",
+    control_mode: Optional[str] = None,
+    reward_mode: Optional[str] = None,
     auto_reset: bool = True,
     record_metrics: bool = False,
     sim_backend: str = "auto",
+    state_keys: Optional[list] = None,
 ) -> gym.Env:
     """Factory function to create ManiSkill3 environments following official patterns.
     
@@ -101,8 +118,26 @@ def make_maniskill_env(
             "Or use the rlft_ms3 conda environment."
         )
     
-    if task != "PickCube-v1":
-        raise ValueError(f"Currently only 'PickCube-v1' is supported, got {task}")
+    # Validate task
+    supported_tasks = ["PickCube-v1", "PegInsertionSide-v1"]
+    if task not in supported_tasks:
+        raise ValueError(f"Supported tasks: {supported_tasks}, got {task}")
+    
+    # Get task defaults
+    task_config = TASK_DEFAULTS.get(task, {})
+    if control_mode is None:
+        control_mode = task_config.get("control_mode", "pd_ee_delta_pose")
+    if reward_mode is None:
+        reward_mode = task_config.get("reward_mode", "dense")
+    if max_episode_steps is None:
+        max_episode_steps = task_config.get("max_episode_steps", 50)
+    
+    # Determine which state keys to extract (robot proprioception only for PegInsertion)
+    if state_keys is None:
+        if task == "PegInsertionSide-v1":
+            state_keys = ["agent"]  # Only robot state for PegInsertion
+        else:
+            state_keys = ["agent", "extra"]  # Include extra for PickCube
     
     # Determine ManiSkill3 obs_mode based on our simplified obs_mode
     # Use state_dict instead of state for structured access to positions
@@ -121,8 +156,11 @@ def make_maniskill_env(
         obs_mode=ms_obs_mode,
         control_mode=control_mode,
         reward_mode=reward_mode,
-        max_episode_steps=max_episode_steps,
     )
+    
+    # Only set max_episode_steps if specified (some tasks like PegInsertion have no limit)
+    if max_episode_steps is not None:
+        env_kwargs["max_episode_steps"] = max_episode_steps
     
     if render_mode is not None:
         env_kwargs["render_mode"] = render_mode
@@ -143,18 +181,18 @@ def make_maniskill_env(
         
         # Wrap for simplified observations
         if obs_mode == "state":
-            env = StateOnlyWrapper(env)
+            env = StateOnlyWrapper(env, state_keys=state_keys)
         elif obs_mode in ["image", "state_image"]:
-            env = SimplifiedObsWrapper(env, obs_mode=obs_mode, image_size=image_size)
+            env = SimplifiedObsWrapper(env, obs_mode=obs_mode, image_size=image_size, state_keys=state_keys)
     else:
         # Vectorized environment: use ManiSkillVectorEnv
         env = ManiSkillVectorEnv(env, auto_reset=auto_reset, record_metrics=record_metrics)
         
         # Wrap for simplified observations
         if obs_mode == "state":
-            env = StateOnlyVecWrapper(env)
+            env = StateOnlyVecWrapper(env, state_keys=state_keys)
         elif obs_mode in ["image", "state_image"]:
-            env = SimplifiedVecObsWrapper(env, obs_mode=obs_mode, image_size=image_size)
+            env = SimplifiedVecObsWrapper(env, obs_mode=obs_mode, image_size=image_size, state_keys=state_keys)
     
     # Set seed
     env.reset(seed=seed)
@@ -165,11 +203,17 @@ def make_maniskill_env(
 class StateOnlyWrapper(gym.Wrapper):
     """Wrapper that flattens state_dict to a simple state array while preserving raw_obs for expert policy.
     
+    Args:
+        env: The environment to wrap
+        state_keys: List of top-level keys to include in state (default: ["agent", "extra"])
+                   For PegInsertionSide, use ["agent"] to only include robot proprioception
+    
     Returns: np.ndarray (state_dim,)
     """
     
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, state_keys: Optional[List[str]] = None):
         super().__init__(env)
+        self.state_keys = state_keys or ["agent", "extra"]
         
         # Get sample observation
         sample_obs, _ = env.reset()
@@ -183,19 +227,19 @@ class StateOnlyWrapper(gym.Wrapper):
         )
     
     def _flatten_obs(self, obs: dict) -> np.ndarray:
-        """Flatten observation dict to 1D array."""
+        """Flatten observation dict to 1D array based on state_keys."""
         parts = []
         
-        # Agent state
-        if "agent" in obs:
+        # Agent state (always include qpos and qvel if agent is in state_keys)
+        if "agent" in self.state_keys and "agent" in obs:
             for key in ["qpos", "qvel"]:
                 if key in obs["agent"]:
                     val = obs["agent"][key]
                     arr = val.cpu().numpy() if isinstance(val, torch.Tensor) else val
                     parts.append(arr.flatten())
         
-        # Extra (positions, etc.)
-        if "extra" in obs:
+        # Extra (positions, etc.) - only if "extra" is in state_keys
+        if "extra" in self.state_keys and "extra" in obs:
             for key, val in obs["extra"].items():
                 if isinstance(val, (np.ndarray, torch.Tensor)):
                     arr = val.cpu().numpy() if isinstance(val, torch.Tensor) else val
@@ -217,10 +261,16 @@ class StateOnlyWrapper(gym.Wrapper):
 
 
 class StateOnlyVecWrapper(gym.Wrapper):
-    """Vectorized version of StateOnlyWrapper."""
+    """Vectorized version of StateOnlyWrapper.
     
-    def __init__(self, env: gym.Env):
+    Args:
+        env: The environment to wrap
+        state_keys: List of top-level keys to include in state (default: ["agent", "extra"])
+    """
+    
+    def __init__(self, env: gym.Env, state_keys: Optional[List[str]] = None):
         super().__init__(env)
+        self.state_keys = state_keys or ["agent", "extra"]
         self.num_envs = getattr(env.unwrapped, 'num_envs', 1)
         
         # Get sample observation
@@ -235,15 +285,15 @@ class StateOnlyVecWrapper(gym.Wrapper):
         )
     
     def _flatten_obs(self, obs: dict) -> torch.Tensor:
-        """Flatten observation dict to tensor."""
+        """Flatten observation dict to tensor based on state_keys."""
         parts = []
         
-        if "agent" in obs:
+        if "agent" in self.state_keys and "agent" in obs:
             for key in ["qpos", "qvel"]:
                 if key in obs["agent"]:
                     parts.append(obs["agent"][key])
         
-        if "extra" in obs:
+        if "extra" in self.state_keys and "extra" in obs:
             for key, val in obs["extra"].items():
                 if isinstance(val, torch.Tensor):
                     if len(val.shape) == 1:
@@ -275,12 +325,20 @@ class SimplifiedObsWrapper(gym.Wrapper):
     
     For obs_mode="image", returns:
         np.ndarray (H, W, 3) uint8
+    
+    Args:
+        env: The environment to wrap
+        obs_mode: "state_image" or "image"
+        image_size: Target image size
+        state_keys: List of top-level keys to include in state (default: ["agent", "extra"])
     """
     
-    def __init__(self, env: gym.Env, obs_mode: str = "state_image", image_size: int = 128):
+    def __init__(self, env: gym.Env, obs_mode: str = "state_image", image_size: int = 128,
+                 state_keys: Optional[List[str]] = None):
         super().__init__(env)
         self.obs_mode = obs_mode
         self.image_size = image_size
+        self.state_keys = state_keys or ["agent", "extra"]
         
         # Get sample observation to infer dimensions
         sample_obs, _ = env.reset()
@@ -291,7 +349,7 @@ class SimplifiedObsWrapper(gym.Wrapper):
                 if "state" in sample_obs:
                     state = sample_obs["state"]
                 else:
-                    # Flatten agent + extra
+                    # Flatten based on state_keys
                     state = self._flatten_state_dict(sample_obs)
                 self.state_dim = state.shape[-1] if len(state.shape) > 0 else 1
             else:
@@ -308,19 +366,34 @@ class SimplifiedObsWrapper(gym.Wrapper):
             )
     
     def _flatten_state_dict(self, obs: dict) -> np.ndarray:
-        """Flatten a nested observation dictionary to a 1D array."""
+        """Flatten a nested observation dictionary to a 1D array based on state_keys."""
         parts = []
         for key, val in obs.items():
             if key in ["sensor_data", "sensor_param"]:
                 continue  # Skip image data
+            if key not in self.state_keys:
+                continue  # Skip keys not in state_keys
             if isinstance(val, dict):
-                parts.append(self._flatten_state_dict(val))
+                # For nested dicts like "agent", flatten all sub-keys
+                for subkey in ["qpos", "qvel"]:  # Specific order for agent
+                    if subkey in val:
+                        subval = val[subkey]
+                        arr = subval.cpu().numpy() if isinstance(subval, torch.Tensor) else subval
+                        parts.append(arr.flatten())
+                # For "extra" dict, flatten all values
+                if key == "extra":
+                    for subkey, subval in val.items():
+                        if isinstance(subval, (np.ndarray, torch.Tensor)):
+                            arr = subval.cpu().numpy() if isinstance(subval, torch.Tensor) else subval
+                            parts.append(arr.flatten())
+                        elif isinstance(subval, (bool, int, float)):
+                            parts.append(np.array([float(subval)]))
             elif isinstance(val, (np.ndarray, torch.Tensor)):
                 arr = val.cpu().numpy() if isinstance(val, torch.Tensor) else val
                 parts.append(arr.flatten())
             elif isinstance(val, (bool, int, float)):
                 parts.append(np.array([val]))
-        return np.concatenate(parts) if parts else np.array([])
+        return np.concatenate(parts).astype(np.float32) if parts else np.array([], dtype=np.float32)
     
     def _extract_rgb(self, obs: dict) -> np.ndarray:
         """Extract and resize RGB image from observation."""
@@ -405,12 +478,20 @@ class SimplifiedVecObsWrapper(gym.Wrapper):
     
     Similar to SimplifiedObsWrapper but handles batched observations.
     Returns torch tensors for GPU compatibility.
+    
+    Args:
+        env: The environment to wrap
+        obs_mode: "state_image" or "image"
+        image_size: Target image size
+        state_keys: List of top-level keys to include in state (default: ["agent", "extra"])
     """
     
-    def __init__(self, env: gym.Env, obs_mode: str = "state_image", image_size: int = 128):
+    def __init__(self, env: gym.Env, obs_mode: str = "state_image", image_size: int = 128,
+                 state_keys: Optional[List[str]] = None):
         super().__init__(env)
         self.obs_mode = obs_mode
         self.image_size = image_size
+        self.state_keys = state_keys or ["agent", "extra"]
         
         # Get num_envs
         self.num_envs = getattr(env.unwrapped, 'num_envs', 1)
@@ -419,10 +500,9 @@ class SimplifiedVecObsWrapper(gym.Wrapper):
         sample_obs, _ = env.reset()
         
         if obs_mode == "state_image":
-            if isinstance(sample_obs, dict) and "state" in sample_obs:
-                self.state_dim = sample_obs["state"].shape[-1]
-            else:
-                self.state_dim = sample_obs.shape[-1] if not isinstance(sample_obs, dict) else 64
+            # Calculate state dim based on state_keys
+            flat_state = self._flatten_obs_batch(sample_obs)
+            self.state_dim = flat_state.shape[-1]
             
             self.single_observation_space = gym.spaces.Dict({
                 "state": gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.state_dim,), dtype=np.float32),
@@ -472,27 +552,11 @@ class SimplifiedVecObsWrapper(gym.Wrapper):
         return rgb
     
     def _flatten_obs_batch(self, obs) -> torch.Tensor:
-        """Flatten ManiSkill3 observation dict into a state vector.
+        """Flatten ManiSkill3 observation dict into a state vector based on state_keys.
         
-        ManiSkill3 with obs_mode="state_dict" or "state_dict+rgb" returns:
-            obs = {
-                "agent": {
-                    "qpos": (num_envs, 9),  # joint positions
-                    "qvel": (num_envs, 9),  # joint velocities
-                },
-                "extra": {
-                    "tcp_pose": (num_envs, 7),  # end-effector pose (pos + quat)
-                    "obj_pose": (num_envs, 7),  # object pose
-                    "goal_pos": (num_envs, 3),  # goal position
-                    "tcp_to_obj_pos": (num_envs, 3),  # relative position
-                    "obj_to_goal_pos": (num_envs, 3),  # relative position
-                    ... (may have additional fields)
-                },
-                "sensor_data": {...}  # camera data, ignored for state
-            }
-        
-        This method extracts and concatenates all numeric fields from "agent" and "extra"
-        to create a flat state vector.
+        This method extracts and concatenates numeric fields from keys specified in state_keys.
+        For PegInsertionSide, only ["agent"] is used (robot proprioception only).
+        For PickCube, ["agent", "extra"] is used (includes object positions).
         
         Returns:
             state: (num_envs, state_dim) flattened state tensor
@@ -501,7 +565,7 @@ class SimplifiedVecObsWrapper(gym.Wrapper):
             # Already a tensor
             if isinstance(obs, torch.Tensor):
                 return obs
-            return torch.from_numpy(obs) if isinstance(obs, np.ndarray) else torch.zeros(self.num_envs, self.state_dim)
+            return torch.from_numpy(obs) if isinstance(obs, np.ndarray) else torch.zeros(self.num_envs, self.state_dim if hasattr(self, 'state_dim') else 1)
         
         # If obs already has a "state" key (e.g., from obs_mode="state"), use it directly
         if "state" in obs:
@@ -510,29 +574,31 @@ class SimplifiedVecObsWrapper(gym.Wrapper):
                 state = torch.from_numpy(state)
             return state
         
-        # Extract from agent and extra dicts
+        # Extract from dicts based on state_keys
         state_parts = []
         device = None
         
-        # Process "agent" dict
-        if "agent" in obs:
+        # Process "agent" dict (if in state_keys)
+        if "agent" in self.state_keys and "agent" in obs:
             agent = obs["agent"]
-            for key in sorted(agent.keys()):  # Sort for deterministic order
-                val = agent[key]
-                if isinstance(val, (torch.Tensor, np.ndarray)):
-                    if isinstance(val, np.ndarray):
-                        val = torch.from_numpy(val)
-                    if device is None:
-                        device = val.device
-                    # Flatten to (num_envs, -1)
-                    if val.dim() == 1:
-                        val = val.unsqueeze(-1)
-                    elif val.dim() > 2:
-                        val = val.view(val.shape[0], -1)
-                    state_parts.append(val.float())
+            # Use fixed order: qpos, qvel for consistency
+            for key in ["qpos", "qvel"]:
+                if key in agent:
+                    val = agent[key]
+                    if isinstance(val, (torch.Tensor, np.ndarray)):
+                        if isinstance(val, np.ndarray):
+                            val = torch.from_numpy(val)
+                        if device is None:
+                            device = val.device
+                        # Flatten to (num_envs, -1)
+                        if val.dim() == 1:
+                            val = val.unsqueeze(-1)
+                        elif val.dim() > 2:
+                            val = val.view(val.shape[0], -1)
+                        state_parts.append(val.float())
         
-        # Process "extra" dict
-        if "extra" in obs:
+        # Process "extra" dict (if in state_keys)
+        if "extra" in self.state_keys and "extra" in obs:
             extra = obs["extra"]
             for key in sorted(extra.keys()):  # Sort for deterministic order
                 val = extra[key]
@@ -553,7 +619,8 @@ class SimplifiedVecObsWrapper(gym.Wrapper):
             return state
         else:
             # Fallback: return zeros if no state data found
-            return torch.zeros(self.num_envs, self.state_dim, device=device or "cpu")
+            state_dim = self.state_dim if hasattr(self, 'state_dim') and self.state_dim else 1
+            return torch.zeros(self.num_envs, state_dim, device=device or "cpu")
     
     def _make_obs(self, obs):
         if self.obs_mode == "image":

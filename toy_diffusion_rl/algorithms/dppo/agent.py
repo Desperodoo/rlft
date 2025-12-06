@@ -100,7 +100,7 @@ class DPPOAgent:
         state_dim: Optional[int] = None,
         image_shape: Optional[Tuple[int, int, int]] = None,
         hidden_dims: List[int] = [256, 256],
-        num_diffusion_steps: int = 5,
+        num_diffusion_steps: int = 100,
         ft_denoising_steps: int = 3,
         vision_encoder_type: str = "cnn",
         vision_output_dim: int = 128,
@@ -148,7 +148,7 @@ class DPPOAgent:
         # Base policy (frozen, for early denoising steps)
         self.actor = MultiModalDiffusionActor(
             action_dim=action_dim,
-            hidden_dims=hidden_dims + [256],
+            hidden_dims=hidden_dims,
             obs_encoder=self.obs_encoder,
         ).to(device)
         for p in self.actor.net.parameters():
@@ -159,7 +159,7 @@ class DPPOAgent:
         # Fine-tuned policy (trainable, for last K denoising steps)
         self.actor_ft = MultiModalDiffusionActor(
             action_dim=action_dim,
-            hidden_dims=hidden_dims + [256],
+            hidden_dims=hidden_dims,
             obs_encoder=self.obs_encoder,  # Share encoder
         ).to(device)
         
@@ -194,7 +194,7 @@ class DPPOAgent:
         # Old policy for PPO ratio computation
         self.old_actor_ft = MultiModalDiffusionActor(
             action_dim=action_dim,
-            hidden_dims=hidden_dims + [256],
+            hidden_dims=hidden_dims,
             obs_encoder=self.obs_encoder,
         ).to(device)
         self._sync_old_policy()

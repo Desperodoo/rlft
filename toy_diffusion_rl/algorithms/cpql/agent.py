@@ -53,10 +53,12 @@ class CPQLAgent:
         learning_rate_q: Learning rate for Q-network
         gamma: Discount factor
         tau: Soft update coefficient
-        alpha: Temperature for Q-value weighting
+        alpha: Temperature for Q-value weighting (reduced for stability)
         bc_weight: Weight for BC loss
         consistency_weight: Weight for consistency loss
         num_flow_steps: Number of ODE steps
+        reward_scale: Scale factor for rewards (for Q-value stability)
+        q_target_clip: Clip range for Q target (None to disable)
         device: Device for computation
     """
     
@@ -74,10 +76,12 @@ class CPQLAgent:
         learning_rate_q: float = 3e-4,
         gamma: float = 0.99,
         tau: float = 0.005,
-        alpha: float = 0.1,
+        alpha: float = 0.01,  # Reduced from 0.1 for stability
         bc_weight: float = 1.0,
         consistency_weight: float = 1.0,
-        num_flow_steps: int = 5,
+        num_flow_steps: int = 10,
+        reward_scale: float = 0.1,  # Scale down rewards for Q-value stability
+        q_target_clip: Optional[float] = 100.0,  # Clip Q targets to prevent explosion
         device: str = "cpu",
         # Legacy parameters
         sigma_min: float = 0.002,
@@ -95,6 +99,8 @@ class CPQLAgent:
         self.bc_weight = bc_weight
         self.consistency_weight = consistency_weight
         self.num_flow_steps = num_flow_steps
+        self.reward_scale = reward_scale
+        self.q_target_clip = q_target_clip
         self.device = device
         
         # Create observation encoder
@@ -110,7 +116,7 @@ class CPQLAgent:
         # Flow Policy
         self.policy = MultiModalVelocityPredictor(
             action_dim=action_dim,
-            hidden_dims=hidden_dims + [256],
+            hidden_dims=hidden_dims,
             obs_encoder=self.obs_encoder,
         ).to(device)
         
@@ -264,6 +270,9 @@ class CPQLAgent:
         
         batch_size = actions.shape[0]
         
+        # Scale rewards for Q-value stability
+        scaled_rewards = rewards * self.reward_scale
+        
         # Update Q-Networks
         with torch.no_grad():
             next_obs_features = self.obs_encoder(state=next_states, image=next_images)
@@ -271,7 +280,11 @@ class CPQLAgent:
             
             target_q1, target_q2 = self.critic_target(next_actions, obs_features=next_obs_features)
             target_q = torch.min(target_q1, target_q2)
-            target_q = rewards.unsqueeze(-1) + self.gamma * (1 - dones.unsqueeze(-1)) * target_q
+            target_q = scaled_rewards.unsqueeze(-1) + self.gamma * (1 - dones.unsqueeze(-1)) * target_q
+            
+            # Clip Q targets to prevent explosion
+            if self.q_target_clip is not None:
+                target_q = torch.clamp(target_q, -self.q_target_clip, self.q_target_clip)
         
         obs_features = self.obs_encoder(state=states, image=images)
         current_q1, current_q2 = self.critic(actions, obs_features=obs_features)

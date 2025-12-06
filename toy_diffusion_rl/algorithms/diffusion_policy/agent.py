@@ -73,7 +73,7 @@ class DiffusionPolicyAgent:
         vision_encoder_type: str = "cnn",
         vision_output_dim: int = 128,
         freeze_vision_encoder: bool = False,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 3e-4,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
         device: str = "cpu"

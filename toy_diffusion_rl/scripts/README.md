@@ -91,6 +91,68 @@ python scripts/validate_maniskill_offline.py \
 7. DPPO (pretrain only)
 8. ReinFlow (pretrain only)
 
+**Arguments:**
+- `--dataset_path`: Path to HDF5 dataset
+- `--obs_mode`: `state` or `state_image` (default: `state_image`)
+- `--num_steps`: Total training steps (default: 50000)
+- `--eval_interval`: Steps between evaluations (default: 5000)
+- `--eval_episodes`: Episodes per evaluation (default: 40)
+- `--record_video`: Enable video recording of evaluations
+- `--video_dir`: Directory to save videos
+
+### 4. `validate_maniskill_online.py`
+
+Online fine-tuning for DPPO and ReinFlow using PPO on ManiSkill3.
+
+```bash
+# Fine-tune from pretrained checkpoint
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_maniskill_online.py \
+    --checkpoint_dir ./results/maniskill_checkpoints_YYYYMMDD_HHMMSS \
+    --obs_mode state_image \
+    --num_iters 100 \
+    --rollout_steps 2048 \
+    --num_envs 20 \
+    --record_video
+
+# Train from scratch using dataset for normalizer
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_maniskill_online.py \
+    --dataset_path data/maniskill_pickcube_1k.h5 \
+    --algorithm DPPO \
+    --num_iters 100 \
+    --rollout_steps 2048
+
+# Fine-tune specific algorithm only
+CUDA_VISIBLE_DEVICES=1 python scripts/validate_maniskill_online.py \
+    --checkpoint_dir ./results/maniskill_checkpoints_XXX \
+    --algorithm ReinFlow \
+    --num_iters 50
+```
+
+**Algorithms:**
+- **DPPO**: Diffusion Policy with PPO (partial chain fine-tuning)
+- **ReinFlow**: Flow Matching with PPO (learnable exploration noise)
+
+**Arguments:**
+- `--checkpoint_dir`: Directory containing pretrained checkpoints (from `validate_maniskill_offline.py`)
+- `--dataset_path`: Path to dataset for creating normalizer (if no checkpoint)
+- `--algorithm`: `DPPO`, `ReinFlow`, or `all` (default: `all`)
+- `--obs_mode`: `state` or `state_image` (default: `state_image`)
+- `--num_envs`: Parallel training environments (default: 20)
+- `--num_eval_envs`: Parallel evaluation environments (default: 20)
+- `--num_iters`: Number of PPO update iterations (default: 100)
+- `--rollout_steps`: Steps per rollout (default: 2048)
+- `--eval_interval`: Iterations between evaluations (default: 10)
+- `--eval_episodes`: Episodes per evaluation (default: 20)
+- `--save_interval`: Iterations between checkpoint saves (default: 50)
+- `--record_video`: Enable video recording of evaluations
+- `--video_dir`: Directory to save videos
+
+**Output:**
+- Checkpoints saved to `./results/online_finetuning_YYYYMMDD_HHMMSS/`
+- Training progress plot (`training_progress.png`)
+- Results JSON with metrics per iteration
+- Videos (if `--record_video` enabled)
+
 ## Dataset Format
 
 Generated HDF5 files contain:

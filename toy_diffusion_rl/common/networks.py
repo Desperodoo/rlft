@@ -1135,6 +1135,18 @@ class MultiModalDoubleQNetwork(nn.Module):
         
         self.q1 = MLP(input_dim=input_dim, output_dim=1, hidden_dims=hidden_dims, activation=nn.ReLU())
         self.q2 = MLP(input_dim=input_dim, output_dim=1, hidden_dims=hidden_dims, activation=nn.ReLU())
+        
+        # Initialize Q-networks with small weights to prevent large initial Q-values
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights for stable Q-value estimation."""
+        for module in [self.q1, self.q2]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight, gain=0.01)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
     
     def forward(
         self,
@@ -1379,3 +1391,277 @@ class MultiModalNoisyFlowMLP(nn.Module):
         noise_std = self.get_noise_std(t, obs_features)
         
         return velocity, noise_std
+
+
+# ============================================================================
+# ShortCut Flow Networks (for ReinFlow with self-consistency)
+# ============================================================================
+# These networks support step size `d` as additional input for ShortCut models.
+# Reference: ReinFlow (https://github.com/ReinFlow/ReinFlow)
+
+class MultiModalShortCutVelocityPredictor(nn.Module):
+    """ShortCut velocity predictor with step size conditioning.
+    
+    Unlike standard flow matching that only takes time t, ShortCut models
+    also condition on step size d, enabling self-consistency training.
+    
+    The embedding combines:
+    - t_embed: sinusoidal embedding of time t
+    - d_embed: sinusoidal embedding of step size d
+    - These are concatenated and projected to td_embed_dim
+    
+    Reference: ShortCutFlow from ReinFlow paper.
+    
+    Args:
+        action_dim: Dimension of action space
+        hidden_dims: Hidden layer dimensions
+        td_embed_dim: Dimension of combined time-step embedding
+        obs_encoder: ObservationEncoder for processing observations
+        obs_dim: Observation dimension (used if obs_encoder is None)
+    """
+    
+    def __init__(
+        self,
+        action_dim: int,
+        hidden_dims: List[int] = [256, 256, 256],
+        td_embed_dim: int = 64,
+        obs_encoder: Optional['ObservationEncoder'] = None,
+        obs_dim: int = 0,
+    ):
+        super().__init__()
+        
+        self.action_dim = action_dim
+        self.td_embed_dim = td_embed_dim
+        self.obs_encoder = obs_encoder
+        
+        if obs_encoder is not None:
+            obs_feature_dim = obs_encoder.output_dim
+        else:
+            obs_feature_dim = obs_dim
+        
+        self.obs_feature_dim = obs_feature_dim
+        
+        # Sinusoidal embedding for both t and d (shared architecture)
+        # Following ReinFlow: use SinusoidalPosEmb style
+        self.map_t = nn.Sequential(
+            nn.Linear(1, td_embed_dim),
+            nn.SiLU(),
+            nn.Linear(td_embed_dim, td_embed_dim)
+        )
+        self.map_d = nn.Sequential(
+            nn.Linear(1, td_embed_dim),
+            nn.SiLU(),
+            nn.Linear(td_embed_dim, td_embed_dim)
+        )
+        
+        # Project concatenated [t_emb, d_emb] to td_embed_dim
+        self.td_embed = nn.Sequential(
+            nn.Linear(2 * td_embed_dim, td_embed_dim),
+            nn.Mish(),  # ReinFlow uses Mish
+            nn.Linear(td_embed_dim, td_embed_dim)
+        )
+        
+        # Velocity prediction network
+        input_dim = obs_feature_dim + action_dim + td_embed_dim
+        self.net = MLP(
+            input_dim=input_dim,
+            output_dim=action_dim,
+            hidden_dims=hidden_dims,
+            activation=nn.SiLU(),
+        )
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        d: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+        image: Optional[torch.Tensor] = None,
+        obs_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict velocity at position x, time t, with step size d.
+        
+        Args:
+            x: Current position in flow (B, action_dim)
+            t: Current timestep in [0, 1] (B,)
+            d: Step size in [0, 1] (B,), e.g., 1/num_steps
+            state: Optional state vector (B, state_dim)
+            image: Optional image tensor (B, C, H, W)
+            obs_features: Pre-computed observation features
+        
+        Returns:
+            Predicted velocity (B, action_dim)
+        """
+        if obs_features is not None:
+            features = obs_features
+        elif self.obs_encoder is not None:
+            features = self.obs_encoder(state=state, image=image)
+        else:
+            features = state
+        
+        # Embed time t and step size d separately
+        t_emb = self.map_t(t.unsqueeze(-1))
+        d_emb = self.map_d(d.unsqueeze(-1))
+        
+        # Combine embeddings
+        td_emb = self.td_embed(torch.cat([t_emb, d_emb], dim=-1))
+        
+        # Concatenate and predict
+        combined = torch.cat([features, x, td_emb], dim=-1)
+        return self.net(combined)
+
+
+class MultiModalNoisyShortCutFlowMLP(nn.Module):
+    """Noisy ShortCut Flow MLP with multi-modal observation support.
+    
+    Extends MultiModalShortCutVelocityPredictor with learnable exploration noise,
+    similar to MultiModalNoisyFlowMLP but with step size conditioning.
+    
+    Used by: ReinFlow (online fine-tuning with ShortCut model)
+    
+    Args:
+        action_dim: Dimension of action space
+        hidden_dims: Hidden layer dimensions
+        noise_scheduler_type: Type of noise schedule ('const', 'learn', 'learn_decay')
+        init_noise_std: Initial noise standard deviation
+        obs_encoder: ObservationEncoder for processing observations
+        obs_dim: Observation dimension (used if obs_encoder is None)
+    """
+    
+    def __init__(
+        self,
+        action_dim: int,
+        hidden_dims: List[int] = [256, 256, 256],
+        noise_scheduler_type: str = "learn",
+        init_noise_std: float = 0.1,
+        obs_encoder: Optional['ObservationEncoder'] = None,
+        obs_dim: int = 0,
+    ):
+        super().__init__()
+        
+        self.action_dim = action_dim
+        self.noise_scheduler_type = noise_scheduler_type
+        self.init_noise_std = init_noise_std
+        self.obs_encoder = obs_encoder
+        
+        if obs_encoder is not None:
+            obs_feature_dim = obs_encoder.output_dim
+        else:
+            obs_feature_dim = obs_dim
+        
+        self.obs_feature_dim = obs_feature_dim
+        
+        # Base ShortCut velocity network
+        self.base_net = MultiModalShortCutVelocityPredictor(
+            action_dim=action_dim,
+            hidden_dims=hidden_dims,
+            obs_encoder=obs_encoder,
+            obs_dim=obs_dim,
+        )
+        
+        # Time embedding for noise prediction
+        self.time_embed_dim = 64
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, self.time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim)
+        )
+        
+        # Observation embedding for noise prediction
+        self.obs_embed = nn.Sequential(
+            nn.Linear(obs_feature_dim, self.time_embed_dim),
+            nn.SiLU(),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim)
+        )
+        
+        # Exploration noise prediction network
+        self.explore_noise_net = nn.Sequential(
+            nn.Linear(self.time_embed_dim * 2, 128),
+            nn.SiLU(),
+            nn.Linear(128, 64),
+            nn.SiLU(),
+            nn.Linear(64, action_dim),
+            nn.Softplus()
+        )
+        
+        self._init_noise_net()
+        
+        if noise_scheduler_type == "learn_decay":
+            self.log_decay = nn.Parameter(torch.zeros(1))
+            
+        if noise_scheduler_type == "const":
+            self.register_buffer("const_noise_std", torch.ones(action_dim) * init_noise_std)
+    
+    def _init_noise_net(self):
+        """Initialize noise network to output init_noise_std."""
+        init_bias = np.log(np.exp(self.init_noise_std) - 1)
+        nn.init.constant_(self.explore_noise_net[-2].bias, init_bias)
+        nn.init.zeros_(self.explore_noise_net[-2].weight)
+    
+    def get_noise_std(
+        self,
+        t: torch.Tensor,
+        obs_features: torch.Tensor
+    ) -> torch.Tensor:
+        """Get exploration noise std based on time and observations."""
+        if self.noise_scheduler_type == "const":
+            batch_size = obs_features.shape[0]
+            return self.const_noise_std.unsqueeze(0).expand(batch_size, -1)
+        
+        time_emb = self.time_embed(t.unsqueeze(-1))
+        obs_emb = self.obs_embed(obs_features)
+        
+        combined = torch.cat([time_emb, obs_emb], dim=-1)
+        noise_std = self.explore_noise_net(combined)
+        
+        if self.noise_scheduler_type == "learn_decay":
+            decay_factor = torch.exp(self.log_decay)
+            time_scale = torch.exp(-decay_factor * t).unsqueeze(-1)
+            noise_std = noise_std * time_scale
+        
+        return noise_std.clamp(min=0.001, max=0.5)
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        d: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+        image: Optional[torch.Tensor] = None,
+        obs_features: Optional[torch.Tensor] = None,
+        sample_noise: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass: compute velocity and optionally sample exploration noise.
+        
+        Args:
+            x: Current position in flow (B, action_dim)
+            t: Current timestep in [0, 1] (B,)
+            d: Step size in [0, 1] (B,)
+            state: Optional state tensor
+            image: Optional image tensor
+            obs_features: Pre-computed observation features
+            sample_noise: Whether to sample noise
+            
+        Returns:
+            Tuple of (velocity, noise, noise_std)
+        """
+        # Get observation features
+        if obs_features is not None:
+            features = obs_features
+        elif self.obs_encoder is not None:
+            features = self.obs_encoder(state=state, image=image)
+        else:
+            features = state
+        
+        # Get base velocity with step size conditioning
+        velocity = self.base_net(x, t, d, obs_features=features)
+        
+        # Get noise std
+        noise_std = self.get_noise_std(t, features)
+        
+        if sample_noise:
+            noise = torch.randn_like(velocity)
+        else:
+            noise = torch.zeros_like(velocity)
+        
+        return velocity, noise, noise_std
