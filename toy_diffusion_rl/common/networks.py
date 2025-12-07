@@ -880,12 +880,16 @@ class MultiModalNoisePredictor(nn.Module):
     
     Used by: DPPO, DiffusionPolicy, DiffusionDoubleQ
     
+    Supports Action Chunking: when action_horizon > 1, predicts noise for
+    a sequence of actions instead of a single action.
+    
     Args:
         action_dim: Dimension of action space
         hidden_dims: Hidden layer dimensions for noise predictor
         time_embed_dim: Dimension of timestep embedding
         obs_encoder: ObservationEncoder for processing observations
         obs_dim: Observation dimension (used if obs_encoder is None)
+        action_horizon: Number of future actions to predict (1 = no chunking)
     """
     
     def __init__(
@@ -895,11 +899,16 @@ class MultiModalNoisePredictor(nn.Module):
         time_embed_dim: int = 64,
         obs_encoder: Optional['ObservationEncoder'] = None,
         obs_dim: int = 0,
+        action_horizon: int = 1,
     ):
         super().__init__()
         
         self.action_dim = action_dim
+        self.action_horizon = action_horizon
         self.obs_encoder = obs_encoder
+        
+        # Total output dimension: action_dim * action_horizon (flattened)
+        self.output_dim = action_dim * action_horizon
         
         if obs_encoder is not None:
             obs_feature_dim = obs_encoder.output_dim
@@ -912,10 +921,11 @@ class MultiModalNoisePredictor(nn.Module):
         self.time_embed = TimestepEmbedding(time_embed_dim)
         
         # Noise prediction network
-        input_dim = obs_feature_dim + action_dim + time_embed_dim
+        # Input: obs_features + flattened noisy action sequence + time embedding
+        input_dim = obs_feature_dim + self.output_dim + time_embed_dim
         self.net = MLP(
             input_dim=input_dim,
-            output_dim=action_dim,
+            output_dim=self.output_dim,
             hidden_dims=hidden_dims,
             activation=nn.SiLU(),
         )
@@ -941,7 +951,9 @@ class MultiModalNoisePredictor(nn.Module):
         """Predict noise in noisy action.
         
         Args:
-            noisy_action: Noisy action (B, action_dim)
+            noisy_action: Noisy action tensor
+                - If action_horizon == 1: (B, action_dim)
+                - If action_horizon > 1: (B, action_horizon, action_dim) or (B, action_horizon * action_dim)
             timestep: Normalized timestep in [0, 1] (B,)
             state: Optional state vector (B, state_dim)
             image: Optional image tensor (B, C, H, W)
@@ -949,7 +961,7 @@ class MultiModalNoisePredictor(nn.Module):
                          If provided, state and image are ignored.
         
         Returns:
-            Predicted noise (B, action_dim)
+            Predicted noise with same shape as input noisy_action
         """
         if obs_features is not None:
             features = obs_features
@@ -958,9 +970,25 @@ class MultiModalNoisePredictor(nn.Module):
         else:
             features = state
         
+        # Remember input shape for output reshaping
+        input_shape = noisy_action.shape
+        batch_size = noisy_action.shape[0]
+        
+        # Flatten action sequence if needed
+        if noisy_action.dim() == 3:  # (B, T, action_dim)
+            noisy_action_flat = noisy_action.view(batch_size, -1)
+        else:  # Already flat (B, action_dim) or (B, T * action_dim)
+            noisy_action_flat = noisy_action
+        
         t_embed = self.time_embed(timestep)
-        x = torch.cat([features, noisy_action, t_embed], dim=-1)
-        return self.net(x)
+        x = torch.cat([features, noisy_action_flat, t_embed], dim=-1)
+        predicted_noise_flat = self.net(x)
+        
+        # Reshape output to match input shape
+        if len(input_shape) == 3:  # Input was (B, T, action_dim)
+            return predicted_noise_flat.view(batch_size, self.action_horizon, self.action_dim)
+        else:
+            return predicted_noise_flat
 
 
 class MultiModalVelocityPredictor(nn.Module):
@@ -968,12 +996,16 @@ class MultiModalVelocityPredictor(nn.Module):
     
     Used by: ReinFlow, FlowMatching, CPQL
     
+    Supports Action Chunking: when action_horizon > 1, predicts velocity for
+    a sequence of actions instead of a single action.
+    
     Args:
         action_dim: Dimension of action space
         hidden_dims: Hidden layer dimensions
         time_embed_dim: Dimension of timestep embedding
         obs_encoder: ObservationEncoder for processing observations
         obs_dim: Observation dimension (used if obs_encoder is None)
+        action_horizon: Number of future actions to predict (1 = no chunking)
     """
     
     def __init__(
@@ -983,11 +1015,16 @@ class MultiModalVelocityPredictor(nn.Module):
         time_embed_dim: int = 64,
         obs_encoder: Optional['ObservationEncoder'] = None,
         obs_dim: int = 0,
+        action_horizon: int = 1,
     ):
         super().__init__()
         
         self.action_dim = action_dim
+        self.action_horizon = action_horizon
         self.obs_encoder = obs_encoder
+        
+        # Total output dimension: action_dim * action_horizon (flattened)
+        self.output_dim = action_dim * action_horizon
         
         if obs_encoder is not None:
             obs_feature_dim = obs_encoder.output_dim
@@ -1004,10 +1041,11 @@ class MultiModalVelocityPredictor(nn.Module):
         )
         
         # Velocity prediction network
-        input_dim = obs_feature_dim + action_dim + time_embed_dim
+        # Input: obs_features + flattened action sequence + time embedding
+        input_dim = obs_feature_dim + self.output_dim + time_embed_dim
         self.net = MLP(
             input_dim=input_dim,
-            output_dim=action_dim,
+            output_dim=self.output_dim,
             hidden_dims=hidden_dims,
             activation=nn.SiLU(),
         )
@@ -1023,14 +1061,16 @@ class MultiModalVelocityPredictor(nn.Module):
         """Predict velocity at position x and time t.
         
         Args:
-            x: Current position in flow (B, action_dim)
+            x: Current position in flow
+                - If action_horizon == 1: (B, action_dim)
+                - If action_horizon > 1: (B, action_horizon, action_dim) or (B, action_horizon * action_dim)
             t: Current timestep in [0, 1] (B,)
             state: Optional state vector (B, state_dim)
             image: Optional image tensor (B, C, H, W)
             obs_features: Pre-computed observation features
         
         Returns:
-            Predicted velocity (B, action_dim)
+            Predicted velocity with same shape as input x
         """
         if obs_features is not None:
             features = obs_features
@@ -1039,9 +1079,25 @@ class MultiModalVelocityPredictor(nn.Module):
         else:
             features = state
         
+        # Remember input shape for output reshaping
+        input_shape = x.shape
+        batch_size = x.shape[0]
+        
+        # Flatten action sequence if needed
+        if x.dim() == 3:  # (B, T, action_dim)
+            x_flat = x.view(batch_size, -1)
+        else:  # Already flat
+            x_flat = x
+        
         t_embed = self.time_embed(t.unsqueeze(-1))
-        combined = torch.cat([features, x, t_embed], dim=-1)
-        return self.net(combined)
+        combined = torch.cat([features, x_flat, t_embed], dim=-1)
+        predicted_velocity_flat = self.net(combined)
+        
+        # Reshape output to match input shape
+        if len(input_shape) == 3:  # Input was (B, T, action_dim)
+            return predicted_velocity_flat.view(batch_size, self.action_horizon, self.action_dim)
+        else:
+            return predicted_velocity_flat
 
 
 class MultiModalValueNetwork(nn.Module):
@@ -1665,3 +1721,418 @@ class MultiModalNoisyShortCutFlowMLP(nn.Module):
             noise = torch.zeros_like(velocity)
         
         return velocity, noise, noise_std
+
+
+# ============================================================================
+# 1D U-Net Architecture for Diffusion Policy
+# ============================================================================
+# Reference: ManiSkill official diffusion policy implementation
+# https://github.com/haosulab/ManiSkill/blob/main/examples/baselines/diffusion_policy/diffusion_policy/conditional_unet1d.py
+
+class SinusoidalPosEmb(nn.Module):
+    """Sinusoidal positional embedding for diffusion timestep.
+    
+    Standard positional encoding used in transformers and diffusion models.
+    """
+    
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute sinusoidal embedding.
+        
+        Args:
+            x: Timestep tensor of shape (batch_size,)
+            
+        Returns:
+            Embedding of shape (batch_size, dim)
+        """
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+
+class Downsample1d(nn.Module):
+    """1D downsampling using strided convolution."""
+    
+    def __init__(self, dim: int):
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Upsample1d(nn.Module):
+    """1D upsampling using transposed convolution."""
+    
+    def __init__(self, dim: int):
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv1dBlock(nn.Module):
+    """Conv1d --> GroupNorm --> Mish activation block."""
+    
+    def __init__(
+        self,
+        inp_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        n_groups: int = 8,
+    ):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            nn.GroupNorm(n_groups, out_channels),
+            nn.Mish(),
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.block(x)
+
+
+class ConditionalResidualBlock1D(nn.Module):
+    """Residual block with FiLM conditioning.
+    
+    Takes two inputs: x (feature) and cond (conditioning).
+    x is passed through 2 Conv1dBlock stacked together with residual connection.
+    cond is applied to x with FiLM (Feature-wise Linear Modulation).
+    
+    Reference: https://arxiv.org/abs/1709.07871
+    """
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        cond_dim: int,
+        kernel_size: int = 3,
+        n_groups: int = 8,
+    ):
+        super().__init__()
+        
+        self.blocks = nn.ModuleList([
+            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups),
+            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups),
+        ])
+        
+        # FiLM modulation: predicts per-channel scale and bias
+        cond_channels = out_channels * 2
+        self.out_channels = out_channels
+        self.cond_encoder = nn.Sequential(
+            nn.Mish(),
+            nn.Linear(cond_dim, cond_channels),
+            nn.Unflatten(-1, (-1, 1))  # (B, cond_channels) -> (B, cond_channels, 1)
+        )
+        
+        # Residual connection
+        self.residual_conv = nn.Conv1d(in_channels, out_channels, 1) \
+            if in_channels != out_channels else nn.Identity()
+    
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """Forward pass with conditioning.
+        
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, horizon)
+            cond: Conditioning tensor of shape (batch_size, cond_dim)
+            
+        Returns:
+            Output tensor of shape (batch_size, out_channels, horizon)
+        """
+        out = self.blocks[0](x)
+        embed = self.cond_encoder(cond)
+        
+        # FiLM modulation: scale and bias
+        embed = embed.reshape(embed.shape[0], 2, self.out_channels, 1)
+        scale = embed[:, 0, ...]
+        bias = embed[:, 1, ...]
+        out = scale * out + bias
+        
+        out = self.blocks[1](out)
+        out = out + self.residual_conv(x)
+        return out
+
+
+class ConditionalUnet1D(nn.Module):
+    """1D U-Net for noise prediction in diffusion policy.
+    
+    This is a simplified version of the official ManiSkill implementation.
+    Uses FiLM conditioning to incorporate timestep and observation embeddings.
+    
+    Architecture:
+    - Encoder: Series of ConditionalResidualBlock1D with downsampling
+    - Middle: ConditionalResidualBlock1D without resolution change
+    - Decoder: Series of ConditionalResidualBlock1D with upsampling and skip connections
+    
+    Args:
+        input_dim: Dimension of input actions
+        global_cond_dim: Dimension of global conditioning (obs_horizon * obs_dim)
+        diffusion_step_embed_dim: Size of positional encoding for diffusion iteration
+        down_dims: Channel size for each UNet level
+        kernel_size: Conv kernel size
+        n_groups: Number of groups for GroupNorm
+    
+    Reference:
+        https://github.com/haosulab/ManiSkill/blob/main/examples/baselines/diffusion_policy/diffusion_policy/conditional_unet1d.py
+    """
+    
+    def __init__(
+        self,
+        input_dim: int,
+        global_cond_dim: int,
+        diffusion_step_embed_dim: int = 256,
+        down_dims: List[int] = [256, 512, 1024],
+        kernel_size: int = 5,
+        n_groups: int = 8,
+    ):
+        super().__init__()
+        
+        self.input_dim = input_dim
+        self.global_cond_dim = global_cond_dim
+        
+        all_dims = [input_dim] + list(down_dims)
+        start_dim = down_dims[0]
+        
+        # Diffusion step encoder
+        dsed = diffusion_step_embed_dim
+        self.diffusion_step_encoder = nn.Sequential(
+            SinusoidalPosEmb(dsed),
+            nn.Linear(dsed, dsed * 4),
+            nn.Mish(),
+            nn.Linear(dsed * 4, dsed),
+        )
+        
+        # Total conditioning dimension
+        cond_dim = dsed + global_cond_dim
+        
+        # Build encoder (down) modules
+        in_out = list(zip(all_dims[:-1], all_dims[1:]))
+        
+        down_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            down_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1D(
+                    dim_in, dim_out, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups),
+                ConditionalResidualBlock1D(
+                    dim_out, dim_out, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups),
+                Downsample1d(dim_out) if not is_last else nn.Identity()
+            ]))
+        
+        # Middle modules
+        mid_dim = all_dims[-1]
+        self.mid_modules = nn.ModuleList([
+            ConditionalResidualBlock1D(
+                mid_dim, mid_dim, cond_dim=cond_dim,
+                kernel_size=kernel_size, n_groups=n_groups),
+            ConditionalResidualBlock1D(
+                mid_dim, mid_dim, cond_dim=cond_dim,
+                kernel_size=kernel_size, n_groups=n_groups),
+        ])
+        
+        # Build decoder (up) modules
+        up_modules = nn.ModuleList([])
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (len(in_out) - 1)
+            up_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1D(
+                    dim_out * 2, dim_in, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups),
+                ConditionalResidualBlock1D(
+                    dim_in, dim_in, cond_dim=cond_dim,
+                    kernel_size=kernel_size, n_groups=n_groups),
+                Upsample1d(dim_in) if not is_last else nn.Identity()
+            ]))
+        
+        # Final conv
+        self.final_conv = nn.Sequential(
+            Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
+            nn.Conv1d(start_dim, input_dim, 1),
+        )
+        
+        self.down_modules = down_modules
+        self.up_modules = up_modules
+        
+        # Print parameter count
+        n_params = sum(p.numel() for p in self.parameters())
+        print(f"ConditionalUnet1D: {n_params / 1e6:.2f}M parameters")
+    
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        global_cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            sample: Noisy action sequence of shape (B, T, input_dim)
+            timestep: Diffusion timestep(s), shape (B,) or scalar
+            global_cond: Global conditioning of shape (B, global_cond_dim)
+            
+        Returns:
+            Predicted noise of shape (B, T, input_dim)
+        """
+        # Convert to (B, C, T) for 1D convolutions
+        sample = sample.moveaxis(-1, -2)  # (B, T, C) -> (B, C, T)
+        
+        # Handle timestep
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timestep) and len(timestep.shape) == 0:
+            timestep = timestep[None].to(sample.device)
+        
+        # Broadcast to batch dimension
+        timestep = timestep.expand(sample.shape[0])
+        
+        # Encode diffusion step
+        global_feature = self.diffusion_step_encoder(timestep)
+        
+        # Concatenate with global conditioning
+        if global_cond is not None:
+            global_feature = torch.cat([global_feature, global_cond], dim=-1)
+        
+        # Encoder
+        x = sample
+        h = []
+        for resnet, resnet2, downsample in self.down_modules:
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            h.append(x)
+            x = downsample(x)
+        
+        # Middle
+        for mid_module in self.mid_modules:
+            x = mid_module(x, global_feature)
+        
+        # Decoder with skip connections
+        for resnet, resnet2, upsample in self.up_modules:
+            x = torch.cat((x, h.pop()), dim=1)
+            x = resnet(x, global_feature)
+            x = resnet2(x, global_feature)
+            x = upsample(x)
+        
+        # Final conv
+        x = self.final_conv(x)
+        
+        # Convert back to (B, T, C)
+        x = x.moveaxis(-1, -2)  # (B, C, T) -> (B, T, C)
+        return x
+
+
+class MultiModalUnet1DNoisePredictor(nn.Module):
+    """1D U-Net noise predictor with multi-modal observation support.
+    
+    Wraps ConditionalUnet1D to work with the ObservationEncoder interface.
+    
+    This is the preferred network for diffusion policy with action chunking,
+    as the U-Net architecture preserves temporal structure better than MLP.
+    
+    Args:
+        action_dim: Dimension of action space
+        obs_encoder: ObservationEncoder for processing observations
+        obs_dim: Observation dimension (used if obs_encoder is None)
+        action_horizon: Number of actions in sequence (pred_horizon)
+        diffusion_step_embed_dim: Size of diffusion step embedding
+        down_dims: Channel sizes for each U-Net level
+        kernel_size: Conv kernel size
+        n_groups: Number of groups for GroupNorm
+    """
+    
+    def __init__(
+        self,
+        action_dim: int,
+        obs_encoder: Optional['ObservationEncoder'] = None,
+        obs_dim: int = 0,
+        action_horizon: int = 16,
+        diffusion_step_embed_dim: int = 64,
+        down_dims: List[int] = [64, 128, 256],
+        kernel_size: int = 5,
+        n_groups: int = 8,
+    ):
+        super().__init__()
+        
+        self.action_dim = action_dim
+        self.action_horizon = action_horizon
+        self.obs_encoder = obs_encoder
+        
+        if obs_encoder is not None:
+            obs_feature_dim = obs_encoder.output_dim
+        else:
+            obs_feature_dim = obs_dim
+        
+        self.obs_feature_dim = obs_feature_dim
+        
+        # 1D U-Net for noise prediction
+        # global_cond_dim = obs_feature_dim (single observation embedding)
+        self.unet = ConditionalUnet1D(
+            input_dim=action_dim,
+            global_cond_dim=obs_feature_dim,
+            diffusion_step_embed_dim=diffusion_step_embed_dim,
+            down_dims=down_dims,
+            kernel_size=kernel_size,
+            n_groups=n_groups,
+        )
+    
+    def forward(
+        self,
+        noisy_action: torch.Tensor,
+        timestep: torch.Tensor,
+        state: Optional[torch.Tensor] = None,
+        image: Optional[torch.Tensor] = None,
+        obs_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Predict noise in noisy action sequence.
+        
+        Args:
+            noisy_action: Noisy action tensor of shape (B, T, action_dim) or (B, action_dim)
+            timestep: Diffusion timestep (can be normalized [0,1] or integer)
+            state: Optional state tensor (B, state_dim)
+            image: Optional image tensor (B, C, H, W)
+            obs_features: Pre-computed observation features (B, obs_feature_dim)
+            
+        Returns:
+            Predicted noise with same shape as noisy_action
+        """
+        # Get observation features
+        if obs_features is not None:
+            features = obs_features
+        elif self.obs_encoder is not None:
+            features = self.obs_encoder(state=state, image=image)
+        else:
+            features = state
+        
+        # Remember input shape
+        input_shape = noisy_action.shape
+        batch_size = noisy_action.shape[0]
+        
+        # Ensure 3D input for U-Net: (B, T, action_dim)
+        if noisy_action.dim() == 2:
+            # (B, action_dim) -> (B, 1, action_dim)
+            noisy_action = noisy_action.unsqueeze(1)
+        
+        # Convert normalized timestep to integer if needed
+        if timestep.dtype == torch.float32 or timestep.dtype == torch.float64:
+            # Assume timestep is normalized [0, 1], convert to integer
+            # This is approximate - exact conversion depends on num_diffusion_steps
+            timestep = (timestep * 100).long()
+        
+        # Forward through U-Net
+        predicted_noise = self.unet(noisy_action, timestep, global_cond=features)
+        
+        # Restore original shape
+        if len(input_shape) == 2:
+            predicted_noise = predicted_noise.squeeze(1)
+        
+        return predicted_noise

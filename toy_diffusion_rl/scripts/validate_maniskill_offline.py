@@ -90,7 +90,7 @@ from toy_diffusion_rl.algorithms.diffusion_double_q.agent import DiffusionDouble
 from toy_diffusion_rl.algorithms.cpql.agent import CPQLAgent
 from toy_diffusion_rl.algorithms.dppo.agent import DPPOAgent
 from toy_diffusion_rl.algorithms.reinflow.agent import ReinFlowAgent
-from toy_diffusion_rl.common.normalizer import DataNormalizer, create_normalizer_from_dataset
+from toy_diffusion_rl.common.normalizer import DataNormalizer
 
 
 def set_seed(seed: int):
@@ -156,32 +156,60 @@ def prepare_batch(
     indices: np.ndarray,
     obs_mode: str,
     device: str,
-    normalizer: Optional[DataNormalizer] = None
+    normalizer: Optional[DataNormalizer] = None,
+    action_horizon: int = 1,
+    episode_ends: Optional[np.ndarray] = None,
 ) -> Dict[str, torch.Tensor]:
     """Prepare a batch for training.
     
     Args:
         dataset: Full dataset dict
-        indices: Batch indices
+        indices: Batch indices (starting indices for action sequences)
         obs_mode: "state" or "state_image"
         device: Target device
         normalizer: Optional normalizer for actions and states
+        action_horizon: Number of future actions to predict (1 = no chunking)
+        episode_ends: Array of episode end indices for boundary handling
         
     Returns:
         Batch dictionary with tensors (normalized if normalizer provided)
+        When action_horizon > 1, actions shape is (B, action_horizon, action_dim)
     """
     batch = {}
+    batch_size = len(indices)
+    n_samples = len(dataset["actions"])
+    action_dim = dataset["actions"].shape[1]
     
-    # Actions (always present)
-    actions = torch.FloatTensor(dataset["actions"][indices]).to(device)
+    # Handle action sequences for action chunking
+    if action_horizon > 1:
+        # Sample action sequences with episode boundary handling
+        action_seqs = np.zeros((batch_size, action_horizon, action_dim), dtype=np.float32)
+        
+        for b, idx in enumerate(indices):
+            # Find which episode this index belongs to
+            if episode_ends is not None:
+                # Find episode end for this index
+                ep_end = episode_ends[np.searchsorted(episode_ends, idx, side='right')]
+                ep_end = min(ep_end, n_samples)
+            else:
+                ep_end = n_samples
+            
+            # Collect action sequence
+            for t in range(action_horizon):
+                action_idx = min(idx + t, ep_end - 1)  # Clamp to episode end
+                action_seqs[b, t] = dataset["actions"][action_idx]
+        
+        actions = torch.FloatTensor(action_seqs).to(device)
+    else:
+        # Single action (original behavior)
+        actions = torch.FloatTensor(dataset["actions"][indices]).to(device)
+    
     batch["rewards"] = torch.FloatTensor(dataset["rewards"][indices]).to(device)
     batch["dones"] = torch.FloatTensor(dataset["dones"][indices]).to(device)
     
-    # Apply action normalization if normalizer is provided
-    if normalizer is not None:
-        batch["actions"] = normalizer.normalize_action(actions)
-    else:
-        batch["actions"] = actions
+    # ManiSkill action space is [-1, 1] by default (official implementation assumption)
+    # No action normalization needed, just use raw actions
+    batch["actions"] = actions
     
     if obs_mode == "state":
         states = torch.FloatTensor(dataset["obs"][indices]).to(device)
@@ -306,6 +334,16 @@ def evaluate_agent(
     
     obs, info = env.reset()
     
+    # Get number of parallel environments
+    if hasattr(env, 'num_envs'):
+        num_envs = env.num_envs
+    else:
+        num_envs = 1
+    
+    # Reset action queues for all envs at the start of evaluation (for action chunking)
+    if hasattr(agent, 'reset'):
+        agent.reset(num_envs=num_envs)
+    
     # Detect device from observation
     if obs_mode == "state":
         device = obs.device if hasattr(obs, 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -372,10 +410,9 @@ def evaluate_agent(
             elif isinstance(actions, torch.Tensor):
                 actions = actions.to(device)
             
-            # Unnormalize actions if normalizer provided
-            # Model outputs are in [-1, 1], need to convert back to original action space
-            if normalizer is not None:
-                actions = normalizer.unnormalize_action(actions)
+            # ManiSkill action space is [-1, 1] by default (official implementation assumption)
+            # Just clip for safety (diffusion output might slightly exceed bounds)
+            actions = torch.clamp(actions, -1.0, 1.0)
             
             # Ensure correct shape for VecEnv
             if actions.ndim == 1:
@@ -454,6 +491,10 @@ def evaluate_agent(
                 env_rewards[i] = 0
                 env_lengths[i] = 0
                 env_successes[i] = False
+                
+                # Reset action queue for this specific env (for action chunking in VecEnv)
+                if hasattr(agent, 'reset'):
+                    agent.reset(env_ids=[i])
     
     successes = sum(episode_successes)
     total_reward = sum(episode_rewards)
@@ -492,6 +533,8 @@ def train_and_evaluate_all(
     video_dir: Optional[str] = None,
     algorithms: Optional[List[str]] = None,
     task: str = "PickCube-v1",
+    action_horizon: int = 1,
+    action_exec_horizon: Optional[int] = None,
 ) -> Tuple[Dict[str, Dict[str, List]], Dict[str, Dict[str, Any]]]:
     """Train specified algorithms and track metrics.
     
@@ -512,6 +555,8 @@ def train_and_evaluate_all(
         video_dir: Directory to save videos (required if record_video=True)
         algorithms: List of algorithm names to train (None = all)
         task: ManiSkill3 task name (PickCube-v1, PegInsertionSide-v1, etc.)
+        action_horizon: Number of future actions to predict (1 = no chunking)
+        action_exec_horizon: Number of actions to execute before re-planning
         
     Returns:
         Tuple of:
@@ -529,19 +574,35 @@ def train_and_evaluate_all(
     batch_size = 256
     n_samples = len(dataset["actions"])
     
-    # Create and fit data normalizer
-    print("Creating data normalizer...")
+    # Compute episode_ends from dones for action chunking
+    episode_ends = None
+    if action_horizon > 1:
+        dones = dataset["dones"]
+        episode_ends = np.where(dones)[0] + 1  # +1 because end is exclusive
+        # Make sure last sample is included
+        if len(episode_ends) == 0 or episode_ends[-1] != n_samples:
+            episode_ends = np.append(episode_ends, n_samples)
+        print(f"Action chunking enabled: horizon={action_horizon}, exec_horizon={action_exec_horizon or action_horizon}")
+        print(f"  Found {len(episode_ends)} episodes in dataset")
+    
+    # ManiSkill action space is [-1, 1] by default for most controllers
+    # (Official diffusion policy asserts this: action_space.high == 1 and action_space.low == -1)
+    # Reference: https://maniskill.readthedocs.io/en/latest/user_guide/concepts/controllers.html
+    # "All the controllers have a normalized action space ([-1, 1]), except arm_pd_joint_pos and arm_pd_joint_pos_vel"
+    print("ManiSkill action space is [-1, 1] by default, no action normalization needed.")
+    
+    # Create normalizer for state normalization only
     normalizer = DataNormalizer(action_mode='limits', obs_mode='limits')
-    normalizer.fit(actions=dataset["actions"], states=dataset.get("obs"))
+    
+    # Only fit state normalizer (no action normalization for ManiSkill)
+    if dataset.get("obs") is not None:
+        normalizer.state_normalizer.fit(dataset["obs"])
+        normalizer.fitted = True
+    
     normalizer = normalizer.to(device)
     
-    # Print normalization statistics
-    action_stats = normalizer.get_action_stats()
-    print(f"  Action normalization (limits mode):")
-    print(f"    Input range: [{action_stats['min'].min():.3f}, {action_stats['max'].max():.3f}]")
-    print(f"    Output range: [-1, 1]")
-    
-    if dataset.get("obs") is not None:
+    # Print state normalization statistics
+    if dataset.get("obs") is not None and normalizer.fitted:
         state_stats = normalizer.get_state_stats()
         print(f"  State normalization (limits mode):")
         print(f"    Input range: [{state_stats['min'].min():.3f}, {state_stats['max'].max():.3f}]")
@@ -561,8 +622,10 @@ def train_and_evaluate_all(
     temp_ckpt_dir = tempfile.mkdtemp(prefix="best_ckpt_ms3_")
     
     # Create evaluation environment (VecEnv for parallel evaluation)
-    # Use multiple envs for faster evaluation
-    num_eval_envs = 40  # Can increase for faster eval, but 4 is reasonable default
+    # Vec action queue now supports multi-env evaluation with action chunking
+    num_eval_envs = 40  # Can increase for faster eval
+    if action_horizon > 1:
+        print(f"Action chunking enabled: using Vec action queue for {num_eval_envs} parallel envs")
     print(f"Creating evaluation environment (task={task}, num_envs={num_eval_envs})...")
     eval_env = make_maniskill_env(
         task=task,
@@ -586,6 +649,13 @@ def train_and_evaluate_all(
     if obs_mode == "state_image":
         common_kwargs["image_shape"] = image_shape
     
+    # Add action chunking parameters (only for BC algorithms that support it)
+    bc_kwargs = common_kwargs.copy()
+    if action_horizon > 1:
+        bc_kwargs["action_horizon"] = action_horizon
+        if action_exec_horizon is not None:
+            bc_kwargs["action_exec_horizon"] = action_exec_horizon
+    
     eval_steps = list(range(0, num_steps + 1, eval_interval))
     if eval_steps[-1] != num_steps:
         eval_steps.append(num_steps)
@@ -607,7 +677,7 @@ def train_and_evaluate_all(
         try:
             agent = DiffusionPolicyAgent(
                 num_diffusion_steps=100,
-                **common_kwargs
+                **bc_kwargs
             )
             
             for step in tqdm(range(num_steps + 1), desc=algo_name):
@@ -638,13 +708,14 @@ def train_and_evaluate_all(
                             "use_pretrain": False,
                             "agent_class": "DiffusionPolicyAgent",
                             "normalizer_state": normalizer.state_dict(),
-                            "agent_kwargs": {"num_diffusion_steps": 100, **common_kwargs},
+                            "agent_kwargs": {"num_diffusion_steps": 100, **bc_kwargs},
                         }
                         print(f"    -> New best! Saving checkpoint at step {step}")
                 
                 if step < num_steps:
                     idx = np.random.randint(0, n_samples, batch_size)
-                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer,
+                                          action_horizon=action_horizon, episode_ends=episode_ends)
                     train_info = agent.train_step(batch)
                     if train_info and "loss" in train_info:
                         loss_buffer.append(train_info["loss"])
@@ -673,7 +744,7 @@ def train_and_evaluate_all(
         try:
             agent = FlowMatchingPolicy(
                 num_inference_steps=10,
-                **common_kwargs
+                **bc_kwargs
             )
             
             for step in tqdm(range(num_steps + 1), desc=algo_name):
@@ -703,13 +774,14 @@ def train_and_evaluate_all(
                             "use_pretrain": False,
                             "agent_class": "FlowMatchingPolicy",
                             "normalizer_state": normalizer.state_dict(),
-                            "agent_kwargs": {"num_inference_steps": 10, **common_kwargs},
+                            "agent_kwargs": {"num_inference_steps": 10, **bc_kwargs},
                         }
                         print(f"    -> New best! Saving checkpoint at step {step}")
                 
                 if step < num_steps:
                     idx = np.random.randint(0, n_samples, batch_size)
-                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer)
+                    batch = prepare_batch(dataset, idx, obs_mode, device, normalizer,
+                                          action_horizon=action_horizon, episode_ends=episode_ends)
                     train_info = agent.train_step(batch)
                     if train_info and "loss" in train_info:
                         loss_buffer.append(train_info["loss"])
@@ -1506,9 +1578,7 @@ def main():
     #     "DiffusionQL", "CPQL", "DPPO", "ReinFlow"
     # ]
     ALL_ALGORITHMS = [
-        "CPQL"
-        "ConsistencyFlowV2",
-        "ReinFlow",
+        "Diffusion Policy",
         "FlowMatching",
     ]
     parser = argparse.ArgumentParser(
@@ -1543,6 +1613,9 @@ def main():
     # New arguments for video recording
     parser.add_argument("--record_video", action="store_true", help="Record evaluation videos (first 3 episodes per eval)")
     parser.add_argument("--video_dir", type=str, default=None, help="Directory to save videos (default: output_dir/videos)")
+    # Action chunking arguments
+    parser.add_argument("--action_horizon", type=int, default=16, help="Number of future actions to predict (1 = no chunking)")
+    parser.add_argument("--action_exec_horizon", type=int, default=8, help="Number of actions to execute before re-planning (default: action_horizon)")
     
     args = parser.parse_args()
     
@@ -1608,6 +1681,9 @@ def main():
     print(f"  Record video: {args.record_video}")
     if video_dir:
         print(f"  Video directory: {video_dir}")
+    print(f"  Action horizon: {args.action_horizon}")
+    if args.action_exec_horizon:
+        print(f"  Action exec horizon: {args.action_exec_horizon}")
     
     # Parse algorithm selection
     if args.algorithm.lower() == "all":
@@ -1646,6 +1722,8 @@ def main():
         video_dir=video_dir,
         algorithms=algorithms_to_train,
         task=args.task,
+        action_horizon=args.action_horizon,
+        action_exec_horizon=args.action_exec_horizon,
     )
     
     # Print summary

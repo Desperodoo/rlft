@@ -43,6 +43,11 @@ class FlowMatchingPolicy:
     Uses CFM objective to learn a velocity field for action generation.
     Supports state-only, image-only, or state+image observations.
     
+    Supports Action Chunking (when action_horizon > 1):
+    - Predicts a sequence of future actions instead of a single action
+    - Uses an action queue to execute actions over multiple steps
+    - action_exec_horizon controls how many actions are executed before re-planning
+    
     Args:
         action_dim: Dimension of action space
         obs_mode: Observation mode ("state", "image", or "state_image")
@@ -56,6 +61,8 @@ class FlowMatchingPolicy:
         vision_output_dim: Output dimension of vision encoder
         freeze_vision_encoder: Whether to freeze vision encoder
         learning_rate: Learning rate
+        action_horizon: Number of future actions to predict (1 = no chunking)
+        action_exec_horizon: Number of actions to execute before re-planning
         device: Device for computation
     """
     
@@ -73,6 +80,8 @@ class FlowMatchingPolicy:
         vision_output_dim: int = 128,
         freeze_vision_encoder: bool = False,
         learning_rate: float = 3e-4,
+        action_horizon: int = 1,
+        action_exec_horizon: Optional[int] = None,
         device: str = "cpu"
     ):
         self.action_dim = action_dim
@@ -84,6 +93,15 @@ class FlowMatchingPolicy:
         self.ema_decay = ema_decay
         self.device = device
         
+        # Action chunking parameters
+        self.action_horizon = action_horizon
+        self.action_exec_horizon = action_exec_horizon if action_exec_horizon is not None else action_horizon
+        
+        # Vectorized action queues for temporal action execution
+        # Dict[env_id, List[action]] to support VecEnv parallel evaluation
+        self._action_queues: Dict[int, List[np.ndarray]] = {}
+        self._num_envs: int = 1
+        
         # Create observation encoder
         self.obs_encoder = create_obs_encoder(
             obs_mode=obs_mode,
@@ -94,11 +112,12 @@ class FlowMatchingPolicy:
             freeze_vision=freeze_vision_encoder,
         ).to(device)
         
-        # Velocity network
+        # Velocity network with action chunking support
         self.velocity_net = MultiModalVelocityPredictor(
             action_dim=action_dim,
             hidden_dims=hidden_dims,
             obs_encoder=self.obs_encoder,
+            action_horizon=action_horizon,
         ).to(device)
         
         # EMA velocity network for stable inference
@@ -119,6 +138,28 @@ class FlowMatchingPolicy:
         self.optimizer = torch.optim.Adam(trainable_params, lr=learning_rate)
         self.total_steps = 0
     
+    def reset(self, num_envs: Optional[int] = None, env_ids: Optional[List[int]] = None):
+        """Reset the action queues for VecEnv support.
+        
+        Args:
+            num_envs: If provided, initialize queues for this many environments.
+                     If None and env_ids is None, resets all existing queues.
+            env_ids: If provided, only reset queues for these specific env IDs.
+                    Useful for auto-reset in VecEnv where only some envs reset.
+        """
+        if num_envs is not None:
+            # Initialize/reset all queues for given number of envs
+            self._num_envs = num_envs
+            self._action_queues = {i: [] for i in range(num_envs)}
+        elif env_ids is not None:
+            # Reset only specific env queues (for auto-reset support)
+            for env_id in env_ids:
+                self._action_queues[env_id] = []
+        else:
+            # Reset all existing queues
+            for env_id in self._action_queues:
+                self._action_queues[env_id] = []
+    
     def _update_ema(self):
         """Update EMA velocity network."""
         if not self.use_ema or self.velocity_net_ema is None:
@@ -129,8 +170,14 @@ class FlowMatchingPolicy:
                 ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
     
     def _linear_interpolate(self, x_0: torch.Tensor, x_1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Linear interpolation (no sigma_min)."""
-        t_expand = t.unsqueeze(-1) if t.dim() == 1 else t
+        """Linear interpolation (no sigma_min).
+        
+        Handles both single action and action sequence cases.
+        """
+        if x_0.dim() == 3:  # (B, T, action_dim)
+            t_expand = t.unsqueeze(-1).unsqueeze(-1)
+        else:  # (B, action_dim)
+            t_expand = t.unsqueeze(-1)
         return (1 - t_expand) * x_0 + t_expand * x_1
     
     def _parse_observation(
@@ -256,19 +303,37 @@ class FlowMatchingPolicy:
         use_rk4: bool = False,
         deterministic: bool = True
     ) -> np.ndarray:
-        """Sample an action by integrating the learned ODE.
+        """Sample action(s) by integrating the learned ODE.
+        
+        With action chunking enabled, uses per-env action queues to avoid
+        re-sampling at every step. Supports both single-env and VecEnv.
         
         Args:
-            obs: Current observation
+            obs: Current observation(s). Can be batched for VecEnv.
             num_steps: Number of integration steps
             use_rk4: Use RK4 integrator
             deterministic: If True, use EMA model for stable inference
             
         Returns:
-            Sampled action
+            Sampled action(s): shape (action_dim,) for single env,
+                              or (num_envs, action_dim) for VecEnv
         """
         state, image = self._parse_observation(obs)
         batch_size = state.shape[0] if state is not None else image.shape[0]
+        is_batched = batch_size > 1
+        
+        # Initialize queues if not already done
+        if len(self._action_queues) == 0:
+            self._action_queues = {i: [] for i in range(batch_size)}
+            self._num_envs = batch_size
+        
+        # Check which envs need new actions (queue empty)
+        envs_need_sample = [i for i in range(batch_size) if len(self._action_queues.get(i, [])) == 0]
+        
+        # If all envs have cached actions, just pop and return
+        if len(envs_need_sample) == 0:
+            actions = np.stack([self._action_queues[i].pop(0) for i in range(batch_size)])
+            return actions if is_batched else actions[0]
         
         # Use EMA model for deterministic sampling
         net = self.velocity_net_ema if (deterministic and self.use_ema and self.velocity_net_ema is not None) else self.velocity_net
@@ -283,7 +348,24 @@ class FlowMatchingPolicy:
         else:
             action = self._euler_integrate(obs_features, batch_size, num_steps, net)
         
-        return action.cpu().numpy().squeeze()
+        action_np = action.cpu().numpy()  # (batch, action_horizon, action_dim) or (batch, action_dim)
+        
+        # Handle action chunking: fill each env's action queue
+        if self.action_horizon > 1:
+            for env_id in range(batch_size):
+                if env_id not in self._action_queues:
+                    self._action_queues[env_id] = []
+                # Only fill for envs that needed new actions
+                if env_id in envs_need_sample:
+                    self._action_queues[env_id] = []  # Clear first
+                    for i in range(min(self.action_exec_horizon, self.action_horizon)):
+                        self._action_queues[env_id].append(action_np[env_id, i])
+            
+            # Pop and return first action from each env's queue
+            actions = np.stack([self._action_queues[i].pop(0) for i in range(batch_size)])
+            return actions if is_batched else actions[0]
+        else:
+            return action_np if is_batched else action_np[0]
     
     def _euler_integrate(
         self,
@@ -296,7 +378,12 @@ class FlowMatchingPolicy:
         if net is None:
             net = self.velocity_net
         dt = 1.0 / num_steps
-        x = torch.randn(batch_size, self.action_dim, device=self.device)
+        
+        # Start from noise - shape depends on action_horizon
+        if self.action_horizon > 1:
+            x = torch.randn(batch_size, self.action_horizon, self.action_dim, device=self.device)
+        else:
+            x = torch.randn(batch_size, self.action_dim, device=self.device)
         
         for i in range(num_steps):
             t = torch.full((batch_size,), i * dt, device=self.device)
@@ -316,7 +403,12 @@ class FlowMatchingPolicy:
         if net is None:
             net = self.velocity_net
         dt = 1.0 / num_steps
-        x = torch.randn(batch_size, self.action_dim, device=self.device)
+        
+        # Start from noise - shape depends on action_horizon
+        if self.action_horizon > 1:
+            x = torch.randn(batch_size, self.action_horizon, self.action_dim, device=self.device)
+        else:
+            x = torch.randn(batch_size, self.action_dim, device=self.device)
         
         for i in range(num_steps):
             t = i * dt
@@ -381,6 +473,8 @@ class FlowMatchingPolicy:
                 "num_inference_steps": self.num_inference_steps,
                 "use_ema": self.use_ema,
                 "ema_decay": self.ema_decay,
+                "action_horizon": self.action_horizon,
+                "action_exec_horizon": self.action_exec_horizon,
             },
         }
         if self.use_ema and self.velocity_net_ema is not None:

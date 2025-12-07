@@ -10,6 +10,10 @@ This unified version supports multiple observation modes:
 - "image": Image observation only  
 - "state_image": Both state and image (multimodal)
 
+Network backends:
+- "mlp": MLP-based noise predictor (faster, smaller)
+- "unet": 1D U-Net noise predictor (official ManiSkill architecture)
+
 The policy learns to denoise actions given observations using DDPM.
 """
 
@@ -21,20 +25,29 @@ from typing import Dict, Optional, Tuple, List, Union
 import copy
 
 try:
-    from ...common.networks import MLP, TimestepEmbedding, MultiModalNoisePredictor
-    from ...common.utils import DiffusionHelper
+    from ...common.networks import (
+        MLP, TimestepEmbedding, MultiModalNoisePredictor,
+        MultiModalUnet1DNoisePredictor
+    )
+    from ...common.utils import DiffusionHelper, create_diffusion_helper, DDPMSchedulerHelper
     from ...common.obs_encoder import ObservationEncoder, create_obs_encoder
 except ImportError:
     try:
-        from toy_diffusion_rl.common.networks import MLP, TimestepEmbedding, MultiModalNoisePredictor
-        from toy_diffusion_rl.common.utils import DiffusionHelper
+        from toy_diffusion_rl.common.networks import (
+            MLP, TimestepEmbedding, MultiModalNoisePredictor,
+            MultiModalUnet1DNoisePredictor
+        )
+        from toy_diffusion_rl.common.utils import DiffusionHelper, create_diffusion_helper, DDPMSchedulerHelper
         from toy_diffusion_rl.common.obs_encoder import ObservationEncoder, create_obs_encoder
     except ImportError:
         import sys
         from pathlib import Path
         sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-        from common.networks import MLP, TimestepEmbedding, MultiModalNoisePredictor
-        from common.utils import DiffusionHelper
+        from common.networks import (
+            MLP, TimestepEmbedding, MultiModalNoisePredictor,
+            MultiModalUnet1DNoisePredictor
+        )
+        from common.utils import DiffusionHelper, create_diffusion_helper, DDPMSchedulerHelper
         from common.obs_encoder import ObservationEncoder, create_obs_encoder
 
 
@@ -44,20 +57,34 @@ class DiffusionPolicyAgent:
     Uses DDPM to model the action distribution conditioned on observations.
     Supports multiple observation modalities through configurable encoder.
     
+    Supports Action Chunking (when action_horizon > 1):
+    - Predicts a sequence of future actions instead of a single action
+    - Uses an action queue to execute actions over multiple steps
+    - action_exec_horizon controls how many actions are executed before re-planning
+    
+    Network backends:
+    - "mlp": MLP-based noise predictor (faster, smaller)
+    - "unet": 1D U-Net noise predictor (official ManiSkill architecture, better for action chunking)
+    
     Args:
         action_dim: Dimension of action space
         obs_mode: Observation mode ("state", "image", or "state_image")
         state_dim: Dimension of state space (required for state/state_image)
         image_shape: Image shape as (H, W, C) (required for image/state_image)
-        hidden_dims: Hidden layer dimensions for noise predictor
+        hidden_dims: Hidden layer dimensions for MLP noise predictor
+        network_type: "mlp" or "unet" (recommended for action chunking)
+        unet_down_dims: Channel dimensions for U-Net downsampling blocks
         num_diffusion_steps: Number of diffusion steps
-        noise_schedule: Type of noise schedule ('linear' or 'cosine')
+        noise_schedule: Type of noise schedule ('linear', 'cosine', or 'squaredcos_cap_v2')
         vision_encoder_type: Type of vision encoder ("cnn" or "dinov2")
         vision_output_dim: Output dimension of vision encoder
         freeze_vision_encoder: Whether to freeze vision encoder weights
         learning_rate: Learning rate for optimizer
-        beta_start: Starting beta for noise schedule
-        beta_end: Ending beta for noise schedule
+        beta_start: Starting beta for noise schedule (only for linear)
+        beta_end: Ending beta for noise schedule (only for linear)
+        action_horizon: Number of future actions to predict (1 = no chunking)
+        action_exec_horizon: Number of actions to execute before re-planning (default: action_horizon)
+        obs_horizon: Number of observation frames (used to compute temporal offset for action extraction)
         device: Device for computation
     """
     
@@ -68,14 +95,19 @@ class DiffusionPolicyAgent:
         state_dim: Optional[int] = None,
         image_shape: Optional[Tuple[int, int, int]] = None,
         hidden_dims: List[int] = [256, 256, 256],
+        network_type: str = "mlp",  # "mlp" or "unet"
+        unet_down_dims: List[int] = [64, 128, 256],  # U-Net channel dims
         num_diffusion_steps: int = 100,
-        noise_schedule: str = "linear",
+        noise_schedule: str = "squaredcos_cap_v2",  # Official default
         vision_encoder_type: str = "cnn",
         vision_output_dim: int = 128,
         freeze_vision_encoder: bool = False,
         learning_rate: float = 3e-4,
         beta_start: float = 0.0001,
         beta_end: float = 0.02,
+        action_horizon: int = 1,
+        action_exec_horizon: Optional[int] = None,
+        obs_horizon: int = 1,
         device: str = "cpu"
     ):
         self.action_dim = action_dim
@@ -83,7 +115,29 @@ class DiffusionPolicyAgent:
         self.state_dim = state_dim
         self.image_shape = image_shape
         self.num_diffusion_steps = num_diffusion_steps
+        self.network_type = network_type
+        self.noise_schedule = noise_schedule
         self.device = device
+        
+        # Action chunking parameters
+        self.action_horizon = action_horizon
+        self.action_exec_horizon = action_exec_horizon if action_exec_horizon is not None else action_horizon
+        self.obs_horizon = obs_horizon
+        
+        # Validate action_exec_horizon
+        assert self.action_exec_horizon >= 1, "action_exec_horizon must be at least 1"
+        assert self.action_exec_horizon <= self.action_horizon, \
+            f"action_exec_horizon ({self.action_exec_horizon}) must be <= action_horizon ({self.action_horizon})"
+        
+        # Action start index: official implementation extracts actions from obs_horizon-1
+        # This ensures predicted action sequence aligns with current observation
+        # Reference: https://github.com/haosulab/ManiSkill/blob/main/examples/baselines/diffusion_policy/train.py
+        self._action_start_idx = max(0, obs_horizon - 1)
+        
+        # Vectorized action queues for temporal action execution
+        # Dict[env_id, List[action]] to support VecEnv parallel evaluation
+        self._action_queues: Dict[int, List[np.ndarray]] = {}
+        self._num_envs: int = 1
         
         # Create observation encoder
         self.obs_encoder = create_obs_encoder(
@@ -95,21 +149,44 @@ class DiffusionPolicyAgent:
             freeze_vision=freeze_vision_encoder,
         ).to(device)
         
-        # Noise prediction network
-        self.noise_predictor = MultiModalNoisePredictor(
-            action_dim=action_dim,
-            hidden_dims=hidden_dims,
-            obs_encoder=self.obs_encoder,
-        ).to(device)
+        # Noise prediction network - supports MLP or U-Net backend
+        if network_type == "mlp":
+            self.noise_predictor = MultiModalNoisePredictor(
+                action_dim=action_dim,
+                hidden_dims=hidden_dims,
+                obs_encoder=self.obs_encoder,
+                action_horizon=action_horizon,
+            ).to(device)
+        elif network_type == "unet":
+            self.noise_predictor = MultiModalUnet1DNoisePredictor(
+                action_dim=action_dim,
+                obs_encoder=self.obs_encoder,
+                action_horizon=action_horizon,
+                down_dims=unet_down_dims,
+            ).to(device)
+        else:
+            raise ValueError(f"Unknown network_type: {network_type}. Choose 'mlp' or 'unet'.")
         
-        # Diffusion helper
-        self.diffusion = DiffusionHelper(
-            num_diffusion_steps=num_diffusion_steps,
-            schedule=noise_schedule,
-            beta_start=beta_start,
-            beta_end=beta_end,
-            device=device
-        )
+        # Diffusion helper - use DDPMSchedulerHelper for squaredcos_cap_v2 support
+        if noise_schedule == "squaredcos_cap_v2":
+            self.diffusion = DDPMSchedulerHelper(
+                num_diffusion_steps=num_diffusion_steps,
+                beta_schedule="squaredcos_cap_v2",
+                clip_sample=True,
+                prediction_type="epsilon",
+                device=device,
+            )
+            self._use_ddpm_scheduler = True
+        else:
+            # Fallback to legacy DiffusionHelper for backward compatibility
+            self.diffusion = DiffusionHelper(
+                num_diffusion_steps=num_diffusion_steps,
+                schedule=noise_schedule,
+                beta_start=beta_start,
+                beta_end=beta_end,
+                device=device
+            )
+            self._use_ddpm_scheduler = False
         
         # Collect trainable parameters
         trainable_params = list(self.noise_predictor.parameters())
@@ -124,6 +201,31 @@ class DiffusionPolicyAgent:
         # EMA model
         self.ema_noise_predictor = None
         self.ema_decay = 0.999
+    
+    def reset(self, num_envs: Optional[int] = None, env_ids: Optional[List[int]] = None):
+        """Reset the action queues for VecEnv support.
+        
+        Args:
+            num_envs: If provided, initialize queues for this many environments.
+                     If None and env_ids is None, resets all existing queues.
+            env_ids: If provided, only reset queues for these specific env IDs.
+                    Useful for auto-reset in VecEnv where only some envs reset.
+        """
+        if num_envs is not None:
+            # Initialize/reset all queues for given number of envs
+            self._num_envs = num_envs
+            self._action_queues = {i: [] for i in range(num_envs)}
+        elif env_ids is not None:
+            # Reset only specific env queues (for auto-reset support)
+            for env_id in env_ids:
+                if env_id not in self._action_queues:
+                    self._action_queues[env_id] = []
+                else:
+                    self._action_queues[env_id] = []
+        else:
+            # Reset all existing queues
+            for env_id in self._action_queues:
+                self._action_queues[env_id] = []
     
     def _init_ema(self):
         """Initialize EMA model."""
@@ -271,30 +373,50 @@ class DiffusionPolicyAgent:
         use_ema: bool = True,
         num_inference_steps: Optional[int] = None
     ) -> np.ndarray:
-        """Sample an action given an observation.
+        """Sample action(s) given observation(s).
         
         Uses the reverse diffusion process (DDPM sampling).
+        With action chunking enabled, uses per-env action queues to avoid
+        re-sampling at every step. Supports both single-env and VecEnv.
         
         Args:
-            obs: Current observation
+            obs: Current observation(s). Can be batched for VecEnv.
             use_ema: Whether to use EMA model
             num_inference_steps: Number of inference steps
             
         Returns:
-            Sampled action
+            Sampled action(s): shape (action_dim,) for single env,
+                              or (num_envs, action_dim) for VecEnv
         """
         state, image = self._parse_observation(obs)
         batch_size = state.shape[0] if state is not None else image.shape[0]
+        is_batched = batch_size > 1
         
-        # Choose model
+        # Initialize queues if not already done
+        if len(self._action_queues) == 0:
+            self._action_queues = {i: [] for i in range(batch_size)}
+            self._num_envs = batch_size
+        
+        # Check which envs need new actions (queue empty)
+        envs_need_sample = [i for i in range(batch_size) if len(self._action_queues.get(i, [])) == 0]
+        
+        # If all envs have cached actions, just pop and return
+        if len(envs_need_sample) == 0:
+            actions = np.stack([self._action_queues[i].pop(0) for i in range(batch_size)])
+            return actions if is_batched else actions[0]
+        
+        # Need to sample new actions - sample for all envs for simplicity
         model = self.ema_noise_predictor if (use_ema and self.ema_noise_predictor) else self.noise_predictor
         model.eval()
         
         # Pre-compute observation features
         obs_features = self.obs_encoder(state=state, image=image)
         
-        # Start from pure noise
-        action = torch.randn(batch_size, self.action_dim, device=self.device)
+        # Start from pure noise - shape depends on action_horizon
+        if self.action_horizon > 1:
+            action = torch.randn(batch_size, self.action_horizon, self.action_dim, device=self.device)
+        else:
+            action = torch.randn(batch_size, self.action_dim, device=self.device)
         
         # Determine steps
         steps = num_inference_steps or self.num_diffusion_steps
@@ -309,7 +431,29 @@ class DiffusionPolicyAgent:
             action = self.diffusion.p_sample(action, t_batch, predicted_noise, clip_denoised=True)
         
         action = torch.clamp(action, -1.0, 1.0)
-        return action.cpu().numpy().squeeze()
+        action_np = action.cpu().numpy()  # (batch, action_horizon, action_dim) or (batch, action_dim)
+        
+        # Handle action chunking: fill each env's action queue
+        if self.action_horizon > 1:
+            # action_np shape: (batch, action_horizon, action_dim)
+            for env_id in range(batch_size):
+                if env_id not in self._action_queues:
+                    self._action_queues[env_id] = []
+                # Only fill for envs that needed new actions
+                if env_id in envs_need_sample:
+                    self._action_queues[env_id] = []  # Clear first
+                    # Extract actions from [start_idx : start_idx + exec_horizon]
+                    # This aligns with official ManiSkill implementation
+                    start_idx = self._action_start_idx
+                    end_idx = min(start_idx + self.action_exec_horizon, self.action_horizon)
+                    for i in range(start_idx, end_idx):
+                        self._action_queues[env_id].append(action_np[env_id, i])
+            
+            # Pop and return first action from each env's queue
+            actions = np.stack([self._action_queues[i].pop(0) for i in range(batch_size)])
+            return actions if is_batched else actions[0]
+        else:
+            return action_np if is_batched else action_np[0]
     
     @torch.no_grad()
     def sample_action_ddim(
@@ -320,16 +464,34 @@ class DiffusionPolicyAgent:
     ) -> np.ndarray:
         """Sample action using DDIM (faster sampling).
         
+        With action chunking enabled, uses per-env action queues to avoid
+        re-sampling at every step. Supports both single-env and VecEnv.
+        
         Args:
-            obs: Current observation
+            obs: Current observation(s). Can be batched for VecEnv.
             num_inference_steps: Number of DDIM steps
             eta: Stochasticity parameter
             
         Returns:
-            Sampled action
+            Sampled action(s): shape (action_dim,) for single env,
+                              or (num_envs, action_dim) for VecEnv
         """
         state, image = self._parse_observation(obs)
         batch_size = state.shape[0] if state is not None else image.shape[0]
+        is_batched = batch_size > 1
+        
+        # Initialize queues if not already done
+        if len(self._action_queues) == 0:
+            self._action_queues = {i: [] for i in range(batch_size)}
+            self._num_envs = batch_size
+        
+        # Check which envs need new actions (queue empty)
+        envs_need_sample = [i for i in range(batch_size) if len(self._action_queues.get(i, [])) == 0]
+        
+        # If all envs have cached actions, just pop and return
+        if len(envs_need_sample) == 0:
+            actions = np.stack([self._action_queues[i].pop(0) for i in range(batch_size)])
+            return actions if is_batched else actions[0]
         
         model = self.ema_noise_predictor if self.ema_noise_predictor else self.noise_predictor
         model.eval()
@@ -341,7 +503,11 @@ class DiffusionPolicyAgent:
         step_size = self.num_diffusion_steps // num_inference_steps
         timesteps = list(range(0, self.num_diffusion_steps, step_size))[::-1]
         
-        action = torch.randn(batch_size, self.action_dim, device=self.device)
+        # Start from pure noise - shape depends on action_horizon
+        if self.action_horizon > 1:
+            action = torch.randn(batch_size, self.action_horizon, self.action_dim, device=self.device)
+        else:
+            action = torch.randn(batch_size, self.action_dim, device=self.device)
         
         for i, t in enumerate(timesteps):
             t_batch = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
@@ -363,7 +529,28 @@ class DiffusionPolicyAgent:
             action = torch.sqrt(alpha_bar_prev) * pred_x0 + dir_xt + noise
         
         action = torch.clamp(action, -1.0, 1.0)
-        return action.cpu().numpy().squeeze()
+        action_np = action.cpu().numpy()  # (batch, action_horizon, action_dim) or (batch, action_dim)
+        
+        # Handle action chunking: fill each env's action queue
+        if self.action_horizon > 1:
+            for env_id in range(batch_size):
+                if env_id not in self._action_queues:
+                    self._action_queues[env_id] = []
+                # Only fill for envs that needed new actions
+                if env_id in envs_need_sample:
+                    self._action_queues[env_id] = []  # Clear first
+                    # Extract actions from [start_idx : start_idx + exec_horizon]
+                    # This aligns with official ManiSkill implementation
+                    start_idx = self._action_start_idx
+                    end_idx = min(start_idx + self.action_exec_horizon, self.action_horizon)
+                    for i in range(start_idx, end_idx):
+                        self._action_queues[env_id].append(action_np[env_id, i])
+            
+            # Pop and return first action from each env's queue
+            actions = np.stack([self._action_queues[i].pop(0) for i in range(batch_size)])
+            return actions if is_batched else actions[0]
+        else:
+            return action_np if is_batched else action_np[0]
     
     def save(self, path: str):
         """Save model checkpoint."""
@@ -378,6 +565,11 @@ class DiffusionPolicyAgent:
                 "state_dim": self.state_dim,
                 "image_shape": self.image_shape,
                 "num_diffusion_steps": self.num_diffusion_steps,
+                "action_horizon": self.action_horizon,
+                "action_exec_horizon": self.action_exec_horizon,
+                "obs_horizon": self.obs_horizon,
+                "network_type": self.network_type,
+                "noise_schedule": self.noise_schedule,
             },
         }
         torch.save(checkpoint, path)
@@ -391,3 +583,6 @@ class DiffusionPolicyAgent:
             self._init_ema()
             self.ema_noise_predictor.load_state_dict(checkpoint["ema_noise_predictor"])
         self.optimizer.load_state_dict(checkpoint["optimizer"])
+        # Reset action queues on load
+        self._action_queues = {}
+        self._num_envs = 1

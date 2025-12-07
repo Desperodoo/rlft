@@ -369,6 +369,115 @@ def create_normalizer_from_dataset(
     return normalizer
 
 
+def create_normalizer_from_env(
+    env,
+    obs_mode: str = 'limits',
+) -> DataNormalizer:
+    """Create normalizer using environment action space bounds.
+    
+    This is the recommended approach for ManiSkill environments, as it uses
+    the true action space bounds instead of data statistics.
+    
+    The action normalizer maps:
+        action_space.low -> -1
+        action_space.high -> +1
+    
+    Reference:
+        ManiSkill official diffusion policy uses environment-level normalization:
+        https://github.com/haosulab/ManiSkill/blob/main/examples/baselines/diffusion_policy/train.py
+    
+    Args:
+        env: Gymnasium environment with action_space attribute
+        obs_mode: Normalization mode for observations ('limits' or 'gaussian')
+        
+    Returns:
+        DataNormalizer with action normalizer fitted to env bounds
+    """
+    normalizer = DataNormalizer(action_mode='limits', obs_mode=obs_mode)
+    
+    # Get action space bounds
+    action_low = env.action_space.low
+    action_high = env.action_space.high
+    
+    if isinstance(action_low, np.ndarray):
+        action_low = action_low.astype(np.float32)
+        action_high = action_high.astype(np.float32)
+    
+    # Verify action space is bounded
+    if np.any(np.isinf(action_low)) or np.any(np.isinf(action_high)):
+        raise ValueError(
+            "Environment action space is unbounded. "
+            "Cannot use environment-level normalization."
+        )
+    
+    # Fit action normalizer to environment bounds
+    # Create dummy 2D array for fit (min and max values)
+    dummy_actions = np.stack([action_low, action_high], axis=0)
+    normalizer.action_normalizer.fit(dummy_actions)
+    
+    return normalizer
+
+
+def normalize_action_with_env_bounds(
+    action: Union[torch.Tensor, np.ndarray],
+    action_low: Union[torch.Tensor, np.ndarray],
+    action_high: Union[torch.Tensor, np.ndarray],
+) -> torch.Tensor:
+    """Normalize action from [low, high] to [-1, 1].
+    
+    This is a simple utility function for direct normalization without
+    creating a full normalizer object.
+    
+    Args:
+        action: Action to normalize
+        action_low: Lower bounds of action space
+        action_high: Upper bounds of action space
+        
+    Returns:
+        Normalized action in [-1, 1]
+    """
+    if isinstance(action, np.ndarray):
+        action = torch.from_numpy(action)
+    if isinstance(action_low, np.ndarray):
+        action_low = torch.from_numpy(action_low)
+    if isinstance(action_high, np.ndarray):
+        action_high = torch.from_numpy(action_high)
+    
+    # Normalize: (action - low) / (high - low) * 2 - 1
+    # Maps low -> -1, high -> +1
+    scale = 2.0 / (action_high - action_low + 1e-8)
+    offset = -1.0 - scale * action_low
+    
+    return action * scale + offset
+
+
+def unnormalize_action_with_env_bounds(
+    action: Union[torch.Tensor, np.ndarray],
+    action_low: Union[torch.Tensor, np.ndarray],
+    action_high: Union[torch.Tensor, np.ndarray],
+) -> torch.Tensor:
+    """Unnormalize action from [-1, 1] to [low, high].
+    
+    Args:
+        action: Normalized action in [-1, 1]
+        action_low: Lower bounds of action space
+        action_high: Upper bounds of action space
+        
+    Returns:
+        Action in [low, high]
+    """
+    if isinstance(action, np.ndarray):
+        action = torch.from_numpy(action)
+    if isinstance(action_low, np.ndarray):
+        action_low = torch.from_numpy(action_low)
+    if isinstance(action_high, np.ndarray):
+        action_high = torch.from_numpy(action_high)
+    
+    # Unnormalize: (action + 1) / 2 * (high - low) + low
+    # Maps -1 -> low, +1 -> high
+    return (action + 1.0) / 2.0 * (action_high - action_low) + action_low
+
+
 if __name__ == "__main__":
     print("Testing DataNormalizer...")
     

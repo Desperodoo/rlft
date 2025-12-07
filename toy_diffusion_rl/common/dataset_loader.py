@@ -363,6 +363,315 @@ class ManiSkillOfflineDataset(PickAndPlaceOfflineDataset):
         )
 
 
+class ActionChunkingDataset(Dataset):
+    """Dataset with Action Chunking support for Diffusion Policy.
+    
+    Instead of returning single (obs, action) pairs, this dataset returns
+    (obs, action_sequence) pairs where action_sequence is a chunk of
+    `action_horizon` consecutive actions.
+    
+    Episode boundary handling follows Diffusion Policy:
+    - Uses pad_before/pad_after to allow sampling near episode boundaries
+    - Pads with first/last action when sampling extends beyond episode
+    
+    Args:
+        h5_path: Path to HDF5 dataset file
+        obs_mode: Observation mode ("state", "image", or "state_image")
+        action_horizon: Number of future actions to predict (chunk size)
+        pad_before: Number of steps to pad before episode start (default: 0)
+        pad_after: Number of steps to pad after episode end (default: action_horizon - 1)
+        transform: Optional transform for images
+        normalize_state: Whether to normalize state observations
+        load_to_memory: Whether to load entire dataset to memory
+        
+    Example:
+        >>> dataset = ActionChunkingDataset(
+        ...     "data/maniskill.h5", 
+        ...     obs_mode="state_image",
+        ...     action_horizon=8
+        ... )
+        >>> sample = dataset[0]
+        >>> print(sample["action"].shape)  # (8, action_dim)
+    """
+    
+    def __init__(
+        self,
+        h5_path: str,
+        obs_mode: str = "state_image",
+        action_horizon: int = 1,
+        pad_before: int = 0,
+        pad_after: Optional[int] = None,
+        transform: Optional[Callable] = None,
+        normalize_state: bool = False,
+        load_to_memory: bool = True,
+    ):
+        super().__init__()
+        
+        self.h5_path = Path(h5_path)
+        self.obs_mode = obs_mode
+        self.action_horizon = action_horizon
+        self.pad_before = pad_before
+        self.pad_after = pad_after if pad_after is not None else action_horizon - 1
+        self.transform = transform
+        self.normalize_state = normalize_state
+        self.load_to_memory = load_to_memory
+        
+        # Validate obs_mode
+        assert obs_mode in ["state", "image", "state_image"], \
+            f"obs_mode must be 'state', 'image', or 'state_image', got {obs_mode}"
+        
+        # Load data and episode information
+        with h5py.File(h5_path, "r") as f:
+            self.total_steps = len(f["actions"])
+            
+            # Check available data
+            self.has_obs = "obs" in f
+            self.has_images = "images" in f
+            
+            # Validate data availability
+            if obs_mode in ["state", "state_image"] and not self.has_obs:
+                raise ValueError(f"Dataset does not contain state observations for obs_mode='{obs_mode}'")
+            if obs_mode in ["image", "state_image"] and not self.has_images:
+                raise ValueError(f"Dataset does not contain images for obs_mode='{obs_mode}'")
+            
+            # Load episode_ids to compute episode boundaries
+            if "episode_ids" in f:
+                episode_ids = f["episode_ids"][:]
+            else:
+                # Fallback: treat entire dataset as one episode
+                episode_ids = np.zeros(self.total_steps, dtype=np.int32)
+            
+            # Compute episode_ends from episode_ids
+            self.episode_ends = self._compute_episode_ends(episode_ids)
+            
+            # Load data to memory
+            if load_to_memory:
+                self.actions = f["actions"][:]
+                self.rewards = f["rewards"][:]
+                self.dones = f["dones"][:]
+                
+                if self.has_obs:
+                    self.obs = f["obs"][:]
+                    self.next_obs = f["next_obs"][:]
+                    
+                    if normalize_state:
+                        self.obs_mean = self.obs.mean(axis=0)
+                        self.obs_std = self.obs.std(axis=0) + 1e-8
+                
+                if self.has_images:
+                    self.images = f["images"][:]
+                    self.next_images = f["next_images"][:]
+            else:
+                self._file = None
+        
+        # Get shapes
+        with h5py.File(h5_path, "r") as f:
+            self.action_dim = f["actions"].shape[1]
+            if self.has_obs:
+                self.state_dim = f["obs"].shape[1]
+            else:
+                self.state_dim = None
+            if self.has_images:
+                self.image_shape = f["images"].shape[1:]
+            else:
+                self.image_shape = None
+        
+        # Create sampling indices following Diffusion Policy approach
+        self.indices = self._create_indices()
+        
+    def _compute_episode_ends(self, episode_ids: np.ndarray) -> np.ndarray:
+        """Compute episode end indices from episode_ids.
+        
+        Args:
+            episode_ids: Array of episode IDs for each timestep
+            
+        Returns:
+            Array of cumulative episode end indices (exclusive)
+        """
+        # Find where episode_id changes
+        episode_ends = []
+        current_ep = episode_ids[0]
+        
+        for i in range(1, len(episode_ids)):
+            if episode_ids[i] != current_ep:
+                episode_ends.append(i)
+                current_ep = episode_ids[i]
+        
+        # Add the final end
+        episode_ends.append(len(episode_ids))
+        
+        return np.array(episode_ends, dtype=np.int64)
+    
+    def _create_indices(self) -> np.ndarray:
+        """Create sampling indices with episode boundary handling.
+        
+        Following Diffusion Policy's SequenceSampler.create_indices():
+        Each index entry contains:
+        - buffer_start_idx: Start index in the actual data buffer
+        - buffer_end_idx: End index in the actual data buffer  
+        - sample_start_idx: Start index in the output sample (for padding)
+        - sample_end_idx: End index in the output sample (for padding)
+        
+        Returns:
+            Array of shape (N, 4) with index tuples
+        """
+        indices = []
+        sequence_length = self.action_horizon
+        pad_before = min(max(self.pad_before, 0), sequence_length - 1)
+        pad_after = min(max(self.pad_after, 0), sequence_length - 1)
+        
+        for ep_idx in range(len(self.episode_ends)):
+            # Get episode boundaries
+            start_idx = 0 if ep_idx == 0 else self.episode_ends[ep_idx - 1]
+            end_idx = self.episode_ends[ep_idx]
+            episode_length = end_idx - start_idx
+            
+            # Compute valid sampling range within this episode
+            # min_start allows sampling to start up to pad_before steps before episode
+            # max_start allows sampling to extend up to pad_after steps after episode
+            min_start = -pad_before
+            max_start = episode_length - sequence_length + pad_after
+            
+            # Generate indices for each valid starting position
+            for local_idx in range(min_start, max_start + 1):
+                # Compute actual buffer indices (clamped to episode)
+                buffer_start_idx = max(local_idx, 0) + start_idx
+                buffer_end_idx = min(local_idx + sequence_length, episode_length) + start_idx
+                
+                # Compute output sample indices (for padding positions)
+                start_offset = buffer_start_idx - (local_idx + start_idx)
+                end_offset = (local_idx + sequence_length + start_idx) - buffer_end_idx
+                sample_start_idx = 0 + start_offset
+                sample_end_idx = sequence_length - end_offset
+                
+                indices.append([buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx])
+        
+        return np.array(indices, dtype=np.int64)
+    
+    def __len__(self) -> int:
+        return len(self.indices)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Get a sample with action chunk.
+        
+        Returns:
+            Dictionary containing:
+                - "action": Action sequence tensor (action_horizon, action_dim)
+                - "reward": Reward for current timestep (scalar)
+                - "done": Done flag for current timestep
+                
+            For state mode:
+                - "obs": Current state observation (state_dim,)
+                
+            For image mode:
+                - "image": Current image tensor (C, H, W) normalized to [0, 1]
+                
+            For state_image mode:
+                - Both "obs" and "image"
+        """
+        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = self.indices[idx]
+        
+        # Get action sequence from buffer
+        action_chunk = self.actions[buffer_start_idx:buffer_end_idx]
+        
+        # Create padded output array
+        action_seq = np.zeros((self.action_horizon, self.action_dim), dtype=np.float32)
+        
+        # Fill with actual data
+        action_seq[sample_start_idx:sample_end_idx] = action_chunk
+        
+        # Pad before with first action (if needed)
+        if sample_start_idx > 0:
+            action_seq[:sample_start_idx] = action_chunk[0]
+        
+        # Pad after with last action (if needed)
+        if sample_end_idx < self.action_horizon:
+            action_seq[sample_end_idx:] = action_chunk[-1]
+        
+        # Get current timestep observation (first timestep of the chunk)
+        obs_idx = buffer_start_idx
+        
+        sample = {
+            "action": torch.from_numpy(action_seq).float(),
+            "reward": torch.tensor(self.rewards[obs_idx], dtype=torch.float32),
+            "done": torch.tensor(self.dones[obs_idx], dtype=torch.bool),
+        }
+        
+        # Add state observations
+        if self.obs_mode in ["state", "state_image"]:
+            obs = self.obs[obs_idx].copy()
+            
+            if self.normalize_state:
+                obs = (obs - self.obs_mean) / self.obs_std
+            
+            sample["obs"] = torch.from_numpy(obs).float()
+        
+        # Add image observations
+        if self.obs_mode in ["image", "state_image"]:
+            image = self.images[obs_idx]
+            
+            if self.transform:
+                image = self.transform(image)
+            
+            # Convert to tensor: (H, W, C) -> (C, H, W), normalize to [0, 1]
+            image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+            sample["image"] = image
+        
+        return sample
+    
+    def make_dataloader(
+        self,
+        batch_size: int = 64,
+        shuffle: bool = True,
+        num_workers: int = 0,
+        pin_memory: bool = True,
+        drop_last: bool = True,
+    ) -> DataLoader:
+        """Create a PyTorch DataLoader."""
+        return DataLoader(
+            self,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            drop_last=drop_last,
+        )
+    
+    def get_all_actions(self) -> torch.Tensor:
+        """Get all actions as a tensor (flat, not chunked)."""
+        return torch.from_numpy(self.actions).float()
+    
+    def get_normalization_stats(self) -> Dict[str, torch.Tensor]:
+        """Compute normalization statistics."""
+        stats = {}
+        
+        if self.has_obs:
+            obs = torch.from_numpy(self.obs).float()
+            stats["obs_mean"] = obs.mean(dim=0)
+            stats["obs_std"] = obs.std(dim=0) + 1e-8
+        
+        actions = self.get_all_actions()
+        stats["action_mean"] = actions.mean(dim=0)
+        stats["action_std"] = actions.std(dim=0) + 1e-8
+        
+        return stats
+    
+    def __repr__(self) -> str:
+        return (
+            f"ActionChunkingDataset(\n"
+            f"  path={self.h5_path},\n"
+            f"  obs_mode='{self.obs_mode}',\n"
+            f"  action_horizon={self.action_horizon},\n"
+            f"  n_episodes={len(self.episode_ends)},\n"
+            f"  total_steps={self.total_steps},\n"
+            f"  num_samples={len(self)},\n"
+            f"  state_dim={self.state_dim},\n"
+            f"  image_shape={self.image_shape},\n"
+            f"  action_dim={self.action_dim},\n"
+            f")"
+        )
+
+
 class TrajectoryDataset(Dataset):
     """Dataset that returns full trajectories instead of single transitions.
     
