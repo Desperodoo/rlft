@@ -1,0 +1,1155 @@
+"""
+Unified Offline RL Training Script
+
+Supports training multiple algorithms on ManiSkill environments:
+- diffusion_policy: DDPM-based Diffusion Policy (imitation learning)
+- flow_matching: Flow Matching Policy (imitation learning)
+- reflected_flow: Reflected Flow for bounded actions
+- consistency_flow: Consistency Flow with self-consistency
+- shortcut_flow: ShortCut Flow with adaptive steps
+- diffusion_double_q: Diffusion Policy + Double Q-Learning (offline RL)
+- cpql: Consistency Policy Q-Learning (offline RL)
+
+Based on the official ManiSkill diffusion_policy implementation.
+"""
+
+ALGO_NAME = "OfflineRL_UNet"
+
+import os
+import random
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from functools import partial
+from typing import List, Optional, Literal
+
+import gymnasium as gym
+from gymnasium.vector.vector_env import VectorEnv
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from tqdm import tqdm
+import tyro
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import EMAModel
+from gymnasium import spaces
+from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
+from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.dataset import Dataset
+from torch.utils.data.sampler import BatchSampler, RandomSampler
+from torch.utils.tensorboard import SummaryWriter
+
+from diffusion_policy.evaluate import evaluate
+from diffusion_policy.make_env import make_eval_envs
+from diffusion_policy.utils import (
+    IterationBasedBatchSampler,
+    build_state_obs_extractor,
+    convert_obs,
+    worker_init_fn,
+)
+from diffusion_policy.plain_conv import PlainConv
+from diffusion_policy.conditional_unet1d import ConditionalUnet1D
+from diffusion_policy.algorithms import (
+    DiffusionPolicyAgent,
+    FlowMatchingAgent,
+    ReflectedFlowAgent,
+    ConsistencyFlowAgent,
+    ShortCutFlowAgent,
+    ShortCutVelocityUNet1D,
+    DiffusionDoubleQAgent,
+    CPQLAgent,
+)
+from diffusion_policy.algorithms.networks import VelocityUNet1D, DoubleQNetwork
+
+
+@dataclass
+class Args:
+    # Experiment settings
+    exp_name: Optional[str] = None
+    """the name of this experiment"""
+    seed: int = 1
+    """seed of the experiment"""
+    torch_deterministic: bool = True
+    """if toggled, `torch.backends.cudnn.deterministic=False`"""
+    cuda: bool = True
+    """if toggled, cuda will be enabled by default"""
+    track: bool = False
+    """if toggled, this experiment will be tracked with Weights and Biases"""
+    wandb_project_name: str = "ManiSkill"
+    """the wandb's project name"""
+    wandb_entity: Optional[str] = None
+    """the entity (team) of wandb's project"""
+    capture_video: bool = True
+    """whether to capture videos of the agent performances"""
+
+    # Environment settings
+    env_id: str = "PegInsertionSide-v1"
+    """the id of the environment"""
+    demo_path: str = "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
+    """the path of demo dataset"""
+    num_demos: Optional[int] = None
+    """number of trajectories to load from the demo dataset"""
+    max_episode_steps: Optional[int] = None
+    """max episode steps for evaluation"""
+    control_mode: str = "pd_joint_delta_pos"
+    """the control mode"""
+    obs_mode: str = "rgb+depth"
+    """observation mode: rgb, depth, or rgb+depth"""
+    sim_backend: str = "physx_cpu"
+    """simulation backend for evaluation"""
+
+    # Training settings
+    total_iters: int = 1_000_000
+    """total training iterations"""
+    batch_size: int = 256
+    """batch size"""
+    lr: float = 1e-4
+    """learning rate"""
+    lr_critic: float = 3e-4
+    """learning rate for critic (only for offline RL)"""
+
+    # Diffusion Policy / Flow Matching settings
+    obs_horizon: int = 2
+    """observation horizon"""
+    act_horizon: int = 8
+    """action execution horizon"""
+    pred_horizon: int = 16
+    """action prediction horizon"""
+    diffusion_step_embed_dim: int = 64
+    """timestep embedding dimension"""
+    unet_dims: List[int] = field(default_factory=lambda: [64, 128, 256])
+    """U-Net channel dimensions"""
+    n_groups: int = 8
+    """GroupNorm groups"""
+    visual_feature_dim: int = 256
+    """visual encoder output dimension"""
+
+    # Algorithm selection
+    algorithm: Literal[
+        "diffusion_policy",
+        "flow_matching", 
+        "reflected_flow", 
+        "consistency_flow", 
+        "shortcut_flow",
+        "diffusion_double_q", 
+        "cpql"
+    ] = "diffusion_policy"
+    """algorithm to train"""
+    
+    # Diffusion Policy specific hyperparameters
+    num_diffusion_iters: int = 100
+    """number of diffusion iterations for DDPM"""
+    
+    # Flow variant specific hyperparameters
+    reflection_mode: Literal["hard", "soft"] = "hard"
+    """reflection mode for reflected_flow"""
+    boundary_reg_weight: float = 0.01
+    """boundary regularization weight for reflected_flow"""
+    max_denoising_steps: int = 8
+    """max denoising steps for shortcut_flow"""
+    self_consistency_k: float = 0.25
+    """fraction of batch for self-consistency in shortcut_flow"""
+    ema_decay: float = 0.999
+    """EMA decay rate for consistency_flow"""
+
+    # Offline RL hyperparameters (inherited from toy_diffusion_rl)
+    alpha: float = 0.1
+    """Q-value weight for diffusion_double_q (0.01 for cpql)"""
+    bc_weight: float = 1.0
+    """BC/flow matching loss weight"""
+    consistency_weight: float = 1.0
+    """consistency loss weight (only for cpql)"""
+    gamma: float = 0.99
+    """discount factor"""
+    tau: float = 0.005
+    """soft update coefficient"""
+    reward_scale: float = 0.1
+    """reward scaling for Q-value stability"""
+    q_target_clip: float = 100.0
+    """Q target clipping"""
+    num_flow_steps: int = 10
+    """ODE integration steps for flow matching"""
+
+    # Logging settings
+    log_freq: int = 1000
+    """logging frequency"""
+    eval_freq: int = 5000
+    """evaluation frequency"""
+    save_freq: Optional[int] = None
+    """checkpoint save frequency"""
+    num_eval_episodes: int = 100
+    """number of evaluation episodes"""
+    num_eval_envs: int = 10
+    """number of parallel eval environments"""
+    num_dataload_workers: int = 0
+    """dataloader workers"""
+
+    # Additional tags
+    demo_type: Optional[str] = None
+
+
+def reorder_keys(d, ref_dict):
+    """Reorder dict keys to match reference dict."""
+    out = dict()
+    for k, v in ref_dict.items():
+        if isinstance(v, dict) or isinstance(v, spaces.Dict):
+            out[k] = reorder_keys(d[k], ref_dict[k])
+        else:
+            out[k] = d[k]
+    return out
+
+
+class OfflineRLDataset(Dataset):
+    """Dataset for Offline RL with chunk-level transitions (SMDP formulation).
+    
+    Extends the official diffusion_policy dataset to support action chunking
+    with proper Bellman equation formulation:
+    
+    For a chunk of length τ starting at timestep t:
+    - cumulative_reward: R_t^(τ) = Σ_{i=0}^{τ-1} γ^i r_{t+i}
+    - next_observations: s_{t+τ} (state after chunk execution)
+    - chunk_done: 1 if episode ends within chunk, 0 otherwise
+    - effective_length: τ (actual chunk length, may be < pred_horizon at episode end)
+    - discount_factor: γ^τ (for proper SMDP Bellman target)
+    
+    The SMDP Bellman equation is:
+    Q(s_t, â_t) = R_t^(τ) + (1 - d_t^(τ)) * γ^τ * max_{â'} Q(s_{t+τ}, â')
+    
+    All other aspects (action padding, slicing, obs processing) are
+    aligned with the official implementation.
+    """
+    
+    def __init__(
+        self,
+        data_path: str,
+        obs_process_fn,
+        obs_space,
+        include_rgb: bool,
+        include_depth: bool,
+        device,
+        num_traj: Optional[int],
+        obs_horizon: int,
+        pred_horizon: int,
+        act_horizon: int,
+        control_mode: str,
+        gamma: float = 0.99,
+    ):
+        self.include_rgb = include_rgb
+        self.include_depth = include_depth
+        self.obs_horizon = obs_horizon
+        self.pred_horizon = pred_horizon
+        self.act_horizon = act_horizon
+        self.gamma = gamma
+        self.device = device
+        
+        # Load demo dataset with RL signals
+        from diffusion_policy.utils import load_traj_hdf5
+        raw_data = load_traj_hdf5(data_path, num_traj=num_traj)
+        
+        print("Raw trajectory loaded, beginning observation pre-processing...")
+        
+        # Process trajectories
+        trajectories = {
+            "observations": [],
+            "actions": [],
+            "rewards": [],
+            "dones": [],
+        }
+        
+        for traj_key in sorted(raw_data.keys(), key=lambda x: int(x.split("_")[-1])):
+            traj = raw_data[traj_key]
+            
+            # Process observations
+            obs_dict = reorder_keys(traj["obs"], obs_space)
+            obs_dict = obs_process_fn(obs_dict)
+            
+            processed_obs = {}
+            if include_depth:
+                processed_obs["depth"] = torch.Tensor(
+                    obs_dict["depth"].astype(np.float32)
+                ).to(device=device, dtype=torch.float16)
+            if include_rgb:
+                processed_obs["rgb"] = torch.from_numpy(obs_dict["rgb"]).to(device)
+            processed_obs["state"] = torch.from_numpy(obs_dict["state"]).to(device)
+            
+            trajectories["observations"].append(processed_obs)
+            
+            # Process actions
+            trajectories["actions"].append(
+                torch.Tensor(traj["actions"]).to(device=device)
+            )
+            
+            # Process rewards (handle different possible keys)
+            if "rewards" in traj:
+                rewards = traj["rewards"]
+            elif "reward" in traj:
+                rewards = traj["reward"]
+            else:
+                # Default to zeros if no reward found
+                rewards = np.zeros(len(traj["actions"]))
+            trajectories["rewards"].append(
+                torch.Tensor(rewards).to(device=device)
+            )
+            
+            # Process dones
+            if "dones" in traj:
+                dones = traj["dones"]
+            elif "done" in traj:
+                dones = traj["done"]
+            elif "terminated" in traj:
+                dones = traj["terminated"]
+            else:
+                # Default: only last step is done
+                dones = np.zeros(len(traj["actions"]))
+                dones[-1] = 1.0
+            trajectories["dones"].append(
+                torch.Tensor(dones).to(device=device)
+            )
+        
+        self.obs_keys = list(processed_obs.keys())
+        print("Obs/action pre-processing done, computing slice indices...")
+        
+        # Action padding for delta controllers
+        if "delta_pos" in control_mode or control_mode == "base_pd_joint_vel_arm_pd_joint_vel":
+            self.pad_action_arm = torch.zeros(
+                (trajectories["actions"][0].shape[1] - 1,), device=device
+            )
+        else:
+            self.pad_action_arm = None
+        
+        # Compute slices (same as official implementation)
+        self.slices = []
+        num_traj = len(trajectories["actions"])
+        total_transitions = 0
+        
+        for traj_idx in range(num_traj):
+            L = trajectories["actions"][traj_idx].shape[0]
+            assert trajectories["observations"][traj_idx]["state"].shape[0] == L + 1
+            total_transitions += L
+            
+            pad_before = obs_horizon - 1
+            pad_after = pred_horizon - obs_horizon
+            
+            self.slices += [
+                (traj_idx, start, start + pred_horizon)
+                for start in range(-pad_before, L - pred_horizon + pad_after)
+            ]
+        
+        print(f"Total transitions: {total_transitions}, Total obs sequences: {len(self.slices)}")
+        self.trajectories = trajectories
+    
+    def __getitem__(self, index):
+        traj_idx, start, end = self.slices[index]
+        L, act_dim = self.trajectories["actions"][traj_idx].shape
+        
+        obs_traj = self.trajectories["observations"][traj_idx]
+        
+        # Get observation sequence (for policy input)
+        obs_seq = {}
+        for k, v in obs_traj.items():
+            obs_seq[k] = v[max(0, start):start + self.obs_horizon]
+            if start < 0:
+                pad_obs_seq = torch.stack([obs_seq[k][0]] * abs(start), dim=0)
+                obs_seq[k] = torch.cat((pad_obs_seq, obs_seq[k]), dim=0)
+        
+        # ===== SMDP Chunk-Level Transition =====
+        # For action chunking, we need to compute:
+        # 1. cumulative_reward: R_t^(τ) = Σ_{i=0}^{τ-1} γ^i r_{t+i}
+        # 2. next_observations: s_{t+τ} (state after chunk execution)
+        # 3. chunk_done: 1 if episode ends within chunk
+        # 4. effective_length: τ (actual chunk length)
+        # 5. discount_factor: γ^τ
+        
+        # Determine the actual action indices for this chunk
+        # The chunk covers actions from action_start to action_start + act_horizon
+        action_start = max(0, start)
+        
+        # Compute effective chunk length (may be shorter at episode end)
+        # We use act_horizon (execution horizon) not pred_horizon for chunk length
+        effective_length = min(self.act_horizon, L - action_start)
+        effective_length = max(1, effective_length)  # At least 1 step
+        
+        # Compute cumulative discounted reward: R_t^(τ) = Σ_{i=0}^{τ-1} γ^i r_{t+i}
+        cumulative_reward = 0.0
+        chunk_done = 0.0
+        
+        rewards_traj = self.trajectories["rewards"][traj_idx]
+        dones_traj = self.trajectories["dones"][traj_idx]
+        
+        for i in range(effective_length):
+            step_idx = action_start + i
+            if step_idx < L:
+                # Add discounted reward
+                cumulative_reward += (self.gamma ** i) * rewards_traj[step_idx].item()
+                # Check if done within chunk
+                if dones_traj[step_idx].item() > 0.5:
+                    chunk_done = 1.0
+                    effective_length = i + 1  # Truncate effective length
+                    break
+        
+        # Compute discount factor: γ^τ
+        discount_factor = self.gamma ** effective_length
+        
+        # Get next observation sequence (state after chunk: s_{t+τ})
+        # This is the observation at timestep (action_start + effective_length)
+        next_obs_start = action_start + effective_length
+        next_obs_seq = {}
+        for k, v in obs_traj.items():
+            # Clamp to valid range [0, L] (observations have L+1 entries)
+            actual_start = min(next_obs_start, L)
+            next_obs_seq[k] = v[actual_start:actual_start + self.obs_horizon]
+            # Pad if we need more observations than available
+            if next_obs_seq[k].shape[0] < self.obs_horizon:
+                pad_len = self.obs_horizon - next_obs_seq[k].shape[0]
+                if next_obs_seq[k].shape[0] > 0:
+                    pad_obs_seq = torch.stack([next_obs_seq[k][-1]] * pad_len, dim=0)
+                else:
+                    # Edge case: use last available observation
+                    pad_obs_seq = torch.stack([v[-1]] * self.obs_horizon, dim=0)
+                    next_obs_seq[k] = pad_obs_seq
+                    continue
+                next_obs_seq[k] = torch.cat((next_obs_seq[k], pad_obs_seq), dim=0)
+        
+        # Get action sequence (full pred_horizon for policy training)
+        act_seq = self.trajectories["actions"][traj_idx][max(0, start):end]
+        if start < 0:
+            act_seq = torch.cat([act_seq[0].repeat(-start, 1), act_seq], dim=0)
+        if end > L:
+            if self.pad_action_arm is not None:
+                gripper_action = act_seq[-1, -1]
+                pad_action = torch.cat((self.pad_action_arm, gripper_action[None]), dim=0)
+            else:
+                pad_action = act_seq[-1]
+            act_seq = torch.cat([act_seq, pad_action.repeat(end - L, 1)], dim=0)
+        
+        assert obs_seq["state"].shape[0] == self.obs_horizon
+        assert act_seq.shape[0] == self.pred_horizon
+        
+        return {
+            "observations": obs_seq,
+            "next_observations": next_obs_seq,
+            "actions": act_seq,
+            # SMDP chunk-level fields (on same device as other tensors)
+            "cumulative_reward": torch.tensor(cumulative_reward, dtype=torch.float32, device=self.device),
+            "chunk_done": torch.tensor(chunk_done, dtype=torch.float32, device=self.device),
+            "effective_length": torch.tensor(effective_length, dtype=torch.float32, device=self.device),
+            "discount_factor": torch.tensor(discount_factor, dtype=torch.float32, device=self.device),
+            # Keep single-step reward/done for backward compatibility (IL algorithms)
+            "rewards": rewards_traj[min(action_start, L - 1)],
+            "dones": dones_traj[min(action_start, L - 1)],
+        }
+    
+    def __len__(self):
+        return len(self.slices)
+
+
+def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
+    """Create agent based on algorithm name with unified external network creation.
+    
+    Args:
+        algorithm: Algorithm name
+        action_dim: Action dimension from environment
+        global_cond_dim: Global conditioning dimension (obs_horizon * feature_dim)
+        args: Training arguments
+        
+    Returns:
+        Initialized agent module
+    """
+    device = "cuda" if args.cuda else "cpu"
+    
+    if algorithm == "diffusion_policy":
+        noise_pred_net = ConditionalUnet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=args.unet_dims,
+            n_groups=args.n_groups,
+        )
+        
+        return DiffusionPolicyAgent(
+            noise_pred_net=noise_pred_net,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            num_diffusion_iters=args.num_diffusion_iters,
+            device=device,
+        )
+    
+    elif algorithm == "flow_matching":
+        velocity_net = VelocityUNet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        return FlowMatchingAgent(
+            velocity_net=velocity_net,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            num_flow_steps=args.num_flow_steps,
+            device=device,
+        )
+    
+    elif algorithm == "reflected_flow":
+        velocity_net = VelocityUNet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        return ReflectedFlowAgent(
+            velocity_net=velocity_net,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            num_flow_steps=args.num_flow_steps,
+            reflection_mode=args.reflection_mode,
+            boundary_reg_weight=args.boundary_reg_weight,
+            device=device,
+        )
+    
+    elif algorithm == "consistency_flow":
+        velocity_net = VelocityUNet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        return ConsistencyFlowAgent(
+            velocity_net=velocity_net,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            num_flow_steps=args.num_flow_steps,
+            flow_weight=args.bc_weight,
+            consistency_weight=args.consistency_weight,
+            ema_decay=args.ema_decay,
+            device=device,
+        )
+    
+    elif algorithm == "shortcut_flow":
+        shortcut_velocity_net = ShortCutVelocityUNet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        return ShortCutFlowAgent(
+            velocity_net=shortcut_velocity_net,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            max_denoising_steps=args.max_denoising_steps,
+            self_consistency_k=args.self_consistency_k,
+            flow_weight=args.bc_weight,
+            shortcut_weight=args.consistency_weight,
+            device=device,
+        )
+    
+    elif algorithm == "diffusion_double_q":
+        noise_pred_net = ConditionalUnet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        q_network = DoubleQNetwork(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            pred_horizon=args.pred_horizon,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        return DiffusionDoubleQAgent(
+            noise_pred_net=noise_pred_net,
+            q_network=q_network,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            num_diffusion_iters=100,
+            alpha=args.alpha,
+            bc_weight=args.bc_weight,
+            gamma=args.gamma,
+            tau=args.tau,
+            reward_scale=args.reward_scale,
+            q_target_clip=args.q_target_clip,
+            device=device,
+        )
+    
+    elif algorithm == "cpql":
+        velocity_net = VelocityUNet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        q_network = DoubleQNetwork(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            pred_horizon=args.pred_horizon,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        return CPQLAgent(
+            velocity_net=velocity_net,
+            q_network=q_network,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            num_flow_steps=args.num_flow_steps,
+            alpha=0.01,  # CPQL uses smaller alpha
+            bc_weight=args.bc_weight,
+            consistency_weight=args.consistency_weight,
+            gamma=args.gamma,
+            tau=args.tau,
+            reward_scale=args.reward_scale,
+            q_target_clip=args.q_target_clip,
+            ema_decay=args.ema_decay,
+            device=device,
+        )
+    
+    else:
+        raise ValueError(f"Unknown algorithm: {algorithm}")
+
+
+def save_ckpt(run_name, tag, agent, ema, ema_agent):
+    os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
+    ema.copy_to(ema_agent.parameters())
+    torch.save(
+        {
+            "agent": agent.state_dict(),
+            "ema_agent": ema_agent.state_dict(),
+        },
+        f"runs/{run_name}/checkpoints/{tag}.pt",
+    )
+
+
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    
+    if args.exp_name is None:
+        args.exp_name = f"{args.algorithm}-{args.env_id}"
+        run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
+    else:
+        run_name = args.exp_name
+    
+    # Validate demo path
+    if args.demo_path.endswith(".h5"):
+        import json
+        json_file = args.demo_path[:-2] + "json"
+        with open(json_file, "r") as f:
+            demo_info = json.load(f)
+            if "control_mode" in demo_info["env_info"]["env_kwargs"]:
+                control_mode = demo_info["env_info"]["env_kwargs"]["control_mode"]
+            elif "control_mode" in demo_info["episodes"][0]:
+                control_mode = demo_info["episodes"][0]["control_mode"]
+            else:
+                raise Exception("Control mode not found in json")
+            assert control_mode == args.control_mode, \
+                f"Control mode mismatch: {control_mode} vs {args.control_mode}"
+    
+    assert args.obs_horizon + args.act_horizon - 1 <= args.pred_horizon
+    assert args.obs_horizon >= 1 and args.act_horizon >= 1 and args.pred_horizon >= 1
+    
+    # Seeding
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = args.torch_deterministic
+    
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    
+    # Create evaluation environment
+    env_kwargs = dict(
+        control_mode=args.control_mode,
+        reward_mode="sparse",
+        obs_mode=args.obs_mode,
+        render_mode="rgb_array",
+        human_render_camera_configs=dict(shader_pack="default"),
+    )
+    assert args.max_episode_steps is not None, "max_episode_steps must be specified"
+    env_kwargs["max_episode_steps"] = args.max_episode_steps
+    other_kwargs = dict(obs_horizon=args.obs_horizon)
+    
+    envs = make_eval_envs(
+        args.env_id,
+        args.num_eval_envs,
+        args.sim_backend,
+        env_kwargs,
+        other_kwargs,
+        video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
+        wrappers=[FlattenRGBDObservationWrapper],
+    )
+    
+    # Wandb tracking
+    if args.track:
+        import wandb
+        config = vars(args)
+        config["eval_env_cfg"] = dict(
+            **env_kwargs,
+            num_envs=args.num_eval_envs,
+            env_id=args.env_id,
+            env_horizon=args.max_episode_steps,
+        )
+        wandb.init(
+            project=args.wandb_project_name,
+            entity=args.wandb_entity,
+            sync_tensorboard=True,
+            config=config,
+            name=run_name,
+            save_code=True,
+            group=args.algorithm,
+            tags=[args.algorithm, "offline_rl"],
+        )
+    
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    )
+    
+    # Setup data processing
+    obs_process_fn = partial(
+        convert_obs,
+        concat_fn=partial(np.concatenate, axis=-1),
+        transpose_fn=partial(np.transpose, axes=(0, 3, 1, 2)),
+        state_obs_extractor=build_state_obs_extractor(args.env_id),
+        depth="rgbd" in args.demo_path,
+    )
+    
+    # Get observation space from temp env
+    tmp_env = gym.make(args.env_id, **env_kwargs)
+    original_obs_space = tmp_env.observation_space
+    include_rgb = tmp_env.unwrapped.obs_mode_struct.visual.rgb
+    include_depth = tmp_env.unwrapped.obs_mode_struct.visual.depth
+    tmp_env.close()
+    
+    # Create dataset
+    dataset = OfflineRLDataset(
+        data_path=args.demo_path,
+        obs_process_fn=obs_process_fn,
+        obs_space=original_obs_space,
+        include_rgb=include_rgb,
+        include_depth=include_depth,
+        device=device,
+        num_traj=args.num_demos,
+        obs_horizon=args.obs_horizon,
+        pred_horizon=args.pred_horizon,
+        act_horizon=args.act_horizon,
+        control_mode=args.control_mode,
+        gamma=args.gamma,  # For SMDP cumulative reward computation
+    )
+    
+    sampler = RandomSampler(dataset, replacement=False)
+    batch_sampler = BatchSampler(sampler, batch_size=args.batch_size, drop_last=True)
+    batch_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
+    train_dataloader = DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=args.num_dataload_workers,
+        worker_init_fn=lambda worker_id: worker_init_fn(worker_id, base_seed=args.seed),
+        persistent_workers=(args.num_dataload_workers > 0),
+    )
+    
+    # Get action dimension from environment
+    action_dim = envs.single_action_space.shape[0]
+    
+    # Determine state dimension from dataset
+    sample_obs = dataset.trajectories["observations"][0]
+    state_dim = sample_obs["state"].shape[-1]
+    
+    # Create visual encoder
+    include_rgb_flag = "rgb" in dataset.obs_keys
+    include_depth_flag = "depth" in dataset.obs_keys
+    
+    in_channels = 0
+    if include_rgb_flag:
+        in_channels += 3
+    if include_depth_flag:
+        in_channels += 1
+    
+    visual_encoder = None
+    visual_feature_dim = 0
+    if in_channels > 0:
+        visual_encoder = PlainConv(
+            in_channels=in_channels,
+            out_dim=args.visual_feature_dim,
+            pool_feature_map=True,
+        ).to(device)
+        visual_feature_dim = args.visual_feature_dim
+    
+    # Compute global conditioning dimension
+    # obs_features = concat(visual_features, state) per timestep, then concat across obs_horizon
+    global_cond_dim = args.obs_horizon * (visual_feature_dim + state_dim)
+    print(f"action_dim: {action_dim}, state_dim: {state_dim}, visual_feature_dim: {visual_feature_dim}")
+    print(f"global_cond_dim: {global_cond_dim} = {args.obs_horizon} * ({visual_feature_dim} + {state_dim})")
+    
+    # Create agent
+    agent = create_agent(args.algorithm, action_dim, global_cond_dim, args).to(device)
+    print(f"Agent ({args.algorithm}) parameters: {sum(p.numel() for p in agent.parameters()) / 1e6:.2f}M")
+    
+    # Create agent wrapper for evaluation (handles obs encoding)
+    # This mirrors the encode_obs and get_action logic from train_rgbd.py's Agent class
+    class AgentWrapper(nn.Module):
+        """Wrapper that combines visual encoder and agent for evaluation.
+        
+        Aligns with train_rgbd.py's Agent.encode_obs and Agent.get_action methods.
+        """
+        def __init__(self, agent, visual_encoder, include_rgb, include_depth, obs_horizon):
+            super().__init__()
+            self.agent = agent
+            self.visual_encoder = visual_encoder
+            self.include_rgb = include_rgb
+            self.include_depth = include_depth
+            self.obs_horizon = obs_horizon
+            
+        def encode_obs(self, obs_seq, eval_mode=True):
+            """Encode observations to get obs_cond for agents.
+            
+            Mirrors train_rgbd.py Agent.encode_obs exactly.
+            
+            Input from environment:
+                obs_seq["rgb"]: (B, obs_horizon, H, W, C) uint8
+                obs_seq["state"]: (B, obs_horizon, state_dim) float32
+            
+            Output:
+                obs_cond: (B, obs_horizon * (visual_dim + state_dim))
+            """
+            # Convert from NHWC to NCHW if needed (environment returns HWC)
+            if self.include_rgb and "rgb" in obs_seq:
+                rgb = obs_seq["rgb"]
+                if rgb.dim() == 5 and rgb.shape[-1] in [1, 3, 4]:
+                    # (B, T, H, W, C) -> (B, T, C, H, W)
+                    rgb = rgb.permute(0, 1, 4, 2, 3)
+                rgb = rgb.float() / 255.0
+                img_seq = rgb
+                
+            if self.include_depth and "depth" in obs_seq:
+                depth = obs_seq["depth"]
+                if depth.dim() == 5 and depth.shape[-1] == 1:
+                    depth = depth.permute(0, 1, 4, 2, 3)
+                depth = depth.float() / 1024.0
+                img_seq = depth
+                
+            if self.include_rgb and self.include_depth:
+                img_seq = torch.cat([rgb, depth], dim=2)  # (B, obs_horizon, C, H, W)
+            
+            features_list = []
+            
+            if self.visual_encoder is not None and (self.include_rgb or self.include_depth):
+                batch_size = img_seq.shape[0]
+                img_seq_flat = img_seq.flatten(end_dim=1)  # (B*obs_horizon, C, H, W)
+                visual_feature = self.visual_encoder(img_seq_flat)  # (B*obs_horizon, D)
+                visual_feature = visual_feature.reshape(
+                    batch_size, self.obs_horizon, visual_feature.shape[1]
+                )  # (B, obs_horizon, D)
+                features_list.append(visual_feature)
+            
+            # State
+            state = obs_seq["state"]  # (B, obs_horizon, state_dim)
+            features_list.append(state)
+            
+            # Concatenate: (B, obs_horizon, D+state_dim)
+            feature = torch.cat(features_list, dim=-1)
+            # Flatten: (B, obs_horizon * (D+state_dim))
+            obs_cond = feature.flatten(start_dim=1)
+            
+            return obs_cond
+        
+        def get_action(self, obs_seq):
+            """Get action from observations (for evaluation).
+            
+            Mirrors train_rgbd.py Agent.get_action.
+            """
+            with torch.no_grad():
+                # encode_obs returns (B, global_cond_dim) - flattened observation features
+                obs_cond = self.encode_obs(obs_seq, eval_mode=True)
+                
+                # Pass flattened obs_cond directly to agent.get_action
+                # The agent's velocity_net/noise_pred_net expects global_cond as (B, global_cond_dim)
+                action_seq = self.agent.get_action(obs_cond)
+                
+                # Only return act_horizon actions (aligned with train_rgbd.py)
+                start = self.obs_horizon - 1
+                end = start + args.act_horizon
+                return action_seq[:, start:end]
+        
+        def eval(self):
+            self.agent.eval()
+            if self.visual_encoder is not None:
+                self.visual_encoder.eval()
+            return self
+        
+        def train(self):
+            self.agent.train()
+            if self.visual_encoder is not None:
+                self.visual_encoder.train()
+            return self
+    
+    # Create wrapped agent for evaluation
+    agent_wrapper = AgentWrapper(agent, visual_encoder, include_rgb_flag, include_depth_flag, args.obs_horizon).to(device)
+    
+    # Setup optimizers
+    # IL algorithms (no critic): diffusion_policy, flow_matching, reflected_flow, consistency_flow, shortcut_flow
+    il_algorithms = ["diffusion_policy", "flow_matching", "reflected_flow", "consistency_flow", "shortcut_flow"]
+    
+    # Collect all trainable parameters
+    all_params = list(agent.parameters())
+    if visual_encoder is not None:
+        all_params += list(visual_encoder.parameters())
+    
+    if args.algorithm in il_algorithms:
+        optimizer = optim.AdamW(
+            params=all_params,
+            lr=args.lr,
+            betas=(0.95, 0.999),
+            weight_decay=1e-6,
+        )
+        critic_optimizer = None
+    else:
+        # Separate optimizers for actor and critic (offline RL algorithms)
+        actor_params = [p for n, p in agent.named_parameters() if "critic" not in n]
+        if visual_encoder is not None:
+            actor_params += list(visual_encoder.parameters())
+        critic_params = list(agent.critic.parameters())
+        
+        optimizer = optim.AdamW(
+            params=actor_params,
+            lr=args.lr,
+            betas=(0.95, 0.999),
+            weight_decay=1e-6,
+        )
+        critic_optimizer = optim.AdamW(
+            params=critic_params,
+            lr=args.lr_critic,
+            betas=(0.9, 0.999),
+            weight_decay=1e-6,
+        )
+    
+    # Learning rate scheduler
+    lr_scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=500,
+        num_training_steps=args.total_iters,
+    )
+    
+    # EMA for agent only (visual encoder is shared)
+    ema = EMAModel(parameters=agent.parameters(), power=0.75)
+    ema_agent = create_agent(args.algorithm, action_dim, global_cond_dim, args).to(device)
+    ema_agent_wrapper = AgentWrapper(ema_agent, visual_encoder, include_rgb_flag, include_depth_flag, args.obs_horizon).to(device)
+    
+    best_eval_metrics = defaultdict(float)
+    timings = defaultdict(float)
+    
+    def evaluate_and_save_best(iteration):
+        if iteration % args.eval_freq == 0:
+            last_tick = time.time()
+            ema.copy_to(ema_agent.parameters())
+            eval_metrics = evaluate(
+                args.num_eval_episodes, ema_agent_wrapper, envs, device, args.sim_backend
+            )
+            timings["eval"] += time.time() - last_tick
+            
+            print(f"Evaluated {len(eval_metrics['success_at_end'])} episodes")
+            for k in eval_metrics.keys():
+                eval_metrics[k] = np.mean(eval_metrics[k])
+                writer.add_scalar(f"eval/{k}", eval_metrics[k], iteration)
+                print(f"{k}: {eval_metrics[k]:.4f}")
+            
+            for k in ["success_once", "success_at_end"]:
+                if k in eval_metrics and eval_metrics[k] > best_eval_metrics[k]:
+                    best_eval_metrics[k] = eval_metrics[k]
+                    save_ckpt(run_name, f"best_eval_{k}", agent, ema, ema_agent)
+                    print(f"New best {k}: {eval_metrics[k]:.4f}. Saving checkpoint.")
+    
+    def log_metrics(iteration, losses):
+        if iteration % args.log_freq == 0:
+            writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], iteration)
+            for k, v in losses.items():
+                writer.add_scalar(f"losses/{k}", v, iteration)
+            for k, v in timings.items():
+                writer.add_scalar(f"time/{k}", v, iteration)
+    
+    # Training loop
+    agent.train()
+    if visual_encoder is not None:
+        visual_encoder.train()
+    pbar = tqdm(total=args.total_iters)
+    last_tick = time.time()
+    
+    # Define IL algorithms (no critic)
+    il_algorithms = ["diffusion_policy", "flow_matching", "reflected_flow", "consistency_flow", "shortcut_flow"]
+    
+    # Helper function to encode observations
+    def encode_observations(obs_seq):
+        """Encode observations to get obs_features for agents."""
+        B = obs_seq["state"].shape[0]
+        T = obs_seq["state"].shape[1]
+        
+        features_list = []
+        
+        # Visual features
+        if visual_encoder is not None:
+            if "rgb" in obs_seq:
+                rgb = obs_seq["rgb"]  # [B, T, C, H, W]
+                rgb_flat = rgb.view(B * T, *rgb.shape[2:]).float() / 255.0
+                if "depth" in obs_seq:
+                    depth = obs_seq["depth"]  # [B, T, 1, H, W]
+                    depth_flat = depth.view(B * T, *depth.shape[2:]).float()
+                    visual_input = torch.cat([rgb_flat, depth_flat], dim=1)
+                else:
+                    visual_input = rgb_flat
+            elif "depth" in obs_seq:
+                depth = obs_seq["depth"]
+                visual_input = depth.view(B * T, *depth.shape[2:]).float()
+            else:
+                visual_input = None
+            
+            if visual_input is not None:
+                visual_feat = visual_encoder(visual_input)  # [B*T, visual_dim]
+                visual_feat = visual_feat.view(B, T, -1)  # [B, T, visual_dim]
+                features_list.append(visual_feat)
+        
+        # State features
+        state = obs_seq["state"]  # [B, T, state_dim]
+        features_list.append(state)
+        
+        # Concatenate features: [B, T, visual_dim + state_dim]
+        obs_features = torch.cat(features_list, dim=-1)
+        
+        return obs_features
+    
+    for iteration, data_batch in enumerate(train_dataloader):
+        timings["data_loading"] += time.time() - last_tick
+        
+        last_tick = time.time()
+        
+        # Common: encode observations
+        obs_seq = data_batch["observations"]
+        action_seq = data_batch["actions"]
+        obs_features = encode_observations(obs_seq)
+        
+        if args.algorithm in il_algorithms:
+            # IL algorithm training (flow_matching, reflected_flow, consistency_flow, shortcut_flow)
+            loss_dict = agent.compute_loss(
+                obs_features=obs_features,
+                actions=action_seq,
+            )
+            
+            if isinstance(loss_dict, dict):
+                total_loss = loss_dict["loss"]
+                losses = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
+            else:
+                total_loss = loss_dict
+                losses = {"total_loss": total_loss.item()}
+            
+            optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+            if visual_encoder is not None:
+                torch.nn.utils.clip_grad_norm_(visual_encoder.parameters(), 1.0)
+            optimizer.step()
+            lr_scheduler.step()
+            
+            # Update EMA for consistency_flow
+            if hasattr(agent, "update_ema"):
+                agent.update_ema()
+        
+        else:
+            # Offline RL training (diffusion_double_q or cpql)
+            next_obs_seq = data_batch["next_observations"]
+            rewards = data_batch["rewards"]
+            dones = data_batch["dones"]
+            
+            # SMDP chunk-level fields for proper action chunking Bellman equation
+            cumulative_reward = data_batch["cumulative_reward"]
+            chunk_done = data_batch["chunk_done"]
+            discount_factor = data_batch["discount_factor"]
+            
+            # Encode next observations
+            next_obs_features = encode_observations(next_obs_seq)
+            
+            # Flatten obs_features for compute_loss (agents expect flattened)
+            obs_cond = obs_features.reshape(obs_features.shape[0], -1)
+            next_obs_cond = next_obs_features.reshape(next_obs_features.shape[0], -1)
+            
+            # Compute combined loss using the unified interface with SMDP fields
+            loss_dict = agent.compute_loss(
+                obs_features=obs_features,
+                actions=action_seq,
+                rewards=rewards,
+                next_obs_features=next_obs_features,
+                dones=dones,
+                # SMDP fields for proper action chunking
+                cumulative_reward=cumulative_reward,
+                chunk_done=chunk_done,
+                discount_factor=discount_factor,
+            )
+            
+            total_loss = loss_dict["loss"]
+            losses = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
+            
+            optimizer.zero_grad()
+            if critic_optimizer is not None:
+                critic_optimizer.zero_grad()
+            
+            total_loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
+            if visual_encoder is not None:
+                torch.nn.utils.clip_grad_norm_(visual_encoder.parameters(), 1.0)
+            
+            optimizer.step()
+            if critic_optimizer is not None:
+                critic_optimizer.step()
+            lr_scheduler.step()
+            
+            # Update targets and EMA
+            agent.update_target()
+            if hasattr(agent, "update_ema"):
+                agent.update_ema()
+        
+        timings["forward"] += time.time() - last_tick
+        
+        # EMA step
+        last_tick = time.time()
+        ema.step(agent.parameters())
+        timings["ema"] += time.time() - last_tick
+        
+        # Evaluation
+        evaluate_and_save_best(iteration)
+        log_metrics(iteration, losses)
+        
+        # Checkpoint
+        if args.save_freq is not None and iteration % args.save_freq == 0:
+            save_ckpt(run_name, str(iteration), agent, ema, ema_agent)
+        
+        pbar.update(1)
+        pbar.set_postfix({k: f"{v:.4f}" for k, v in losses.items()})
+        last_tick = time.time()
+    
+    evaluate_and_save_best(args.total_iters)
+    log_metrics(args.total_iters, losses)
+    
+    envs.close()
+    writer.close()

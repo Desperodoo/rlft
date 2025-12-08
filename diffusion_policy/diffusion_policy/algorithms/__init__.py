@@ -1,0 +1,37 @@
+"""
+Algorithms module for Diffusion Policy
+
+This module contains offline RL algorithms migrated from toy_diffusion_rl,
+aligned with the official ManiSkill diffusion policy implementation.
+
+Available algorithms:
+- DiffusionPolicyAgent: DDPM-based imitation learning (original diffusion policy)
+- FlowMatchingAgent: Flow Matching based imitation learning
+- ReflectedFlowAgent: Reflected Flow for bounded action spaces
+- ConsistencyFlowAgent: Consistency Flow with self-consistency loss
+- ShortCutFlowAgent: ShortCut Flow with adaptive step sizes
+- DiffusionDoubleQAgent: Diffusion Policy + Double Q-Learning for offline RL  
+- CPQLAgent: Consistency Policy Q-Learning for offline RL
+"""
+
+from .diffusion_policy import DiffusionPolicyAgent
+from .flow_matching import FlowMatchingAgent
+from .reflected_flow import ReflectedFlowAgent
+from .consistency_flow import ConsistencyFlowAgent
+from .shortcut_flow import ShortCutFlowAgent, ShortCutVelocityUNet1D
+from .diffusion_double_q import DiffusionDoubleQAgent
+from .cpql import CPQLAgent
+from .networks import DoubleQNetwork, VelocityUNet1D
+
+__all__ = [
+    "DiffusionPolicyAgent",
+    "FlowMatchingAgent",
+    "ReflectedFlowAgent",
+    "ConsistencyFlowAgent",
+    "ShortCutFlowAgent",
+    "ShortCutVelocityUNet1D",
+    "DiffusionDoubleQAgent", 
+    "CPQLAgent",
+    "DoubleQNetwork",
+    "VelocityUNet1D",
+]
