@@ -29,6 +29,22 @@ class ConsistencyFlowAgent(nn.Module):
         consistency_weight: float = 1.0,
         ema_decay: float = 0.999,
         consistency_delta: float = 0.01,  # Small time step for consistency
+        # Consistency design toggles
+        cons_use_flow_t: bool = False,
+        cons_full_t_range: bool = False,
+        cons_t_min: float = 0.05,
+        cons_t_max: float = 0.95,
+        cons_t_upper: float = 0.95,
+        cons_delta_mode: Literal["random", "fixed"] = "random",
+        cons_delta_min: float = 0.02,
+        cons_delta_max: float = 0.15,
+        cons_delta_fixed: float = 0.01,
+        cons_delta_dynamic_max: bool = False,
+        cons_delta_cap: float = 0.99,
+        teacher_steps: int = 2,
+        teacher_from: Literal["t_plus", "t_cons"] = "t_plus",
+        student_point: Literal["t_plus", "t_cons"] = "t_plus",
+        consistency_loss_space: Literal["velocity", "endpoint"] = "velocity",
         device: str = "cuda",
     ):
         super().__init__()
@@ -50,11 +66,21 @@ class ConsistencyFlowAgent(nn.Module):
         self.device = device
         
         # Consistency loss hyperparameters (aligned with best practices)
-        self.t_min = 0.05  # Avoid boundary instability at t≈0
-        self.t_max = 0.95  # Avoid boundary instability at t≈1
-        self.delta_min = 0.02  # Minimum delta for consistency
-        self.delta_max = 0.15  # Maximum delta (avoid large teacher error)
-        self.teacher_steps = 2  # Multi-step teacher for accurate targets
+        self.cons_use_flow_t = cons_use_flow_t
+        self.cons_full_t_range = cons_full_t_range
+        self.cons_delta_mode = cons_delta_mode
+        self.t_min = cons_t_min  # Avoid boundary instability at t≈0
+        self.t_max = cons_t_max  # Avoid boundary instability at t≈1
+        self.t_upper = cons_t_upper  # Clamp for t_plus
+        self.delta_min = cons_delta_min  # Minimum delta for consistency
+        self.delta_max = cons_delta_max  # Maximum delta (avoid large teacher error)
+        self.delta_fixed = cons_delta_fixed
+        self.delta_dynamic_max = cons_delta_dynamic_max
+        self.delta_cap = cons_delta_cap
+        self.teacher_steps = teacher_steps  # Teacher rollout steps to 1
+        self.teacher_from = teacher_from
+        self.student_point = student_point
+        self.consistency_loss_space = consistency_loss_space
         
     def update_ema(self):
         """Update EMA velocity network.
@@ -113,17 +139,17 @@ class ConsistencyFlowAgent(nn.Module):
         x_0 = torch.randn_like(actions)
         
         # Sample time uniformly
-        t = torch.rand(batch_size, device=actions.device)
+        t_flow = torch.rand(batch_size, device=actions.device)
         
         # Interpolate
-        t_expand = t.view(-1, 1, 1)
-        x_t = (1 - t_expand) * x_0 + t_expand * actions
+        t_flow_expand = t_flow.view(-1, 1, 1)
+        x_t_flow = (1 - t_flow_expand) * x_0 + t_flow_expand * actions
         
         # Flow matching target
         v_target = actions - x_0
         
         # Predict velocity
-        v_pred = self.velocity_net(x_t, t, obs_features)
+        v_pred = self.velocity_net(x_t_flow, t_flow, obs_features)
         
         # Flow matching loss
         flow_loss = F.mse_loss(v_pred, v_target)
@@ -132,32 +158,68 @@ class ConsistencyFlowAgent(nn.Module):
         # Using velocity space loss for gradient stability
         consistency_loss = torch.tensor(0.0, device=actions.device)
         if self.consistency_weight > 0:
-            # Sample t in restricted range [t_min, t_max] to avoid boundary instability
-            t_cons = self.t_min + torch.rand(batch_size, device=actions.device) * (self.t_max - self.t_min)
+            # Choose sampling range
+            t_low = 0.0 if self.cons_full_t_range else self.t_min
+            t_high = 1.0 if self.cons_full_t_range else self.t_max
+            t_upper = self.t_upper if self.t_upper is not None else t_high
             
-            # Random delta in [delta_min, delta_max], clamped to not exceed t_max
-            delta_t = self.delta_min + torch.rand(batch_size, device=actions.device) * (self.delta_max - self.delta_min)
-            t_plus = torch.clamp(t_cons + delta_t, max=self.t_max)
+            # Optionally reuse flow t (clamped) or resample for consistency branch
+            if self.cons_use_flow_t:
+                t_cons = torch.clamp(t_flow, min=t_low, max=t_high)
+                t_cons_expand = t_cons.view(-1, 1, 1)
+                x_t_cons = (1 - t_cons_expand) * x_0 + t_cons_expand * actions
+            else:
+                range_span = max(t_high - t_low, 1e-6)
+                t_cons = t_low + torch.rand(batch_size, device=actions.device) * range_span
+                t_cons_expand = t_cons.view(-1, 1, 1)
+                x_t_cons = (1 - t_cons_expand) * x_0 + t_cons_expand * actions
             
-            # Get x at both time points (using same x_0 for consistency)
-            t_cons_expand = t_cons.view(-1, 1, 1)
+            # Delta strategy: random or fixed, optional dynamic cap
+            if self.cons_delta_mode == "fixed":
+                delta_t = torch.full_like(t_cons, self.delta_fixed)
+            else:
+                if self.delta_dynamic_max:
+                    delta_high = torch.clamp(self.delta_cap - t_cons, min=0.0)
+                else:
+                    delta_high = torch.full_like(t_cons, self.delta_max)
+                delta_range = torch.clamp(delta_high - self.delta_min, min=0.0)
+                delta_t = self.delta_min + torch.rand_like(t_cons) * delta_range
+                delta_t = torch.clamp(delta_t, min=self.delta_min)
+            
+            t_plus = torch.clamp(t_cons + delta_t, max=t_upper)
             t_plus_expand = t_plus.view(-1, 1, 1)
-            x_t_cons = (1 - t_cons_expand) * x_0 + t_cons_expand * actions
             x_t_plus = (1 - t_plus_expand) * x_0 + t_plus_expand * actions
             
-            # Teacher: multi-step integration from t_plus to 1 using EMA network
+            # Teacher rollout start: either from t_cons or t_plus
+            if self.teacher_from == "t_cons":
+                teacher_x = x_t_cons
+                teacher_t = t_cons
+            else:
+                teacher_x = x_t_plus
+                teacher_t = t_plus
+            
             with torch.no_grad():
                 target_x1 = self._get_consistency_targets(
-                    x_t_plus, t_plus, obs_features, num_steps=self.teacher_steps
+                    teacher_x, teacher_t, obs_features, num_steps=self.teacher_steps
                 )
             
-            # Student: predict velocity at t_plus, compute implied x1
-            # The target velocity is: v_target = (target_x1 - x_0) 
-            # This is in velocity space for gradient stability
-            v_target = target_x1 - x_0
-            v_pred = self.velocity_net(x_t_plus, t_plus, obs_features)
+            # Student evaluation point
+            if self.student_point == "t_cons":
+                student_x = x_t_cons
+                student_t = t_cons
+            else:
+                student_x = x_t_plus
+                student_t = t_plus
             
-            consistency_loss = F.mse_loss(v_pred, v_target)
+            v_pred_student = self.velocity_net(student_x, student_t, obs_features)
+            
+            if self.consistency_loss_space == "velocity":
+                v_target_cons = target_x1 - x_0
+                consistency_loss = F.mse_loss(v_pred_student, v_target_cons)
+            else:
+                remaining = (1.0 - student_t).view(-1, 1, 1)
+                pred_x1 = student_x + remaining * v_pred_student
+                consistency_loss = F.mse_loss(pred_x1, target_x1)
         
         total_loss = (
             self.flow_weight * flow_loss + 

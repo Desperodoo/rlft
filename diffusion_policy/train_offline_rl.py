@@ -161,6 +161,36 @@ class Args:
     """fraction of batch for self-consistency in shortcut_flow"""
     ema_decay: float = 0.999
     """EMA decay rate for consistency_flow"""
+    cons_use_flow_t: bool = False
+    """reuse flow t for consistency branch instead of resampling"""
+    cons_full_t_range: bool = False
+    """sample consistency t in [0,1] instead of clipped range"""
+    cons_t_min: float = 0.05
+    """minimum t for consistency sampling when not using full range"""
+    cons_t_max: float = 0.95
+    """maximum t for consistency sampling when not using full range"""
+    cons_t_upper: float = 0.95
+    """upper clamp for t_plus (set 0.99 for CPQL-style)"""
+    cons_delta_mode: Literal["random", "fixed"] = "random"
+    """delta sampling strategy for consistency"""
+    cons_delta_min: float = 0.02
+    """minimum delta when using random delta"""
+    cons_delta_max: float = 0.15
+    """maximum delta when using random delta (static cap)"""
+    cons_delta_fixed: float = 0.01
+    """fixed delta when cons_delta_mode=fixed"""
+    cons_delta_dynamic_max: bool = False
+    """cap random delta by remaining time (e.g., 0.99 - t_cons)"""
+    cons_delta_cap: float = 0.99
+    """ceiling used when cons_delta_dynamic_max is enabled"""
+    cons_teacher_steps: int = 2
+    """teacher rollout steps to t=1"""
+    cons_teacher_from: Literal["t_plus", "t_cons"] = "t_plus"
+    """where teacher rollout starts"""
+    cons_student_point: Literal["t_plus", "t_cons"] = "t_plus"
+    """student evaluation point for consistency loss"""
+    cons_loss_space: Literal["velocity", "endpoint"] = "velocity"
+    """consistency loss space: velocity (v) or endpoint (x1)"""
 
     # Offline RL hyperparameters (inherited from toy_diffusion_rl)
     alpha: float = 0.01
@@ -579,6 +609,21 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             flow_weight=args.bc_weight,
             consistency_weight=args.consistency_weight,
             ema_decay=args.ema_decay,
+            cons_use_flow_t=args.cons_use_flow_t,
+            cons_full_t_range=args.cons_full_t_range,
+            cons_t_min=args.cons_t_min,
+            cons_t_max=args.cons_t_max,
+            cons_t_upper=args.cons_t_upper,
+            cons_delta_mode=args.cons_delta_mode,
+            cons_delta_min=args.cons_delta_min,
+            cons_delta_max=args.cons_delta_max,
+            cons_delta_fixed=args.cons_delta_fixed,
+            cons_delta_dynamic_max=args.cons_delta_dynamic_max,
+            cons_delta_cap=args.cons_delta_cap,
+            teacher_steps=args.cons_teacher_steps,
+            teacher_from=args.cons_teacher_from,
+            student_point=args.cons_student_point,
+            consistency_loss_space=args.cons_loss_space,
             device=device,
         )
     
