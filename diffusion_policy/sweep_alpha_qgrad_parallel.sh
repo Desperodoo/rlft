@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Parallel Grid search for Alpha and Q-gradient chain length (Diffusion Double Q)
+# Parallel Grid search for Alpha and Q-gradient chain length (cpql)
 # Auto-allocates tasks to available GPUs
 #
 # Usage: ./sweep_alpha_qgrad_parallel.sh [--gpus "3 4 5 6 7 8"] [--dry-run] [--env ENV_ID]
@@ -8,13 +8,13 @@
 set -e
 
 # Default configurations
-GPUS=(0)
+GPUS=(2 3 4 5 6 7 8 9)
 DRY_RUN=false
 TOTAL_ITERS=30000
 EVAL_FREQ=2000
 LOG_FREQ=100
 NUM_EVAL_EPISODES=100
-NUM_EVAL_ENVS=100
+NUM_EVAL_ENVS=50
 NUM_DEMOS=1000
 SIM_BACKEND="physx_cuda"
 WANDB_PROJECT="maniskill_alpha_qgrad_grid"
@@ -74,7 +74,7 @@ Q_GRAD_CONFIGS=(
 SEEDS=(0)
 
 DEMO_PATH="$HOME/.maniskill/demos/${ENV_ID}/rl/trajectory.rgb.${CONTROL_MODE}.physx_cuda.h5"
-LOG_DIR="/tmp/ddql_grid_search"
+LOG_DIR="/tmp/cpql_grid_search"
 mkdir -p "$LOG_DIR"
 
 echo "=========================================="
@@ -105,7 +105,7 @@ for alpha in "${ALPHAS[@]}"; do
         Q_GRAD_STEPS="${config##*:}"
         for seed in "${SEEDS[@]}"; do
             TASKS[$TASK_IDX]="$alpha|$Q_GRAD_MODE|$Q_GRAD_STEPS|$seed"
-            ((TASK_IDX++))
+            ((TASK_IDX+=1))
         done
     done
 done
@@ -131,13 +131,13 @@ run_task() {
         q_grad_suffix="q_last${q_grad_steps}"
     fi
     
-    exp_name="ddql-${ENV_ID}-alpha${alpha}-${q_grad_suffix}-seed${seed}"
+    exp_name="cpql-${ENV_ID}-alpha${alpha}-${q_grad_suffix}-seed${seed}"
     log_file="$LOG_DIR/${exp_name}.log"
     
     echo "[GPU $gpu] [$task_num/$TOTAL_TASKS] Starting: $exp_name"
     
     CMD="CUDA_VISIBLE_DEVICES=$gpu python train_offline_rl.py \
-        --algorithm diffusion_double_q \
+        --algorithm cpql \
         --env_id $ENV_ID \
         --obs_mode rgb \
         --demo_path $DEMO_PATH \
@@ -179,7 +179,7 @@ run_task() {
 # Parallel task dispatch
 declare -A gpu_queue
 for gpu in "${GPUS[@]}"; do
-    gpu_queue[$gpu]=()
+    gpu_queue[$gpu]=""
 done
 
 next_task=0
@@ -195,9 +195,9 @@ dispatch_tasks() {
             if ! kill -0 "$pid" 2>/dev/null; then
                 # Process finished
                 if wait "$pid" 2>/dev/null; then
-                    ((COMPLETED++))
+                    ((COMPLETED+=1))
                 else
-                    ((FAILED++))
+                    ((FAILED+=1))
                 fi
                 gpu_queue[$gpu]=""
             fi
@@ -207,7 +207,7 @@ dispatch_tasks() {
         if [ -z "${gpu_queue[$gpu]}" ] && [ $next_task -lt $TOTAL_TASKS ]; then
             run_task "$gpu" "${TASKS[$next_task]}" $((next_task + 1)) &
             gpu_queue[$gpu]=$!
-            ((next_task++))
+            ((next_task+=1))
         fi
     done
 }
@@ -221,8 +221,8 @@ done
 # Wait for remaining processes
 for gpu in "${GPUS[@]}"; do
     if [ -n "${gpu_queue[$gpu]}" ]; then
-        wait "${gpu_queue[$gpu]}" || ((FAILED++))
-        ((COMPLETED++))
+        wait "${gpu_queue[$gpu]}" || ((FAILED+=1))
+        ((COMPLETED+=1))
     fi
 done
 
