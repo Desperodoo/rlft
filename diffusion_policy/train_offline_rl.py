@@ -670,6 +670,8 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             reward_scale=args.reward_scale,
             q_target_clip=args.q_target_clip,
             ema_decay=args.ema_decay,
+            q_grad_mode=args.q_grad_mode,
+            q_grad_steps=args.q_grad_steps,
             device=device,
         )
     

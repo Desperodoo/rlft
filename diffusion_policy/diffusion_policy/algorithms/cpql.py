@@ -49,6 +49,8 @@ class CPQLAgent(nn.Module):
         reward_scale: Scale factor for rewards (default: 0.1)
         q_target_clip: Clip range for Q target (default: 100.0)
         ema_decay: Decay rate for EMA velocity network (default: 0.999)
+        q_grad_mode: Gradient mode for Q-loss ("whole_grad", "last_few", "single_step")
+        q_grad_steps: Number of steps with gradient when q_grad_mode="last_few"
         device: Device to run on (default: "cuda")
     """
     
@@ -69,6 +71,8 @@ class CPQLAgent(nn.Module):
         reward_scale: float = 0.1,
         q_target_clip: float = 100.0,
         ema_decay: float = 0.999,
+        q_grad_mode: str = "single_step",
+        q_grad_steps: int = 1,
         device: str = "cuda",
     ):
         super().__init__()
@@ -88,7 +92,13 @@ class CPQLAgent(nn.Module):
         self.reward_scale = reward_scale
         self.q_target_clip = q_target_clip
         self.ema_decay = ema_decay
+        self.q_grad_mode = q_grad_mode
+        self.q_grad_steps = q_grad_steps
         self.device = device
+        
+        # Validate q_grad_mode
+        assert q_grad_mode in ["whole_grad", "last_few", "single_step"], \
+            f"q_grad_mode must be 'whole_grad', 'last_few', or 'single_step', got {q_grad_mode}"
         
         # Consistency loss hyperparameters (aligned with best practices)
         self.t_min = 0.05  # Avoid boundary instability at t≈0
@@ -257,20 +267,21 @@ class CPQLAgent(nn.Module):
         consistency_loss = F.mse_loss(v_cons_pred, v_cons_target)
         
         # ===== Q-Value Maximization Loss (uses act_horizon) =====
-        # Generate full pred_horizon actions using flow ODE, then truncate to act_horizon
-        x_for_q = torch.randn(B, self.pred_horizon, self.action_dim, device=device)
-        dt = 1.0 / self.num_flow_steps
+        # Generate actions with configurable gradient chain
+        if self.q_grad_mode == "single_step":
+            # Single-step approximation: flow from t=0 to t=1 in one step
+            generated_actions_full = self._sample_actions_single_step(obs_cond)
+        elif self.q_grad_mode == "whole_grad":
+            # Full gradient chain through all flow steps
+            generated_actions_full = self._sample_actions_with_grad(
+                obs_cond, grad_steps=self.num_flow_steps
+            )
+        elif self.q_grad_mode == "last_few":
+            # Gradient through last N steps only
+            generated_actions_full = self._sample_actions_with_grad(
+                obs_cond, grad_steps=self.q_grad_steps
+            )
         
-        with torch.no_grad():
-            for i in range(self.num_flow_steps - 1):
-                t_step = torch.full((B,), i * dt, device=device)
-                v = self.velocity_net(x_for_q, t_step, global_cond=obs_cond)
-                x_for_q = x_for_q + v * dt
-        
-        # Last step with gradient
-        t_last = torch.full((B,), (self.num_flow_steps - 1) * dt, device=device)
-        v_last = self.velocity_net(x_for_q, t_last, global_cond=obs_cond)
-        generated_actions_full = x_for_q + v_last * dt
         generated_actions_full = torch.clamp(generated_actions_full, -1.0, 1.0)
         
         # Truncate to act_horizon for Q-value computation
@@ -399,6 +410,74 @@ class CPQLAgent(nn.Module):
             x = x + v * dt
         
         return torch.clamp(x, -1.0, 1.0)
+    
+    def _sample_actions_with_grad(
+        self,
+        obs_cond: torch.Tensor,
+        grad_steps: int,
+    ) -> torch.Tensor:
+        """Sample actions with gradient flowing through the last `grad_steps` flow steps.
+        
+        This implements configurable gradient chain length for Q-loss backpropagation.
+        
+        Args:
+            obs_cond: Observation conditioning [B, global_cond_dim]
+            grad_steps: Number of steps to keep gradients (from the end)
+            
+        Returns:
+            actions: (B, pred_horizon, action_dim) generated actions with gradient
+        """
+        B = obs_cond.shape[0]
+        device = obs_cond.device
+        
+        x = torch.randn(B, self.pred_horizon, self.action_dim, device=device)
+        dt = 1.0 / self.num_flow_steps
+        
+        # Steps without gradient (first N - grad_steps)
+        no_grad_steps = self.num_flow_steps - grad_steps
+        
+        if no_grad_steps > 0:
+            with torch.no_grad():
+                for i in range(no_grad_steps):
+                    t = torch.full((B,), i * dt, device=device)
+                    v = self.velocity_net(x, t, global_cond=obs_cond)
+                    x = x + v * dt
+        
+        # Steps with gradient (last grad_steps)
+        for i in range(no_grad_steps, self.num_flow_steps):
+            t = torch.full((B,), i * dt, device=device)
+            v = self.velocity_net(x, t, global_cond=obs_cond)
+            x = x + v * dt
+        
+        return x
+    
+    def _sample_actions_single_step(
+        self,
+        obs_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single-step flow sampling for fast Q-loss computation.
+        
+        Directly predict velocity at t=0 and step to t=1 in one step.
+        This is equivalent to predicting x_1 = x_0 + v(x_0, 0) * 1.0
+        
+        Args:
+            obs_cond: Observation conditioning [B, global_cond_dim]
+            
+        Returns:
+            actions: (B, pred_horizon, action_dim) generated actions
+        """
+        B = obs_cond.shape[0]
+        device = obs_cond.device
+        
+        # Start from noise
+        x_0 = torch.randn(B, self.pred_horizon, self.action_dim, device=device)
+        
+        # Single step: predict velocity at t=0, step to t=1
+        t = torch.zeros(B, device=device)
+        v = self.velocity_net(x_0, t, global_cond=obs_cond)
+        x_1 = x_0 + v * 1.0  # dt = 1.0 for single step
+        
+        return x_1
     
     def update_ema(self):
         """Update EMA velocity network.
