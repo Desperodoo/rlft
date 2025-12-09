@@ -60,6 +60,7 @@ from diffusion_policy.algorithms import (
     ShortCutVelocityUNet1D,
     DiffusionDoubleQAgent,
     CPQLAgent,
+    AWCPAgent,
     DPPOAgent,
     ReinFlowAgent,
 )
@@ -137,6 +138,7 @@ class Args:
         "shortcut_flow",
         "diffusion_double_q", 
         "cpql",
+        "awcp",
         "dppo",
         "reinflow"
     ] = "diffusion_policy"
@@ -215,6 +217,12 @@ class Args:
     """Q-gradient mode: whole_grad (full chain), last_few (partial), single_step (fast approx)"""
     q_grad_steps: int = 5
     """Number of steps with gradient in last_few mode"""
+    
+    # AWCP (Advantage-Weighted Consistency Policy) specific hyperparameters
+    beta: float = 1.0
+    """Temperature for advantage weighting in AWCP (higher = more selective)"""
+    weight_clip: float = 10.0
+    """Maximum weight to prevent outlier dominance in AWCP"""
 
     # Logging settings
     log_freq: int = 1000
@@ -717,6 +725,42 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             ema_decay=args.ema_decay,
             q_grad_mode=args.q_grad_mode,
             q_grad_steps=args.q_grad_steps,
+            device=device,
+        )
+    
+    elif algorithm == "awcp":
+        velocity_net = VelocityUNet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        # Q-Network for advantage weighting
+        q_network = DoubleQNetwork(
+            action_dim=action_dim,
+            obs_dim=global_cond_dim,
+            action_horizon=args.act_horizon,
+        )
+        
+        return AWCPAgent(
+            velocity_net=velocity_net,
+            q_network=q_network,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            act_horizon=args.act_horizon,
+            num_flow_steps=args.num_flow_steps,
+            beta=args.beta,  # AWCP temperature parameter
+            bc_weight=args.bc_weight,
+            consistency_weight=args.consistency_weight,
+            gamma=args.gamma,
+            tau=args.tau,
+            reward_scale=args.reward_scale,
+            q_target_clip=args.q_target_clip,
+            ema_decay=args.ema_decay,
+            weight_clip=args.weight_clip,
             device=device,
         )
     

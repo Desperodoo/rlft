@@ -12,6 +12,7 @@ Available algorithms:
 - ShortCutFlowAgent: ShortCut Flow with adaptive step sizes
 - DiffusionDoubleQAgent: Diffusion Policy + Double Q-Learning for offline RL  
 - CPQLAgent: Consistency Policy Q-Learning for offline RL
+- AWCPAgent: Advantage-Weighted Consistency Policy (AWAC-style Q-weighted BC)
 - DPPOAgent: DDPM policy with partial chain fine-tuning (for online RL)
 - ReinFlowAgent: Flow matching with learnable exploration noise (for online RL)
 """
@@ -23,6 +24,7 @@ from .consistency_flow import ConsistencyFlowAgent
 from .shortcut_flow import ShortCutFlowAgent, ShortCutVelocityUNet1D
 from .diffusion_double_q import DiffusionDoubleQAgent
 from .cpql import CPQLAgent
+from .awcp import AWCPAgent
 from .dppo import DPPOAgent, ValueNetwork
 from .reinflow import ReinFlowAgent, NoisyVelocityUNet1D, ExploreNoiseNet
 from .networks import DoubleQNetwork, VelocityUNet1D
@@ -36,6 +38,7 @@ __all__ = [
     "ShortCutVelocityUNet1D",
     "DiffusionDoubleQAgent", 
     "CPQLAgent",
+    "AWCPAgent",
     "DPPOAgent",
     "ReinFlowAgent",
     "ValueNetwork",
