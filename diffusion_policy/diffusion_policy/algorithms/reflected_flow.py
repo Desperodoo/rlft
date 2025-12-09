@@ -95,16 +95,11 @@ class ReflectedFlowAgent(nn.Module):
             # Hard reflection: reflect x_t and compute adjusted velocity
             x_t_reflected = self._reflect_trajectory(x_t)
             
-            # Velocity is gradient of flow from x_0 to x_1
-            # After reflection, we need to adjust the target
-            v_target = x_1 - x_0  # Standard CFM velocity
-            
-            # Check if we crossed boundary
-            crossed_low = x_t < self.action_low
-            crossed_high = x_t > self.action_high
-            
-            # Flip velocity component for reflected dimensions
-            v_target = torch.where(crossed_low | crossed_high, -v_target, v_target)
+            # Velocity target: direction from x_t_reflected to x_1
+            # After reflection, the target should point towards the data
+            # Use remaining time to scale the velocity properly
+            remaining_time = 1.0 - t_expand + 1e-6  # avoid division by zero
+            v_target = (x_1 - x_t_reflected) / remaining_time
             
             return x_t_reflected, v_target
         else:

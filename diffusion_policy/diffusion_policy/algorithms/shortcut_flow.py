@@ -10,6 +10,7 @@ import copy
 import math
 
 from diffusion_policy.conditional_unet1d import ConditionalUnet1D
+from .networks import soft_update
 
 
 class ShortCutVelocityUNet1D(nn.Module):
@@ -99,6 +100,7 @@ class ShortCutFlowAgent(nn.Module):
         self_consistency_k: float = 0.25,  # Fraction of batch for consistency
         flow_weight: float = 1.0,
         shortcut_weight: float = 1.0,
+        ema_decay: float = 0.999,
         device: str = "cuda",
     ):
         super().__init__()
@@ -110,7 +112,13 @@ class ShortCutFlowAgent(nn.Module):
         self.self_consistency_k = self_consistency_k
         self.flow_weight = flow_weight
         self.shortcut_weight = shortcut_weight
+        self.ema_decay = ema_decay
         self.device = device
+        
+        # EMA velocity network for stable shortcut targets
+        self.velocity_net_ema = copy.deepcopy(velocity_net)
+        for param in self.velocity_net_ema.parameters():
+            param.requires_grad = False
         
         # Log2 of max steps for step size sampling
         self.log_max_steps = int(math.log2(max_denoising_steps))
@@ -135,19 +143,19 @@ class ShortCutFlowAgent(nn.Module):
     ) -> torch.Tensor:
         """
         Compute shortcut target: what velocity would take us 2d steps instead of d.
-        Uses two small steps to compute the target for one large step.
+        Uses two small steps with EMA network to compute the target for one large step.
         
         v(x_t, t, 2d) ≈ v(x_t, t, d) + d * v(x_{t+d}, t+d, d)
         """
         with torch.no_grad():
-            # First step with step size d
-            v_1 = self.velocity_net(x_t, t, d, obs_features)
+            # First step with step size d (using EMA for stable targets)
+            v_1 = self.velocity_net_ema(x_t, t, d, obs_features)
             d_expand = d.view(-1, 1, 1)
             x_t_plus_d = x_t + d_expand * v_1
             
             # Second step from t+d with step size d
             t_plus_d = t + d
-            v_2 = self.velocity_net(x_t_plus_d, t_plus_d, d, obs_features)
+            v_2 = self.velocity_net_ema(x_t_plus_d, t_plus_d, d, obs_features)
             
             # Combined velocity for step size 2d
             # v(t, 2d) should equal (v(t, d) + v(t+d, d)) / 2 for 2d total movement
@@ -243,12 +251,21 @@ class ShortCutFlowAgent(nn.Module):
             "shortcut_loss": shortcut_loss,
         }
     
+    def update_ema(self):
+        """Update EMA velocity network.
+        
+        Formula: θ_ema = ema_decay * θ_ema + (1 - ema_decay) * θ
+        Equivalent to: soft_update(ema, source, tau=1-ema_decay)
+        """
+        soft_update(self.velocity_net_ema, self.velocity_net, 1 - self.ema_decay)
+    
     @torch.no_grad()
     def get_action(
         self,
         obs_features: torch.Tensor,
         num_steps: Optional[int] = None,
         adaptive: bool = True,
+        use_ema: bool = True,
     ) -> torch.Tensor:
         """
         Generate action using ShortCut flow with adaptive step sizes.
@@ -257,11 +274,13 @@ class ShortCutFlowAgent(nn.Module):
             obs_features: Encoded observation [B, obs_horizon, obs_dim]
             num_steps: Override number of steps (uses max possible step size)
             adaptive: If True, use learned adaptive steps; else use uniform steps
+            use_ema: Whether to use EMA network for sampling (default: True)
             
         Returns:
             actions: Generated action sequence [B, pred_horizon, action_dim]
         """
         self.velocity_net.eval()
+        net = self.velocity_net_ema if use_ema else self.velocity_net
         batch_size = obs_features.shape[0]
         device = obs_features.device
         
@@ -290,7 +309,7 @@ class ShortCutFlowAgent(nn.Module):
                 
                 d = torch.full((batch_size,), d_val, device=device)
                 
-                v = self.velocity_net(x, t, d, obs_features)
+                v = net(x, t, d, obs_features)
                 x = x + d.view(-1, 1, 1) * v
                 t = t + d
                 
@@ -305,7 +324,7 @@ class ShortCutFlowAgent(nn.Module):
             
             for i in range(steps):
                 t = torch.full((batch_size,), i * dt, device=device)
-                v = self.velocity_net(x, t, d, obs_features)
+                v = net(x, t, d, obs_features)
                 x = x + dt * v
         
         # Clamp to action bounds

@@ -46,12 +46,23 @@ class ConsistencyFlowAgent(nn.Module):
         self.flow_weight = flow_weight
         self.consistency_weight = consistency_weight
         self.ema_decay = ema_decay
-        self.consistency_delta = consistency_delta
+        self.consistency_delta = consistency_delta  # Not used anymore, kept for API compatibility
         self.device = device
         
+        # Consistency loss hyperparameters (aligned with best practices)
+        self.t_min = 0.05  # Avoid boundary instability at t≈0
+        self.t_max = 0.95  # Avoid boundary instability at t≈1
+        self.delta_min = 0.02  # Minimum delta for consistency
+        self.delta_max = 0.15  # Maximum delta (avoid large teacher error)
+        self.teacher_steps = 2  # Multi-step teacher for accurate targets
+        
     def update_ema(self):
-        """Update EMA velocity network."""
-        soft_update(self.velocity_net_ema, self.velocity_net, self.ema_decay)
+        """Update EMA velocity network.
+        
+        Formula: θ_ema = ema_decay * θ_ema + (1 - ema_decay) * θ
+        Equivalent to: soft_update(ema, source, tau=1-ema_decay)
+        """
+        soft_update(self.velocity_net_ema, self.velocity_net, 1 - self.ema_decay)
     
     def _get_consistency_targets(
         self,
@@ -118,30 +129,35 @@ class ConsistencyFlowAgent(nn.Module):
         flow_loss = F.mse_loss(v_pred, v_target)
         
         # Consistency loss: predictions from t and t+delta should reach same endpoint
+        # Using velocity space loss for gradient stability
         consistency_loss = torch.tensor(0.0, device=actions.device)
         if self.consistency_weight > 0:
-            # Sample another time slightly ahead
-            t_plus = torch.clamp(t + self.consistency_delta, max=1.0)
+            # Sample t in restricted range [t_min, t_max] to avoid boundary instability
+            t_cons = self.t_min + torch.rand(batch_size, device=actions.device) * (self.t_max - self.t_min)
             
-            # Get x at t_plus
+            # Random delta in [delta_min, delta_max], clamped to not exceed t_max
+            delta_t = self.delta_min + torch.rand(batch_size, device=actions.device) * (self.delta_max - self.delta_min)
+            t_plus = torch.clamp(t_cons + delta_t, max=self.t_max)
+            
+            # Get x at both time points (using same x_0 for consistency)
+            t_cons_expand = t_cons.view(-1, 1, 1)
             t_plus_expand = t_plus.view(-1, 1, 1)
+            x_t_cons = (1 - t_cons_expand) * x_0 + t_cons_expand * actions
             x_t_plus = (1 - t_plus_expand) * x_0 + t_plus_expand * actions
             
-            # One-step prediction from t
+            # Teacher: multi-step integration from t_plus to 1 using EMA network
             with torch.no_grad():
-                # Integrate from t to 1 using EMA
-                target_from_t = self._get_consistency_targets(
-                    x_t, t, obs_features, num_steps=2
+                target_x1 = self._get_consistency_targets(
+                    x_t_plus, t_plus, obs_features, num_steps=self.teacher_steps
                 )
             
-            # One-step prediction from t_plus using current model
-            # Integrate from t_plus to 1
-            v_from_t_plus = self.velocity_net(x_t_plus, t_plus, obs_features)
-            remaining = (1.0 - t_plus).view(-1, 1, 1)
-            pred_from_t_plus = x_t_plus + v_from_t_plus * remaining
+            # Student: predict velocity at t_plus, compute implied x1
+            # The target velocity is: v_target = (target_x1 - x_0) 
+            # This is in velocity space for gradient stability
+            v_target = target_x1 - x_0
+            v_pred = self.velocity_net(x_t_plus, t_plus, obs_features)
             
-            # Consistency: both should predict same endpoint
-            consistency_loss = F.mse_loss(pred_from_t_plus, target_from_t)
+            consistency_loss = F.mse_loss(v_pred, v_target)
         
         total_loss = (
             self.flow_weight * flow_loss + 

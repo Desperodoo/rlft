@@ -39,6 +39,7 @@ class CPQLAgent(nn.Module):
         action_dim: Dimension of action space
         obs_horizon: Number of observation frames (default: 2)
         pred_horizon: Length of action sequence to predict (default: 16)
+        act_horizon: Length of action sequence for Q-learning (default: 8)
         num_flow_steps: Number of ODE integration steps (default: 10)
         alpha: Weight for Q-value term (default: 0.01)
         bc_weight: Weight for flow matching loss (default: 1.0)
@@ -58,6 +59,7 @@ class CPQLAgent(nn.Module):
         action_dim: int,
         obs_horizon: int = 2,
         pred_horizon: int = 16,
+        act_horizon: int = 8,
         num_flow_steps: int = 10,
         alpha: float = 0.01,
         bc_weight: float = 1.0,
@@ -76,6 +78,7 @@ class CPQLAgent(nn.Module):
         self.action_dim = action_dim
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
+        self.act_horizon = act_horizon
         self.num_flow_steps = num_flow_steps
         self.alpha = alpha
         self.bc_weight = bc_weight
@@ -86,6 +89,13 @@ class CPQLAgent(nn.Module):
         self.q_target_clip = q_target_clip
         self.ema_decay = ema_decay
         self.device = device
+        
+        # Consistency loss hyperparameters (aligned with best practices)
+        self.t_min = 0.05  # Avoid boundary instability at t≈0
+        self.t_max = 0.95  # Avoid boundary instability at t≈1
+        self.delta_min = 0.02  # Minimum delta for consistency
+        self.delta_max = 0.15  # Maximum delta (avoid large teacher error)
+        self.teacher_steps = 2  # Multi-step teacher for accurate targets
         
         # EMA velocity network for consistency loss
         self.velocity_net_ema = copy.deepcopy(self.velocity_net)
@@ -104,6 +114,8 @@ class CPQLAgent(nn.Module):
         rewards: torch.Tensor,
         next_obs_features: torch.Tensor,
         dones: torch.Tensor,
+        # actions_for_q: act_horizon length actions for Q-learning (matches reward horizon)
+        actions_for_q: Optional[torch.Tensor] = None,
         # SMDP chunk-level fields (optional, for proper action chunking)
         cumulative_reward: Optional[torch.Tensor] = None,
         chunk_done: Optional[torch.Tensor] = None,
@@ -118,10 +130,11 @@ class CPQLAgent(nn.Module):
         
         Args:
             obs_features: Encoded observation features [B, obs_horizon, obs_dim] or [B, global_cond_dim]
-            actions: (B, pred_horizon, action_dim) expert action sequence
+            actions: (B, pred_horizon, action_dim) expert action sequence for BC training
             rewards: (B,) or (B, 1) single-step rewards (used if cumulative_reward not provided)
             next_obs_features: Next observation features (s_{t+τ} for SMDP)
             dones: (B,) or (B, 1) done flags (used if chunk_done not provided)
+            actions_for_q: (B, act_horizon, action_dim) action sequence for Q-learning (matches reward)
             cumulative_reward: (B,) or (B, 1) SMDP cumulative discounted reward R_t^(τ)
             chunk_done: (B,) or (B, 1) SMDP done flag (1 if episode ends within chunk)
             discount_factor: (B,) or (B, 1) SMDP discount γ^τ
@@ -129,6 +142,10 @@ class CPQLAgent(nn.Module):
         Returns:
             Dict with loss components
         """
+        # Use actions_for_q if provided, otherwise use full actions (backward compatibility)
+        if actions_for_q is None:
+            actions_for_q = actions
+        
         # Flatten obs_features if 3D
         if obs_features.dim() == 3:
             obs_cond = obs_features.reshape(obs_features.shape[0], -1)
@@ -140,27 +157,29 @@ class CPQLAgent(nn.Module):
         else:
             next_obs_cond = next_obs_features
         
-        # Compute policy loss
-        policy_dict = self._compute_policy_loss(obs_cond, actions)
+        # Compute policy loss (BC uses full pred_horizon, Q uses act_horizon)
+        policy_dict = self._compute_policy_loss(obs_cond, actions, actions_for_q)
         
-        # Compute critic loss (with SMDP support)
+        # Compute critic loss (uses act_horizon actions to match reward)
+        # IMPORTANT: Detach obs_cond and next_obs_cond for critic to prevent
+        # gradients from flowing back to visual encoder through critic loss
         critic_loss = self._compute_critic_loss(
-            obs_cond, next_obs_cond, actions, rewards, dones,
+            obs_cond.detach(), next_obs_cond.detach(), actions_for_q, rewards, dones,
             cumulative_reward=cumulative_reward,
             chunk_done=chunk_done,
             discount_factor=discount_factor,
         )
         
-        # Total loss
-        total_loss = policy_dict["policy_loss"] + critic_loss
-        
+        # Return policy_loss and critic_loss separately (NOT summed)
+        # This allows train_offline_rl.py to do separate backward passes
         return {
-            "loss": total_loss,
-            "policy_loss": policy_dict["policy_loss"],
+            "loss": policy_dict["policy_loss"] + critic_loss,  # For logging only
+            "actor_loss": policy_dict["policy_loss"],  # Alias for compatibility
+            "policy_loss": policy_dict["policy_loss"],  # For actor backward
             "flow_loss": policy_dict["flow_loss"],
             "consistency_loss": policy_dict["consistency_loss"],
             "q_policy_loss": policy_dict["q_policy_loss"],
-            "critic_loss": critic_loss,
+            "critic_loss": critic_loss,  # For critic backward
             "q_mean": policy_dict["q_mean"],
         }
     
@@ -174,15 +193,27 @@ class CPQLAgent(nn.Module):
         t_expand = t.view(-1, 1, 1)  # (B, 1, 1) for (B, T, D)
         return (1 - t_expand) * x_0 + t_expand * x_1
     
-    def _compute_policy_loss(self, obs_cond: torch.Tensor, action_seq: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Compute policy loss: Flow BC + Consistency + Q-value."""
+    def _compute_policy_loss(
+        self, 
+        obs_cond: torch.Tensor, 
+        action_seq: torch.Tensor,
+        actions_for_q_input: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute policy loss: Flow BC + Consistency + Q-value.
+        
+        Args:
+            obs_cond: Observation conditioning [B, global_cond_dim]
+            action_seq: Full pred_horizon actions for BC training [B, pred_horizon, action_dim]
+            actions_for_q_input: act_horizon actions for Q-learning [B, act_horizon, action_dim]
+        """
         B = action_seq.shape[0]
         device = action_seq.device
+        act_horizon = actions_for_q_input.shape[1]
         
         # Sample noise x_0 ~ N(0, I)
         x_0 = torch.randn_like(action_seq)
         
-        # ===== Flow Matching Loss =====
+        # ===== Flow Matching Loss (uses full pred_horizon) =====
         t = torch.rand(B, device=device)
         x_t = self._linear_interpolate(x_0, action_seq, t)
         
@@ -193,29 +224,40 @@ class CPQLAgent(nn.Module):
         v_pred = self.velocity_net(x_t, t, global_cond=obs_cond)
         flow_loss = F.mse_loss(v_pred, v_target)
         
-        # ===== Consistency Loss =====
-        # Sample t in [0.05, 0.95] and compute consistency between t and t+delta
-        t_cons = 0.05 + torch.rand(B, device=device) * 0.9
-        delta_t = torch.rand(B, device=device) * (0.99 - t_cons)
-        delta_t = torch.clamp(delta_t, min=0.02)
-        t_next = torch.clamp(t_cons + delta_t, max=0.99)
+        # ===== Consistency Loss (uses full pred_horizon) =====
+        # Sample t in restricted range [t_min, t_max] to avoid boundary instability
+        t_cons = self.t_min + torch.rand(B, device=device) * (self.t_max - self.t_min)
         
-        x_t_cons = self._linear_interpolate(x_0, action_seq, t_cons)
-        x_t_next = self._linear_interpolate(x_0, action_seq, t_next)
+        # Random delta in [delta_min, delta_max], clamped to not exceed t_max
+        delta_t = self.delta_min + torch.rand(B, device=device) * (self.delta_max - self.delta_min)
+        t_plus = torch.clamp(t_cons + delta_t, max=self.t_max)
         
-        # Teacher prediction at t_next using EMA network
+        # Get x at t_plus (student input point - Consistency Flow style)
+        x_t_plus = self._linear_interpolate(x_0, action_seq, t_plus)
+        
+        # Teacher: multi-step integration from t_plus to 1 using EMA network
         with torch.no_grad():
-            v_teacher = self.velocity_net_ema(x_t_next, t_next, global_cond=obs_cond)
-            t_next_expand = t_next.view(-1, 1, 1)
-            pred_x1 = x_t_next + (1 - t_next_expand) * v_teacher
+            x_teacher = x_t_plus.clone()
+            current_t = t_plus.clone()
+            remaining_time = 1.0 - current_t
+            dt_teacher = remaining_time / self.teacher_steps
+            
+            for _ in range(self.teacher_steps):
+                v_teacher = self.velocity_net_ema(x_teacher, current_t, global_cond=obs_cond)
+                dt_expand = dt_teacher.view(-1, 1, 1)
+                x_teacher = x_teacher + v_teacher * dt_expand
+                current_t = current_t + dt_teacher
+            
+            target_x1 = x_teacher
         
-        # Student should predict same x_1 from earlier t
-        v_cons_target = pred_x1 - x_0
-        v_cons_pred = self.velocity_net(x_t_cons, t_cons, global_cond=obs_cond)
+        # Student: predict velocity at t_plus
+        # Target velocity in velocity space: v_target = target_x1 - x_0
+        v_cons_target = target_x1 - x_0
+        v_cons_pred = self.velocity_net(x_t_plus, t_plus, global_cond=obs_cond)
         consistency_loss = F.mse_loss(v_cons_pred, v_cons_target)
         
-        # ===== Q-Value Maximization Loss =====
-        # Generate actions using flow ODE (only last step is differentiable)
+        # ===== Q-Value Maximization Loss (uses act_horizon) =====
+        # Generate full pred_horizon actions using flow ODE, then truncate to act_horizon
         x_for_q = torch.randn(B, self.pred_horizon, self.action_dim, device=device)
         dt = 1.0 / self.num_flow_steps
         
@@ -228,8 +270,11 @@ class CPQLAgent(nn.Module):
         # Last step with gradient
         t_last = torch.full((B,), (self.num_flow_steps - 1) * dt, device=device)
         v_last = self.velocity_net(x_for_q, t_last, global_cond=obs_cond)
-        actions_for_q = x_for_q + v_last * dt
-        actions_for_q = torch.clamp(actions_for_q, -1.0, 1.0)
+        generated_actions_full = x_for_q + v_last * dt
+        generated_actions_full = torch.clamp(generated_actions_full, -1.0, 1.0)
+        
+        # Truncate to act_horizon for Q-value computation
+        actions_for_q = generated_actions_full[:, :act_horizon, :]
         
         # IMPORTANT: We need gradients to flow to policy (velocity_net) but NOT to critic
         # The Q-maximization gradient should only update the policy, not the critic
@@ -243,8 +288,8 @@ class CPQLAgent(nn.Module):
             p.requires_grad = True
         
         # Clip Q-values to prevent explosion in policy optimization
-        if self.q_target_clip is not None:
-            q_value = torch.clamp(q_value, -self.q_target_clip, self.q_target_clip)
+        # if self.q_target_clip is not None:
+        #     q_value = torch.clamp(q_value, -self.q_target_clip, self.q_target_clip)
         
         q_loss = -q_value.mean()
         
@@ -311,8 +356,10 @@ class CPQLAgent(nn.Module):
         scaled_rewards = r * self.reward_scale
         
         with torch.no_grad():
-            # Sample next actions using EMA policy
-            next_actions = self._sample_actions_batch(next_obs_cond, use_ema=True)
+            # Sample next actions using EMA policy (full pred_horizon)
+            next_actions_full = self._sample_actions_batch(next_obs_cond, use_ema=True)
+            # Truncate to act_horizon to match Q-network input
+            next_actions = next_actions_full[:, :self.act_horizon, :]
             
             # Compute target Q-values
             target_q1, target_q2 = self.critic_target(next_actions, next_obs_cond)
@@ -354,10 +401,12 @@ class CPQLAgent(nn.Module):
         return torch.clamp(x, -1.0, 1.0)
     
     def update_ema(self):
-        """Update EMA velocity network."""
-        with torch.no_grad():
-            for ema_p, p in zip(self.velocity_net_ema.parameters(), self.velocity_net.parameters()):
-                ema_p.data.mul_(self.ema_decay).add_(p.data, alpha=1 - self.ema_decay)
+        """Update EMA velocity network.
+        
+        Formula: θ_ema = ema_decay * θ_ema + (1 - ema_decay) * θ
+        Equivalent to: soft_update(ema, source, tau=1-ema_decay)
+        """
+        soft_update(self.velocity_net_ema, self.velocity_net, 1 - self.ema_decay)
     
     def update_target(self):
         """Soft update target critic network."""

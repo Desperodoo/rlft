@@ -1,0 +1,190 @@
+#!/bin/bash
+#
+# Sweep Q-gradient chain length for Diffusion Double Q
+#
+# This script tests different gradient chain lengths:
+# - single_step: Fast approximation, gradient only at t=1->0
+# - last_few with different q_grad_steps: Partial chain gradient
+# - whole_grad: Full chain gradient (slow but theoretically correct)
+#
+# Reference: Diffusion-QL (Zhendong Wang et al.)
+# https://github.com/Zhendong-Wang/Diffusion-Policies-for-Offline-RL
+#
+# Usage: ./sweep_q_grad_steps.sh [--dry-run] [--gpu GPU_ID] [--env ENV_ID]
+
+set -e
+
+# Default configurations
+GPU_ID=0
+DRY_RUN=false
+TOTAL_ITERS=30000
+EVAL_FREQ=2000
+LOG_FREQ=100
+NUM_EVAL_EPISODES=100
+NUM_EVAL_ENVS=100
+NUM_DEMOS=1000
+SIM_BACKEND="physx_cuda"
+WANDB_PROJECT="maniskill_q_grad_sweep"
+MAX_EPISODE_STEPS=100
+ENV_ID="LiftPegUpright-v1"
+CONTROL_MODE="pd_ee_delta_pose"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --gpu)
+            GPU_ID="$2"
+            shift 2
+            ;;
+        --env)
+            ENV_ID="$2"
+            shift 2
+            ;;
+        --iters)
+            TOTAL_ITERS="$2"
+            shift 2
+            ;;
+        --num-demos)
+            NUM_DEMOS="$2"
+            shift 2
+            ;;
+        --wandb-project)
+            WANDB_PROJECT="$2"
+            shift 2
+            ;;
+        --control-mode)
+            CONTROL_MODE="$2"
+            shift 2
+            ;;
+        --sim-backend)
+            SIM_BACKEND="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Demo path based on environment
+DEMO_PATH="$HOME/.maniskill/demos/${ENV_ID}/rl/trajectory.rgb.${CONTROL_MODE}.physx_cuda.h5"
+
+# Seeds for multiple runs
+SEEDS=(0)
+
+# Q-gradient modes to sweep
+Q_GRAD_CONFIGS=(
+    "single_step:0"      # Fast approximation
+    "last_few:1"         # last 1 step
+    "last_few:3"         # last 3 steps
+    "last_few:5"         # last 5 steps (default)
+    "last_few:10"        # last 10 steps
+    "last_few:20"        # last 20 steps
+    "whole_grad:0"       # Full chain (slow but accurate)
+)
+
+echo "=========================================="
+echo "Q-gradient Chain Length Sweep"
+echo "=========================================="
+echo "GPU: $GPU_ID"
+echo "Algorithm: diffusion_double_q"
+echo "Environment: $ENV_ID"
+echo "Control Mode: $CONTROL_MODE"
+echo "Sim Backend: $SIM_BACKEND"
+echo "Demo Path: $DEMO_PATH"
+echo "Q-grad configs: ${Q_GRAD_CONFIGS[*]}"
+echo "Seeds: ${SEEDS[*]}"
+echo "Total iterations: $TOTAL_ITERS"
+echo "Eval frequency: $EVAL_FREQ"
+echo "Num demos: $NUM_DEMOS"
+echo "Dry run: $DRY_RUN"
+echo "=========================================="
+echo ""
+
+# Change to the diffusion_policy directory
+cd /home/amax/rlft/diffusion_policy
+
+# Check if demo file exists
+if [ ! -f "$DEMO_PATH" ]; then
+    echo "Error: Demo file not found: $DEMO_PATH"
+    echo "Please check the environment ID and demo path."
+    exit 1
+fi
+
+# Calculate total experiments
+TOTAL_EXPS=$((${#Q_GRAD_CONFIGS[@]} * ${#SEEDS[@]}))
+EXP_IDX=0
+
+for config in "${Q_GRAD_CONFIGS[@]}"; do
+    # Parse config (format: "mode:steps")
+    Q_GRAD_MODE="${config%%:*}"
+    Q_GRAD_STEPS="${config##*:}"
+    
+    for seed in "${SEEDS[@]}"; do
+        EXP_IDX=$((EXP_IDX + 1))
+        
+        # Generate experiment name
+        if [ "$Q_GRAD_MODE" = "single_step" ]; then
+            exp_name="ddql-${ENV_ID}-q_grad-single_step-seed${seed}"
+        elif [ "$Q_GRAD_MODE" = "whole_grad" ]; then
+            exp_name="ddql-${ENV_ID}-q_grad-whole-seed${seed}"
+        else
+            exp_name="ddql-${ENV_ID}-q_grad-last_${Q_GRAD_STEPS}-seed${seed}"
+        fi
+        
+        echo "[$EXP_IDX/$TOTAL_EXPS] Running: $exp_name"
+        
+        # Build command
+        CMD="CUDA_VISIBLE_DEVICES=$GPU_ID python train_offline_rl.py \
+            --algorithm diffusion_double_q \
+            --env_id $ENV_ID \
+            --obs_mode rgb \
+            --demo_path $DEMO_PATH \
+            --control-mode $CONTROL_MODE \
+            --sim-backend $SIM_BACKEND \
+            --num-demos $NUM_DEMOS \
+            --seed $seed \
+            --total_iters $TOTAL_ITERS \
+            --eval_freq $EVAL_FREQ \
+            --log_freq $LOG_FREQ \
+            --num_eval_episodes $NUM_EVAL_EPISODES \
+            --num_eval_envs $NUM_EVAL_ENVS \
+            --exp_name $exp_name \
+            --track \
+            --wandb_project_name $WANDB_PROJECT \
+            --max_episode_steps $MAX_EPISODE_STEPS \
+            --q_grad_mode $Q_GRAD_MODE \
+            --alpha 0.2"
+        
+        # Add q_grad_steps for last_few mode
+        if [ "$Q_GRAD_MODE" = "last_few" ]; then
+            CMD="$CMD --q_grad_steps $Q_GRAD_STEPS"
+        fi
+        
+        if [ "$DRY_RUN" = true ]; then
+            echo "  [DRY RUN] Would execute:"
+            echo "  $CMD"
+            echo ""
+        else
+            echo "  Starting..."
+            # Run and capture output
+            if eval "$CMD"; then
+                echo "  ✓ $exp_name completed successfully"
+            else
+                echo "  ✗ $exp_name failed"
+                # Continue with other experiments even if one fails
+            fi
+        fi
+        
+        echo ""
+    done
+done
+
+echo "=========================================="
+echo "Q-gradient sweep completed!"
+echo "=========================================="

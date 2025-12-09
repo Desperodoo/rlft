@@ -60,6 +60,8 @@ from diffusion_policy.algorithms import (
     ShortCutVelocityUNet1D,
     DiffusionDoubleQAgent,
     CPQLAgent,
+    DPPOAgent,
+    ReinFlowAgent,
 )
 from diffusion_policy.algorithms.networks import VelocityUNet1D, DoubleQNetwork
 
@@ -134,13 +136,19 @@ class Args:
         "consistency_flow", 
         "shortcut_flow",
         "diffusion_double_q", 
-        "cpql"
+        "cpql",
+        "dppo",
+        "reinflow"
     ] = "diffusion_policy"
     """algorithm to train"""
     
     # Diffusion Policy specific hyperparameters
     num_diffusion_iters: int = 100
     """number of diffusion iterations for DDPM"""
+    
+    # DPPO specific hyperparameters
+    ft_denoising_steps: int = 5
+    """number of denoising steps to fine-tune (for DPPO)"""
     
     # Flow variant specific hyperparameters
     reflection_mode: Literal["hard", "soft"] = "hard"
@@ -155,7 +163,7 @@ class Args:
     """EMA decay rate for consistency_flow"""
 
     # Offline RL hyperparameters (inherited from toy_diffusion_rl)
-    alpha: float = 0.1
+    alpha: float = 0.01
     """Q-value weight for diffusion_double_q (0.01 for cpql)"""
     bc_weight: float = 1.0
     """BC/flow matching loss weight"""
@@ -171,6 +179,12 @@ class Args:
     """Q target clipping"""
     num_flow_steps: int = 10
     """ODE integration steps for flow matching"""
+    
+    # Diffusion Double Q specific hyperparameters
+    q_grad_mode: Literal["whole_grad", "last_few", "single_step"] = "last_few"
+    """Q-gradient mode: whole_grad (full chain), last_few (partial), single_step (fast approx)"""
+    q_grad_steps: int = 5
+    """Number of steps with gradient in last_few mode"""
 
     # Logging settings
     log_freq: int = 1000
@@ -424,13 +438,45 @@ class OfflineRLDataset(Dataset):
                 pad_action = act_seq[-1]
             act_seq = torch.cat([act_seq, pad_action.repeat(end - L, 1)], dim=0)
         
+        # Get act_horizon action sequence for Q-learning (matches SMDP reward horizon)
+        # IMPORTANT: Use effective_length (not act_horizon) to match the reward computation
+        # This ensures act_seq_for_q only contains actions that contributed to cumulative_reward
+        act_start = max(0, start)
+        act_effective_end = min(act_start + effective_length, L)  # Use effective_length!
+        act_seq_for_q = self.trajectories["actions"][traj_idx][act_start:act_effective_end]
+        
+        # Handle edge case: empty sequence (start >= L)
+        if act_seq_for_q.shape[0] == 0:
+            # Use the last action in trajectory
+            act_seq_for_q = self.trajectories["actions"][traj_idx][L-1:L]
+        
+        # Pad at beginning if start < 0
+        if start < 0:
+            act_seq_for_q = torch.cat([act_seq_for_q[0].repeat(-start, 1), act_seq_for_q], dim=0)
+        
+        # Pad at end to reach act_horizon (for fixed-size Q-network input)
+        # These padded actions are "invalid" - they occur after episode termination
+        if act_seq_for_q.shape[0] < self.act_horizon:
+            pad_len = self.act_horizon - act_seq_for_q.shape[0]
+            if self.pad_action_arm is not None:
+                gripper_action = act_seq_for_q[-1, -1]
+                pad_action = torch.cat((self.pad_action_arm, gripper_action[None]), dim=0)
+            else:
+                pad_action = act_seq_for_q[-1]
+            act_seq_for_q = torch.cat([act_seq_for_q, pad_action.repeat(pad_len, 1)], dim=0)
+        
+        # Truncate if longer than act_horizon (can happen with padding at beginning)
+        act_seq_for_q = act_seq_for_q[:self.act_horizon]
+        
         assert obs_seq["state"].shape[0] == self.obs_horizon
         assert act_seq.shape[0] == self.pred_horizon
+        assert act_seq_for_q.shape[0] == self.act_horizon
         
         return {
             "observations": obs_seq,
             "next_observations": next_obs_seq,
-            "actions": act_seq,
+            "actions": act_seq,  # Full pred_horizon for policy BC training
+            "actions_for_q": act_seq_for_q,  # act_horizon for Q-learning (matches reward horizon)
             # SMDP chunk-level fields (on same device as other tensors)
             "cumulative_reward": torch.tensor(cumulative_reward, dtype=torch.float32, device=self.device),
             "chunk_done": torch.tensor(chunk_done, dtype=torch.float32, device=self.device),
@@ -566,13 +612,11 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             n_groups=args.n_groups,
         )
         
+        # Q-Network: simple MLP, uses act_horizon to match SMDP reward horizon
         q_network = DoubleQNetwork(
-            input_dim=action_dim,
-            global_cond_dim=global_cond_dim,
-            pred_horizon=args.pred_horizon,
-            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
-            down_dims=tuple(args.unet_dims),
-            n_groups=args.n_groups,
+            action_dim=action_dim,
+            obs_dim=global_cond_dim,
+            action_horizon=args.act_horizon,
         )
         
         return DiffusionDoubleQAgent(
@@ -581,13 +625,16 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             action_dim=action_dim,
             obs_horizon=args.obs_horizon,
             pred_horizon=args.pred_horizon,
-            num_diffusion_iters=100,
+            act_horizon=args.act_horizon,  # Add act_horizon for Q-learning
+            num_diffusion_iters=args.num_diffusion_iters,
             alpha=args.alpha,
             bc_weight=args.bc_weight,
             gamma=args.gamma,
             tau=args.tau,
             reward_scale=args.reward_scale,
             q_target_clip=args.q_target_clip,
+            q_grad_mode=args.q_grad_mode,
+            q_grad_steps=args.q_grad_steps,
             device=device,
         )
     
@@ -600,13 +647,11 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             n_groups=args.n_groups,
         )
         
+        # Q-Network: simple MLP, uses act_horizon to match SMDP reward horizon
         q_network = DoubleQNetwork(
-            input_dim=action_dim,
-            global_cond_dim=global_cond_dim,
-            pred_horizon=args.pred_horizon,
-            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
-            down_dims=tuple(args.unet_dims),
-            n_groups=args.n_groups,
+            action_dim=action_dim,
+            obs_dim=global_cond_dim,
+            action_horizon=args.act_horizon,
         )
         
         return CPQLAgent(
@@ -615,8 +660,9 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             action_dim=action_dim,
             obs_horizon=args.obs_horizon,
             pred_horizon=args.pred_horizon,
+            act_horizon=args.act_horizon,  # Add act_horizon for Q-learning
             num_flow_steps=args.num_flow_steps,
-            alpha=0.01,  # CPQL uses smaller alpha
+            alpha=args.alpha,  # CPQL uses smaller alpha
             bc_weight=args.bc_weight,
             consistency_weight=args.consistency_weight,
             gamma=args.gamma,
@@ -627,13 +673,56 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             device=device,
         )
     
+    elif algorithm == "dppo":
+        noise_pred_net = ConditionalUnet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=args.unet_dims,
+            n_groups=args.n_groups,
+        )
+        
+        return DPPOAgent(
+            noise_pred_net=noise_pred_net,
+            obs_dim=global_cond_dim,
+            act_dim=action_dim,
+            pred_horizon=args.pred_horizon,
+            obs_horizon=args.obs_horizon,
+            act_horizon=args.act_horizon,
+            num_diffusion_iters=args.num_diffusion_iters,
+            ft_denoising_steps=args.ft_denoising_steps,
+            ema_decay=args.ema_decay,
+            use_ema=True,
+        )
+    
+    elif algorithm == "reinflow":
+        velocity_net = VelocityUNet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        return ReinFlowAgent(
+            velocity_net=velocity_net,
+            obs_dim=global_cond_dim,
+            act_dim=action_dim,
+            pred_horizon=args.pred_horizon,
+            obs_horizon=args.obs_horizon,
+            act_horizon=args.act_horizon,
+            num_flow_steps=args.num_flow_steps,
+            ema_decay=args.ema_decay,
+            use_ema=True,
+        )
+    
     else:
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
 
-def save_ckpt(run_name, tag, agent, ema, ema_agent):
+def save_ckpt(run_name, tag, agent, ema_agent):
+    """Save checkpoint. Assumes ema_agent has already been updated with EMA params."""
     os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
-    ema.copy_to(ema_agent.parameters())
     torch.save(
         {
             "agent": agent.state_dict(),
@@ -909,8 +998,9 @@ if __name__ == "__main__":
     agent_wrapper = AgentWrapper(agent, visual_encoder, include_rgb_flag, include_depth_flag, args.obs_horizon).to(device)
     
     # Setup optimizers
-    # IL algorithms (no critic): diffusion_policy, flow_matching, reflected_flow, consistency_flow, shortcut_flow
-    il_algorithms = ["diffusion_policy", "flow_matching", "reflected_flow", "consistency_flow", "shortcut_flow"]
+    # IL algorithms (no critic): BC-only training
+    # DPPO and ReinFlow are included because their offline training is pure BC
+    il_algorithms = ["diffusion_policy", "flow_matching", "reflected_flow", "consistency_flow", "shortcut_flow", "dppo", "reinflow"]
     
     # Collect all trainable parameters
     all_params = list(agent.parameters())
@@ -927,6 +1017,8 @@ if __name__ == "__main__":
         critic_optimizer = None
     else:
         # Separate optimizers for actor and critic (offline RL algorithms)
+        # IMPORTANT: Actor params include visual_encoder, critic params are separate
+        # This ensures critic gradients don't affect visual encoder through shared optimizer
         actor_params = [p for n, p in agent.named_parameters() if "critic" not in n]
         if visual_encoder is not None:
             actor_params += list(visual_encoder.parameters())
@@ -944,6 +1036,10 @@ if __name__ == "__main__":
             betas=(0.9, 0.999),
             weight_decay=1e-6,
         )
+        
+        # Store actor_params and critic_params for separate gradient clipping
+        actor_params_for_clip = actor_params
+        critic_params_for_clip = critic_params
     
     # Learning rate scheduler
     lr_scheduler = get_scheduler(
@@ -953,18 +1049,53 @@ if __name__ == "__main__":
         num_training_steps=args.total_iters,
     )
     
-    # EMA for agent only (visual encoder is shared)
-    ema = EMAModel(parameters=agent.parameters(), power=0.75)
-    ema_agent = create_agent(args.algorithm, action_dim, global_cond_dim, args).to(device)
+    # EMA setup - different for IL vs Offline RL algorithms
+    if args.algorithm in il_algorithms:
+        # For IL algorithms: EMA for entire agent
+        ema = EMAModel(parameters=agent.parameters(), power=0.75)
+        ema_agent = create_agent(args.algorithm, action_dim, global_cond_dim, args).to(device)
+        ema_critic = None
+        ema_critic_params = None
+    else:
+        # For Offline RL algorithms: Separate EMA for actor and critic
+        # Actor EMA: only actor parameters (excludes critic)
+        actor_params_for_ema = [p for n, p in agent.named_parameters() if "critic" not in n]
+        ema = EMAModel(parameters=actor_params_for_ema, power=0.75)
+        
+        # Critic EMA: only critic parameters
+        critic_params_for_ema = list(agent.critic.parameters())
+        ema_critic = EMAModel(parameters=critic_params_for_ema, power=0.75)
+        
+        # Store param names for proper EMA copying
+        ema_actor_param_names = [n for n, p in agent.named_parameters() if "critic" not in n]
+        ema_critic_param_names = [n for n, p in agent.named_parameters() if "critic" in n and "target" not in n]
+        
+        ema_agent = create_agent(args.algorithm, action_dim, global_cond_dim, args).to(device)
+    
     ema_agent_wrapper = AgentWrapper(ema_agent, visual_encoder, include_rgb_flag, include_depth_flag, args.obs_horizon).to(device)
     
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
     
-    def evaluate_and_save_best(iteration):
-        if iteration % args.eval_freq == 0:
-            last_tick = time.time()
+    def copy_ema_to_eval_agent():
+        """Copy EMA parameters to evaluation agent."""
+        if args.algorithm in il_algorithms:
+            # IL algorithms: simple copy
             ema.copy_to(ema_agent.parameters())
+        else:
+            # Offline RL: copy actor EMA to actor params, critic EMA to critic params
+            # Copy actor EMA
+            ema_actor_params = [p for n, p in ema_agent.named_parameters() if "critic" not in n]
+            ema.copy_to(ema_actor_params)
+            # Copy critic EMA
+            if ema_critic is not None:
+                ema_critic_params = list(ema_agent.critic.parameters())
+                ema_critic.copy_to(ema_critic_params)
+    
+    def evaluate_and_save_best(iteration):
+        if iteration % args.eval_freq == 0 and iteration > 0:
+            last_tick = time.time()
+            copy_ema_to_eval_agent()
             eval_metrics = evaluate(
                 args.num_eval_episodes, ema_agent_wrapper, envs, device, args.sim_backend
             )
@@ -979,7 +1110,8 @@ if __name__ == "__main__":
             for k in ["success_once", "success_at_end"]:
                 if k in eval_metrics and eval_metrics[k] > best_eval_metrics[k]:
                     best_eval_metrics[k] = eval_metrics[k]
-                    save_ckpt(run_name, f"best_eval_{k}", agent, ema, ema_agent)
+                    # copy_ema_to_eval_agent is already called above, so ema_agent is up-to-date
+                    save_ckpt(run_name, f"best_eval_{k}", agent, ema_agent)
                     print(f"New best {k}: {eval_metrics[k]:.4f}. Saving checkpoint.")
     
     def log_metrics(iteration, losses):
@@ -998,7 +1130,8 @@ if __name__ == "__main__":
     last_tick = time.time()
     
     # Define IL algorithms (no critic)
-    il_algorithms = ["diffusion_policy", "flow_matching", "reflected_flow", "consistency_flow", "shortcut_flow"]
+    # DPPO and ReinFlow are included because their offline training is pure BC
+    il_algorithms = ["diffusion_policy", "flow_matching", "reflected_flow", "consistency_flow", "shortcut_flow", "dppo", "reinflow"]
     
     # Helper function to encode observations
     def encode_observations(obs_seq):
@@ -1081,6 +1214,9 @@ if __name__ == "__main__":
             rewards = data_batch["rewards"]
             dones = data_batch["dones"]
             
+            # actions_for_q: act_horizon length, matches SMDP reward horizon
+            actions_for_q = data_batch["actions_for_q"]
+            
             # SMDP chunk-level fields for proper action chunking Bellman equation
             cumulative_reward = data_batch["cumulative_reward"]
             chunk_done = data_batch["chunk_done"]
@@ -1094,9 +1230,12 @@ if __name__ == "__main__":
             next_obs_cond = next_obs_features.reshape(next_obs_features.shape[0], -1)
             
             # Compute combined loss using the unified interface with SMDP fields
+            # actions: full pred_horizon for BC training
+            # actions_for_q: act_horizon for Q-learning (matches reward horizon)
             loss_dict = agent.compute_loss(
                 obs_features=obs_features,
-                actions=action_seq,
+                actions=action_seq,  # pred_horizon for BC
+                actions_for_q=actions_for_q,  # act_horizon for Q-learning
                 rewards=rewards,
                 next_obs_features=next_obs_features,
                 dones=dones,
@@ -1106,23 +1245,34 @@ if __name__ == "__main__":
                 discount_factor=discount_factor,
             )
             
-            total_loss = loss_dict["loss"]
+            # Extract actor and critic losses separately
+            actor_loss = loss_dict.get("actor_loss", loss_dict.get("policy_loss", loss_dict["loss"]))
+            critic_loss = loss_dict.get("critic_loss", torch.tensor(0.0))
+            
             losses = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
             
+            # ===== Separate backward passes for actor and critic =====
+            # This ensures gradients don't interfere between actor and critic
+            
+            # Step 1: Backward pass for actor (includes visual_encoder)
             optimizer.zero_grad()
-            if critic_optimizer is not None:
-                critic_optimizer.zero_grad()
+            actor_loss.backward(retain_graph=True)  # retain_graph for critic backward
             
-            total_loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(agent.parameters(), 1.0)
-            if visual_encoder is not None:
-                torch.nn.utils.clip_grad_norm_(visual_encoder.parameters(), 1.0)
+            # Gradient clipping for actor only
+            torch.nn.utils.clip_grad_norm_(actor_params_for_clip, 1.0)
             
             optimizer.step()
-            if critic_optimizer is not None:
-                critic_optimizer.step()
             lr_scheduler.step()
+            
+            # Step 2: Backward pass for critic (separate)
+            if critic_optimizer is not None and isinstance(critic_loss, torch.Tensor) and critic_loss.requires_grad:
+                critic_optimizer.zero_grad()
+                critic_loss.backward()
+                
+                # Gradient clipping for critic only
+                torch.nn.utils.clip_grad_norm_(critic_params_for_clip, 1.0)
+                
+                critic_optimizer.step()
             
             # Update targets and EMA
             agent.update_target()
@@ -1131,9 +1281,18 @@ if __name__ == "__main__":
         
         timings["forward"] += time.time() - last_tick
         
-        # EMA step
+        # EMA step - separate for actor and critic
         last_tick = time.time()
-        ema.step(agent.parameters())
+        if args.algorithm in il_algorithms:
+            ema.step(agent.parameters())
+        else:
+            # Update actor EMA (excludes critic)
+            actor_params_for_ema_step = [p for n, p in agent.named_parameters() if "critic" not in n]
+            ema.step(actor_params_for_ema_step)
+            # Update critic EMA
+            if ema_critic is not None:
+                critic_params_for_ema_step = list(agent.critic.parameters())
+                ema_critic.step(critic_params_for_ema_step)
         timings["ema"] += time.time() - last_tick
         
         # Evaluation
@@ -1142,7 +1301,8 @@ if __name__ == "__main__":
         
         # Checkpoint
         if args.save_freq is not None and iteration % args.save_freq == 0:
-            save_ckpt(run_name, str(iteration), agent, ema, ema_agent)
+            copy_ema_to_eval_agent()
+            save_ckpt(run_name, str(iteration), agent, ema_agent)
         
         pbar.update(1)
         pbar.set_postfix({k: f"{v:.4f}" for k, v in losses.items()})

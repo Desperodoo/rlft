@@ -1,11 +1,11 @@
 #!/bin/bash
-# Batch experiments for Offline RL algorithms on ManiSkill3
-# Usage: ./run_experiments.sh [--dry-run] [--gpu GPU_ID] [--algorithms "algo1 algo2 ..."]
+# Alpha parameter sweep for CPQL and Diffusion Double Q algorithms
+# Usage: ./sweep_alpha.sh [--dry-run] [--gpu GPU_ID] [--env ENV_ID]
 
 set -e
 
 # Default configurations
-GPU_ID=1
+GPU_ID=0
 DRY_RUN=false
 TOTAL_ITERS=30000
 EVAL_FREQ=2000
@@ -14,8 +14,10 @@ NUM_EVAL_EPISODES=100
 NUM_EVAL_ENVS=100
 NUM_DEMOS=1000
 SIM_BACKEND="physx_cuda"
-WANDB_PROJECT="maniskill_offline_rl"
+WANDB_PROJECT="maniskill_alpha_sweep"
 MAX_EPISODE_STEPS=100
+ENV_ID="LiftPegUpright-v1"
+CONTROL_MODE="pd_ee_delta_pose"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -28,8 +30,8 @@ while [[ $# -gt 0 ]]; do
             GPU_ID="$2"
             shift 2
             ;;
-        --algorithms)
-            SELECTED_ALGORITHMS="$2"
+        --env)
+            ENV_ID="$2"
             shift 2
             ;;
         --iters)
@@ -44,8 +46,12 @@ while [[ $# -gt 0 ]]; do
             WANDB_PROJECT="$2"
             shift 2
             ;;
-        --max-episode-steps)
-            MAX_EPISODE_STEPS="$2"
+        --control-mode)
+            CONTROL_MODE="$2"
+            shift 2
+            ;;
+        --sim-backend)
+            SIM_BACKEND="$2"
             shift 2
             ;;
         *)
@@ -55,37 +61,40 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Algorithms to run
-if [ -z "$SELECTED_ALGORITHMS" ]; then
-    ALGORITHMS=(
-        "diffusion_policy"
-        "flow_matching"
-        "reflected_flow"
-        "consistency_flow"
-        "shortcut_flow"
-        "diffusion_double_q"
-        "cpql"
-    )
-else
-    read -ra ALGORITHMS <<< "$SELECTED_ALGORITHMS"
-fi
+# Algorithms to sweep
+ALGORITHMS=(
+    "cpql"
+    "diffusion_double_q"
+)
 
-# Environments and their demo paths (state_dict+rgb format)
-declare -A ENVS
-ENVS["LiftPegUpright-v1"]="$HOME/.maniskill/demos/LiftPegUpright-v1/rl/trajectory.rgb.pd_ee_delta_pose.physx_cuda.h5"
-# Add more environments here:
-# ENVS["PegInsertionSide-v1"]="$HOME/.maniskill/demos/PegInsertionSide-v1/motionplanning/trajectory.rgb.pd_ee_delta_pos.physx_cpu.h5"
-# ENVS["StackCube-v1"]="$HOME/.maniskill/demos/StackCube-v1/motionplanning/trajectory.rgb.pd_ee_delta_pos.physx_cpu.h5"
+# Alpha values to sweep
+ALPHAS=(
+    0.005
+    0.01
+    0.02
+    0.05
+    0.1
+    0.2
+    0.5
+    1.0
+)
+
+# Demo path based on environment
+DEMO_PATH="$HOME/.maniskill/demos/${ENV_ID}/rl/trajectory.rgb.${CONTROL_MODE}.physx_cuda.h5"
 
 # Seeds for multiple runs
 SEEDS=(0)
 
 echo "=========================================="
-echo "Offline RL Batch Experiments"
+echo "Alpha Parameter Sweep"
 echo "=========================================="
 echo "GPU: $GPU_ID"
 echo "Algorithms: ${ALGORITHMS[*]}"
-echo "Environments: ${!ENVS[*]}"
+echo "Environment: $ENV_ID"
+echo "Control Mode: $CONTROL_MODE"
+echo "Sim Backend: $SIM_BACKEND"
+echo "Demo Path: $DEMO_PATH"
+echo "Alpha values: ${ALPHAS[*]}"
 echo "Seeds: ${SEEDS[*]}"
 echo "Total iterations: $TOTAL_ITERS"
 echo "Eval frequency: $EVAL_FREQ"
@@ -97,33 +106,32 @@ echo ""
 # Change to the diffusion_policy directory
 cd /home/amax/rlft/diffusion_policy
 
+# Check if demo file exists
+if [ ! -f "$DEMO_PATH" ]; then
+    echo "Error: Demo file not found: $DEMO_PATH"
+    echo "Please check the environment ID and demo path."
+    exit 1
+fi
+
 # Calculate total experiments
-TOTAL_EXPS=$((${#ALGORITHMS[@]} * ${#ENVS[@]} * ${#SEEDS[@]}))
+TOTAL_EXPS=$((${#ALGORITHMS[@]} * ${#ALPHAS[@]} * ${#SEEDS[@]}))
 EXP_IDX=0
 
-for env in "${!ENVS[@]}"; do
-    demo_path="${ENVS[$env]}"
-    
-    # Check if demo file exists
-    if [ ! -f "$demo_path" ]; then
-        echo "Warning: Demo file not found for $env: $demo_path"
-        continue
-    fi
-    
-    for algo in "${ALGORITHMS[@]}"; do
+for algo in "${ALGORITHMS[@]}"; do
+    for alpha in "${ALPHAS[@]}"; do
         for seed in "${SEEDS[@]}"; do
             EXP_IDX=$((EXP_IDX + 1))
             
-            exp_name="${algo}-${env}-seed${seed}"
+            exp_name="${algo}-${ENV_ID}-alpha${alpha}-seed${seed}"
             
             echo "[$EXP_IDX/$TOTAL_EXPS] Running: $exp_name"
             
             CMD="CUDA_VISIBLE_DEVICES=$GPU_ID python train_offline_rl.py \
                 --algorithm $algo \
-                --env_id $env \
+                --env_id $ENV_ID \
                 --obs_mode rgb \
-                --demo_path $demo_path \
-                --control-mode pd_ee_delta_pose \
+                --demo_path $DEMO_PATH \
+                --control-mode $CONTROL_MODE \
                 --sim-backend $SIM_BACKEND \
                 --num-demos $NUM_DEMOS \
                 --seed $seed \
@@ -135,7 +143,8 @@ for env in "${!ENVS[@]}"; do
                 --exp_name $exp_name \
                 --track \
                 --wandb_project_name $WANDB_PROJECT \
-                --max_episode_steps $MAX_EPISODE_STEPS"
+                --max_episode_steps $MAX_EPISODE_STEPS \
+                --alpha $alpha"
             
             if [ "$DRY_RUN" = true ]; then
                 echo "  [DRY RUN] Would execute:"
@@ -158,5 +167,5 @@ for env in "${!ENVS[@]}"; do
 done
 
 echo "=========================================="
-echo "Batch experiments completed!"
+echo "Alpha sweep completed!"
 echo "=========================================="

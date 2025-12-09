@@ -1,35 +1,13 @@
 """
 Network architectures for Offline RL algorithms
-
-All networks are designed to be compatible with the official diffusion_policy
-structure, using PlainConv for visual encoding and ConditionalUnet1D architecture.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from ..conditional_unet1d import ConditionalUnet1D
-from ..plain_conv import PlainConv
-
-
-class SinusoidalPosEmb(nn.Module):
-    """Sinusoidal positional embedding for timestep encoding."""
-    
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        device = x.device
-        half_dim = self.dim // 2
-        emb = np.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
 
 
 class VelocityUNet1D(nn.Module):
@@ -91,100 +69,99 @@ class VelocityUNet1D(nn.Module):
 
 
 class DoubleQNetwork(nn.Module):
-    """Twin Q-Network with 1D U-Net architecture.
+    """Twin Q-Network with MLP architecture.
     
-    Uses the same architecture as the policy network to maintain consistency.
-    Takes (action_sequence, obs_features) and outputs Q-values.
+    Simple MLP-based Q-network following mainstream offline RL methods
+    (Diffusion-QL, IDQL, CPQL, etc.). Takes (action_sequence, obs_features) 
+    and outputs scalar Q-values.
     
-    Note on Action Chunking and Q-Learning:
-    - This Q-network evaluates entire action sequences, not single actions
-    - The Bellman equation should ideally use cumulative rewards over the sequence
-    - Current implementation uses single-step reward as approximation
+    Architecture: Flatten(action_seq) + obs_cond → MLP → Q-value
     
     Args:
-        input_dim: Action dimension
-        global_cond_dim: Dimension of global conditioning (obs features)
-        pred_horizon: Length of action sequence (default: 16)
-        diffusion_step_embed_dim: Dimension for time/dummy embedding
-        down_dims: Channel dimensions for each downsampling stage
-        n_groups: Number of groups for GroupNorm
+        action_dim: Action dimension
+        obs_dim: Dimension of observation features
+        action_horizon: Length of action sequence (typically act_horizon)
+        hidden_dims: Hidden layer dimensions for MLP
     """
     
     def __init__(
         self,
-        input_dim: int,
-        global_cond_dim: int,
-        pred_horizon: int = 16,
-        diffusion_step_embed_dim: int = 64,
-        down_dims: List[int] = [64, 128, 256],
-        n_groups: int = 8,
+        action_dim: int,
+        obs_dim: int,
+        action_horizon: int = 8,
+        hidden_dims: List[int] = [512, 512, 512],
     ):
         super().__init__()
         
-        self.pred_horizon = pred_horizon
-        self.input_dim = input_dim
+        self.action_horizon = action_horizon
+        self.action_dim = action_dim
         
-        # Q1 network - uses U-Net architecture for consistency with policy
-        self.q1_net = ConditionalUnet1D(
-            input_dim=input_dim,
-            global_cond_dim=global_cond_dim,
-            diffusion_step_embed_dim=diffusion_step_embed_dim,
-            down_dims=down_dims,
-            n_groups=n_groups,
-        )
+        # Input: flattened action sequence + observation features
+        input_dim = action_horizon * action_dim + obs_dim
         
-        # Q2 network
-        self.q2_net = ConditionalUnet1D(
-            input_dim=input_dim,
-            global_cond_dim=global_cond_dim,
-            diffusion_step_embed_dim=diffusion_step_embed_dim,
-            down_dims=down_dims,
-            n_groups=n_groups,
-        )
+        # Build Q1 MLP
+        q1_layers = []
+        in_dim = input_dim
+        for hidden_dim in hidden_dims:
+            q1_layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.Mish(),
+            ])
+            in_dim = hidden_dim
+        q1_layers.append(nn.Linear(in_dim, 1))
+        self.q1_net = nn.Sequential(*q1_layers)
         
-        # Output heads to reduce action sequence to scalar Q-value
-        # After U-Net: (B, pred_horizon, input_dim) -> (B, 1)
-        flatten_dim = pred_horizon * input_dim
-        self.q1_head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flatten_dim, 256),
-            nn.Mish(),
-            nn.Linear(256, 1),
-        )
+        # Build Q2 MLP
+        q2_layers = []
+        in_dim = input_dim
+        for hidden_dim in hidden_dims:
+            q2_layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.Mish(),
+            ])
+            in_dim = hidden_dim
+        q2_layers.append(nn.Linear(in_dim, 1))
+        self.q2_net = nn.Sequential(*q2_layers)
         
-        self.q2_head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(flatten_dim, 256),
-            nn.Mish(),
-            nn.Linear(256, 1),
-        )
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize network weights."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        # Output layers with smaller weights for stability
+        for net in [self.q1_net, self.q2_net]:
+            final_layer = net[-1]
+            if isinstance(final_layer, nn.Linear):
+                nn.init.orthogonal_(final_layer.weight, gain=0.01)
+                if final_layer.bias is not None:
+                    nn.init.zeros_(final_layer.bias)
     
     def forward(
         self,
         action_seq: torch.Tensor,
         obs_cond: torch.Tensor,
-        timestep: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            action_seq: (B, pred_horizon, action_dim) action sequence
-            obs_cond: (B, global_cond_dim) observation features
-            timestep: (B,) optional timestep, defaults to 0
+            action_seq: (B, action_horizon, action_dim) action sequence
+            obs_cond: (B, obs_dim) observation features
             
         Returns:
             q1, q2: (B, 1) Q-values from both networks
         """
         B = action_seq.shape[0]
-        if timestep is None:
-            timestep = torch.zeros(B, device=action_seq.device, dtype=torch.long)
+        action_flat = action_seq.reshape(B, -1)
+        x = torch.cat([action_flat, obs_cond], dim=-1)
         
-        # Get U-Net features
-        q1_features = self.q1_net(action_seq, timestep, global_cond=obs_cond)
-        q2_features = self.q2_net(action_seq, timestep, global_cond=obs_cond)
-        
-        # Reduce to scalar Q-values
-        q1 = self.q1_head(q1_features)
-        q2 = self.q2_head(q2_features)
+        q1 = self.q1_net(x)
+        q2 = self.q2_net(x)
         
         return q1, q2
     
@@ -192,17 +169,12 @@ class DoubleQNetwork(nn.Module):
         self,
         action_seq: torch.Tensor,
         obs_cond: torch.Tensor,
-        timestep: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass through Q1 network only."""
         B = action_seq.shape[0]
-        if timestep is None:
-            timestep = torch.zeros(B, device=action_seq.device, dtype=torch.long)
-        
-        q1_features = self.q1_net(action_seq, timestep, global_cond=obs_cond)
-        q1 = self.q1_head(q1_features)
-        
-        return q1
+        action_flat = action_seq.reshape(B, -1)
+        x = torch.cat([action_flat, obs_cond], dim=-1)
+        return self.q1_net(x)
 
 
 def soft_update(target: nn.Module, source: nn.Module, tau: float):
