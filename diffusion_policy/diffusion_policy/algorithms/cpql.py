@@ -293,16 +293,23 @@ class CPQLAgent(nn.Module):
         for p in self.critic.parameters():
             p.requires_grad = False
         
-        q_value = self.critic.q1_forward(actions_for_q, obs_cond)
+        # Get Q-values from both Q-networks for normalization trick
+        q1_value, q2_value = self.critic(actions_for_q, obs_cond)
         
         for p in self.critic.parameters():
             p.requires_grad = True
         
-        # Clip Q-values to prevent explosion in policy optimization
-        # if self.q_target_clip is not None:
-        #     q_value = torch.clamp(q_value, -self.q_target_clip, self.q_target_clip)
+        # Q-loss normalization trick from original CPQL
+        # Randomly select which Q to optimize and normalize by the other's magnitude
+        # This prevents Q-value explosion in offline RL
+        # Reference: https://github.com/cccedric/cpql/blob/main/agents/ql_cm.py#L157-L161
+        if torch.rand(1).item() > 0.5:
+            q_loss = -q1_value.mean() / q2_value.abs().mean().detach()
+        else:
+            q_loss = -q2_value.mean() / q1_value.abs().mean().detach()
         
-        q_loss = -q_value.mean()
+        # Store q_mean for logging (use min of Q1 and Q2)
+        q_mean = torch.min(q1_value, q2_value).mean()
         
         # Total policy loss
         policy_loss = (
@@ -316,7 +323,7 @@ class CPQLAgent(nn.Module):
             "flow_loss": flow_loss,
             "consistency_loss": consistency_loss,
             "q_policy_loss": q_loss,
-            "q_mean": q_value.mean(),
+            "q_mean": q_mean,
         }
     
     def _compute_critic_loss(
