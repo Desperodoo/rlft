@@ -17,7 +17,7 @@ NUM_EVAL_EPISODES=100
 NUM_EVAL_ENVS=50
 NUM_DEMOS=1000
 SIM_BACKEND="physx_cuda"
-WANDB_PROJECT="maniskill_awcp_beta_grid"
+WANDB_PROJECT="maniskill_awcp_beta_grid_2"
 MAX_EPISODE_STEPS=100
 ENV_ID="LiftPegUpright-v1"
 CONTROL_MODE="pd_ee_delta_pose"
@@ -68,12 +68,12 @@ done
 # beta=0 means uniform weighting (equivalent to pure BC)
 # beta>0 means high-advantage samples get higher weight
 # Recommended range: 0.1 to 10.0
-BETAS=(0.1 0.5 1.0 2.0 5.0)
-WEIGHT_CLIPS=(10.0 100.0)  # Can also sweep this if needed
+BETAS=(10.0 20.0 50.0 100.0)
+WEIGHT_CLIPS=(50.0 100.0 200.0 400.0)  # Can also sweep this if needed
 SEEDS=(0)
 
 DEMO_PATH="$HOME/.maniskill/demos/${ENV_ID}/rl/trajectory.rgb.${CONTROL_MODE}.physx_cuda.h5"
-LOG_DIR="/tmp/awcp_beta_grid_search"
+LOG_DIR="/tmp/awcp_beta_grid_search_2"
 mkdir -p "$LOG_DIR"
 
 echo "=========================================="
@@ -88,7 +88,7 @@ echo "Dry run: $DRY_RUN"
 echo "=========================================="
 echo ""
 
-cd /home/amax/rlft/diffusion_policy
+cd /home/wjz/rlft/diffusion_policy
 
 # Check demo file
 if [ ! -f "$DEMO_PATH" ]; then
