@@ -162,7 +162,9 @@ class Args:
     self_consistency_k: float = 0.25
     """fraction of batch for self-consistency in shortcut_flow"""
     ema_decay: float = 0.999
-    """EMA decay rate for consistency_flow"""
+    """EMA decay rate for consistency_flow and shortcut_flow"""
+    
+    # Consistency Flow specific hyperparameters
     cons_use_flow_t: bool = False
     """reuse flow t for consistency branch instead of resampling"""
     cons_full_t_range: bool = False
@@ -193,6 +195,32 @@ class Args:
     """student evaluation point for consistency loss"""
     cons_loss_space: Literal["velocity", "endpoint"] = "velocity"
     """consistency loss space: velocity (v) or endpoint (x1)"""
+
+    # ShortCut Flow specific hyperparameters
+    sc_t_min: float = 0.0
+    """minimum t for time sampling in shortcut_flow"""
+    sc_t_max: float = 1.0
+    """maximum t for time sampling in shortcut_flow"""
+    sc_t_sampling_mode: Literal["uniform", "truncated"] = "uniform"
+    """time sampling mode: uniform (then clamp) or truncated (direct valid range)"""
+    sc_step_size_mode: Literal["power2", "uniform", "fixed"] = "power2"
+    """step size sampling mode: power2 (log-uniform), uniform, or fixed"""
+    sc_min_step_size: float = 0.0625
+    """minimum step size (1/16 by default)"""
+    sc_max_step_size: float = 0.5
+    """maximum step size (1/2 by default)"""
+    sc_fixed_step_size: float = 0.125
+    """fixed step size when sc_step_size_mode=fixed"""
+    sc_target_mode: Literal["velocity", "endpoint"] = "velocity"
+    """shortcut target mode: velocity (match v) or endpoint (match x1)"""
+    sc_teacher_steps: int = 2
+    """teacher rollout steps for shortcut target"""
+    sc_use_ema_teacher: bool = True
+    """whether to use EMA network as teacher for shortcut target"""
+    sc_inference_mode: Literal["adaptive", "uniform"] = "adaptive"
+    """inference mode: adaptive (variable step sizes) or uniform (fixed dt)"""
+    sc_num_inference_steps: int = 8
+    """number of inference steps (for uniform mode or as fallback)"""
 
     # Offline RL hyperparameters (inherited from toy_diffusion_rl)
     alpha: float = 0.01
@@ -653,6 +681,23 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             self_consistency_k=args.self_consistency_k,
             flow_weight=args.bc_weight,
             shortcut_weight=args.consistency_weight,
+            ema_decay=args.ema_decay,
+            # Time sampling hyperparameters
+            t_min=args.sc_t_min,
+            t_max=args.sc_t_max,
+            t_sampling_mode=args.sc_t_sampling_mode,
+            # Step size hyperparameters
+            step_size_mode=args.sc_step_size_mode,
+            min_step_size=args.sc_min_step_size,
+            max_step_size=args.sc_max_step_size,
+            fixed_step_size=args.sc_fixed_step_size,
+            # Target computation hyperparameters
+            target_mode=args.sc_target_mode,
+            teacher_steps=args.sc_teacher_steps,
+            use_ema_teacher=args.sc_use_ema_teacher,
+            # Inference hyperparameters
+            inference_mode=args.sc_inference_mode,
+            num_inference_steps=args.sc_num_inference_steps,
             device=device,
         )
     

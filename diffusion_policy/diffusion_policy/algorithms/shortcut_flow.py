@@ -1,6 +1,13 @@
 """
 ShortCut Flow Policy with adaptive step size.
 Migrated from toy_diffusion_rl (ReinFlow) to diffusion_policy framework.
+
+Configurable design axes (for ablation studies):
+1. Time sampling: t_min, t_max, t_sampling_mode
+2. Step size sampling: step_size_mode, min_step_size, max_step_size
+3. Target computation: target_mode (velocity/endpoint), teacher_steps, use_ema_teacher
+4. Training: flow_weight, shortcut_weight, self_consistency_k
+5. Inference: inference_mode (adaptive/uniform), num_inference_steps
 """
 import torch
 import torch.nn as nn
@@ -88,6 +95,12 @@ class ShortCutFlowAgent(nn.Module):
     ShortCut Flow Matching agent with adaptive step sizes.
     Learns to take larger steps when possible, enabling faster inference.
     Based on ReinFlow implementation.
+    
+    Configurable hyperparameters for ablation:
+    - Time sampling: t_min, t_max, t_sampling_mode (uniform/truncated)
+    - Step size: step_size_mode (power2/uniform/fixed), min/max step sizes
+    - Target: target_mode (velocity/endpoint), teacher_steps, use_ema_teacher
+    - Inference: inference_mode (adaptive/uniform), num_inference_steps
     """
     
     def __init__(
@@ -101,6 +114,22 @@ class ShortCutFlowAgent(nn.Module):
         flow_weight: float = 1.0,
         shortcut_weight: float = 1.0,
         ema_decay: float = 0.999,
+        # Time sampling hyperparameters
+        t_min: float = 0.0,
+        t_max: float = 1.0,
+        t_sampling_mode: Literal["uniform", "truncated"] = "uniform",
+        # Step size hyperparameters
+        step_size_mode: Literal["power2", "uniform", "fixed"] = "power2",
+        min_step_size: float = 0.0625,  # 1/16 by default
+        max_step_size: float = 0.5,     # 1/2 by default
+        fixed_step_size: float = 0.125, # 1/8 for fixed mode
+        # Target computation hyperparameters
+        target_mode: Literal["velocity", "endpoint"] = "velocity",
+        teacher_steps: int = 2,
+        use_ema_teacher: bool = True,
+        # Inference hyperparameters
+        inference_mode: Literal["adaptive", "uniform"] = "adaptive",
+        num_inference_steps: int = 8,
         device: str = "cuda",
     ):
         super().__init__()
@@ -115,24 +144,79 @@ class ShortCutFlowAgent(nn.Module):
         self.ema_decay = ema_decay
         self.device = device
         
+        # Time sampling config
+        self.t_min = t_min
+        self.t_max = t_max
+        self.t_sampling_mode = t_sampling_mode
+        
+        # Step size config
+        self.step_size_mode = step_size_mode
+        self.min_step_size = min_step_size
+        self.max_step_size = max_step_size
+        self.fixed_step_size = fixed_step_size
+        
+        # Target computation config
+        self.target_mode = target_mode
+        self.teacher_steps = teacher_steps
+        self.use_ema_teacher = use_ema_teacher
+        
+        # Inference config
+        self.inference_mode = inference_mode
+        self.num_inference_steps = num_inference_steps
+        
         # EMA velocity network for stable shortcut targets
         self.velocity_net_ema = copy.deepcopy(velocity_net)
         for param in self.velocity_net_ema.parameters():
             param.requires_grad = False
         
-        # Log2 of max steps for step size sampling
+        # Log2 of max steps for step size sampling (power2 mode)
         self.log_max_steps = int(math.log2(max_denoising_steps))
         
     def _sample_step_size(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """
-        Sample step sizes d from {1/N, 2/N, 4/N, ...} where N is max_steps.
-        Uses log-uniform distribution.
+        Sample step sizes d based on step_size_mode.
+        
+        Modes:
+        - power2: d from {1/N, 2/N, 4/N, ...} where N is max_steps (log-uniform)
+        - uniform: d ~ U[min_step_size, max_step_size]
+        - fixed: d = fixed_step_size
         """
-        # Sample power of 2: 0, 1, 2, ..., log_max_steps
-        powers = torch.randint(0, self.log_max_steps + 1, (batch_size,), device=device)
-        # d = 2^power / max_steps
-        d = (2.0 ** powers.float()) / self.max_denoising_steps
+        if self.step_size_mode == "power2":
+            # Sample power of 2: 0, 1, 2, ..., log_max_steps
+            powers = torch.randint(0, self.log_max_steps + 1, (batch_size,), device=device)
+            # d = 2^power / max_steps
+            d = (2.0 ** powers.float()) / self.max_denoising_steps
+        elif self.step_size_mode == "uniform":
+            # Uniform sampling in [min_step_size, max_step_size]
+            d = self.min_step_size + torch.rand(batch_size, device=device) * (self.max_step_size - self.min_step_size)
+        elif self.step_size_mode == "fixed":
+            # Fixed step size
+            d = torch.full((batch_size,), self.fixed_step_size, device=device)
+        else:
+            raise ValueError(f"Unknown step_size_mode: {self.step_size_mode}")
         return d
+    
+    def _sample_time(self, batch_size: int, device: torch.device, d: torch.Tensor) -> torch.Tensor:
+        """
+        Sample time t based on t_sampling_mode.
+        
+        Modes:
+        - uniform: t ~ U[t_min, t_max], then clamp to leave room for 2d
+        - truncated: directly sample in valid range [t_min, 1 - 2d]
+        """
+        if self.t_sampling_mode == "uniform":
+            # Standard uniform sampling, then clamp
+            t = self.t_min + torch.rand(batch_size, device=device) * (self.t_max - self.t_min)
+            # Ensure t + 2d <= 1 for shortcut training
+            max_t = 1.0 - 2 * d
+            t = torch.clamp(t * max_t.clamp(min=0.01) / max(self.t_max, 0.01), min=0.0, max=0.99)
+        elif self.t_sampling_mode == "truncated":
+            # Directly sample in valid range
+            max_t = (1.0 - 2 * d).clamp(min=self.t_min)
+            t = self.t_min + torch.rand(batch_size, device=device) * (max_t - self.t_min).clamp(min=0.01)
+        else:
+            raise ValueError(f"Unknown t_sampling_mode: {self.t_sampling_mode}")
+        return t
     
     def _compute_shortcut_target(
         self,
@@ -140,28 +224,61 @@ class ShortCutFlowAgent(nn.Module):
         t: torch.Tensor,
         d: torch.Tensor,
         obs_features: torch.Tensor,
+        x_0: torch.Tensor,
+        x_1: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute shortcut target: what velocity would take us 2d steps instead of d.
-        Uses two small steps with EMA network to compute the target for one large step.
+        Compute shortcut target based on target_mode.
         
-        v(x_t, t, 2d) ≈ v(x_t, t, d) + d * v(x_{t+d}, t+d, d)
+        Modes:
+        - velocity: Target velocity that achieves 2d displacement
+        - endpoint: Target endpoint x_1 reached after 2d steps
+        
+        Args:
+            x_t: Current noisy state at time t
+            t: Current time
+            d: Current step size
+            obs_features: Observation conditioning
+            x_0: Initial noise (for endpoint mode)
+            x_1: Target actions (for endpoint mode)
         """
+        # Select teacher network
+        teacher_net = self.velocity_net_ema if self.use_ema_teacher else self.velocity_net
+        
         with torch.no_grad():
-            # First step with step size d (using EMA for stable targets)
-            v_1 = self.velocity_net_ema(x_t, t, d, obs_features)
-            d_expand = d.view(-1, 1, 1)
-            x_t_plus_d = x_t + d_expand * v_1
+            if self.teacher_steps == 1:
+                # Single-step target: just predict with d and use as 2d target
+                v_1 = teacher_net(x_t, t, d, obs_features)
+                d_expand = d.view(-1, 1, 1)
+                x_t_plus_d = x_t + d_expand * v_1
+                
+                t_plus_d = t + d
+                v_2 = teacher_net(x_t_plus_d, t_plus_d, d, obs_features)
+                
+                # Combined velocity for step size 2d
+                shortcut_v = v_1 + d_expand * v_2
+                target_endpoint = x_t + 2 * d_expand * ((v_1 + v_2) / 2)
+            else:
+                # Multi-step rollout to get target
+                x = x_t.clone()
+                current_t = t.clone()
+                d_expand = d.view(-1, 1, 1)
+                
+                # Take teacher_steps small steps, each of size d
+                for step in range(self.teacher_steps):
+                    if step < self.teacher_steps:
+                        v = teacher_net(x, current_t, d, obs_features)
+                        x = x + d_expand * v
+                        current_t = current_t + d
+                
+                target_endpoint = x
+                # Compute equivalent velocity for 2d step
+                shortcut_v = (target_endpoint - x_t) / (self.teacher_steps * d_expand)
             
-            # Second step from t+d with step size d
-            t_plus_d = t + d
-            v_2 = self.velocity_net_ema(x_t_plus_d, t_plus_d, d, obs_features)
-            
-            # Combined velocity for step size 2d
-            # v(t, 2d) should equal (v(t, d) + v(t+d, d)) / 2 for 2d total movement
-            shortcut_v = v_1 + d_expand * v_2  # This takes us 2d in one step
-            
-        return shortcut_v
+            if self.target_mode == "velocity":
+                return shortcut_v
+            else:  # endpoint
+                return target_endpoint
     
     def compute_loss(
         self,
@@ -181,16 +298,11 @@ class ShortCutFlowAgent(nn.Module):
         # Sample noise
         x_0 = torch.randn_like(actions)
         
-        # Sample time uniformly
-        t = torch.rand(batch_size, device=device)
-        
         # Sample step sizes
         d = self._sample_step_size(batch_size, device)
         
-        # Ensure t + 2d <= 1 for shortcut training
-        # Clamp t to leave room for 2d
-        max_t = 1.0 - 2 * d
-        t = torch.clamp(t * max_t.clamp(min=0.01), min=0.0, max=0.99)
+        # Sample time using configurable method
+        t = self._sample_time(batch_size, device, d)
         
         # Interpolate
         t_expand = t.view(-1, 1, 1)
@@ -217,6 +329,8 @@ class ShortCutFlowAgent(nn.Module):
             t_sub = t[idx]
             d_sub = d[idx]
             obs_sub = obs_features[idx]
+            x_0_sub = x_0[idx]
+            actions_sub = actions[idx]
             
             # Double the step size for shortcut
             d_double = 2 * d_sub
@@ -230,10 +344,12 @@ class ShortCutFlowAgent(nn.Module):
                 d_valid = d_sub[valid_mask]
                 d_double_valid = d_double[valid_mask]
                 obs_valid = obs_sub[valid_mask]
+                x_0_valid = x_0_sub[valid_mask]
+                actions_valid = actions_sub[valid_mask]
                 
-                # Shortcut target from two d-steps
+                # Shortcut target from teacher rollout
                 shortcut_target = self._compute_shortcut_target(
-                    x_t_valid, t_valid, d_valid, obs_valid
+                    x_t_valid, t_valid, d_valid, obs_valid, x_0_valid, actions_valid
                 )
                 
                 # Predict with 2d step size
@@ -241,7 +357,13 @@ class ShortCutFlowAgent(nn.Module):
                     x_t_valid, t_valid, d_double_valid, obs_valid
                 )
                 
-                shortcut_loss = F.mse_loss(v_pred_2d, shortcut_target)
+                if self.target_mode == "velocity":
+                    shortcut_loss = F.mse_loss(v_pred_2d, shortcut_target)
+                else:  # endpoint
+                    # Compute predicted endpoint from student
+                    d_double_expand = d_double_valid.view(-1, 1, 1)
+                    pred_endpoint = x_t_valid + d_double_expand * v_pred_2d
+                    shortcut_loss = F.mse_loss(pred_endpoint, shortcut_target)
         
         total_loss = self.flow_weight * flow_loss + self.shortcut_weight * shortcut_loss
         
@@ -264,7 +386,7 @@ class ShortCutFlowAgent(nn.Module):
         self,
         obs_features: torch.Tensor,
         num_steps: Optional[int] = None,
-        adaptive: bool = True,
+        adaptive: Optional[bool] = None,
         use_ema: bool = True,
     ) -> torch.Tensor:
         """
@@ -272,8 +394,8 @@ class ShortCutFlowAgent(nn.Module):
         
         Args:
             obs_features: Encoded observation [B, obs_horizon, obs_dim]
-            num_steps: Override number of steps (uses max possible step size)
-            adaptive: If True, use learned adaptive steps; else use uniform steps
+            num_steps: Override number of steps (default: num_inference_steps)
+            adaptive: Override inference_mode (default: uses self.inference_mode)
             use_ema: Whether to use EMA network for sampling (default: True)
             
         Returns:
@@ -284,13 +406,17 @@ class ShortCutFlowAgent(nn.Module):
         batch_size = obs_features.shape[0]
         device = obs_features.device
         
+        # Determine inference mode
+        use_adaptive = adaptive if adaptive is not None else (self.inference_mode == "adaptive")
+        steps = num_steps if num_steps is not None else self.num_inference_steps
+        
         # Start from noise
         x = torch.randn(
             batch_size, self.pred_horizon, self.action_dim,
             device=device
         )
         
-        if adaptive and num_steps is None:
+        if use_adaptive:
             # Use adaptive step sizes (powers of 2)
             # Start with largest possible step size
             t = torch.zeros(batch_size, device=device)
@@ -300,10 +426,10 @@ class ShortCutFlowAgent(nn.Module):
                 remaining = 1.0 - t[0]
                 
                 # Use power-of-2 step sizes
-                d_val = min(remaining.item(), 1.0 / 2)  # At least 2 steps
+                d_val = min(remaining.item(), self.max_step_size)
                 for power in range(self.log_max_steps, -1, -1):
                     candidate = (2.0 ** power) / self.max_denoising_steps
-                    if candidate <= remaining:
+                    if candidate <= remaining and candidate >= self.min_step_size:
                         d_val = candidate
                         break
                 
@@ -318,7 +444,6 @@ class ShortCutFlowAgent(nn.Module):
                     break
         else:
             # Uniform steps
-            steps = num_steps if num_steps is not None else self.max_denoising_steps
             dt = 1.0 / steps
             d = torch.full((batch_size,), dt, device=device)
             
