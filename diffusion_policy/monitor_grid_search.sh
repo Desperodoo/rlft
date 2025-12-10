@@ -5,7 +5,7 @@
 #
 # Usage: ./monitor_grid_search.sh [--log-dir /tmp/ddql_grid_search]
 
-LOG_DIR="/tmp/cpql_grid_search"
+LOG_DIR="/tmp/cpql_qlnorm_grid_search"
 REFRESH=5  # seconds
 
 while [[ $# -gt 0 ]]; do

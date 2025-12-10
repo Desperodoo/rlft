@@ -17,7 +17,7 @@ NUM_EVAL_EPISODES=100
 NUM_EVAL_ENVS=50
 NUM_DEMOS=1000
 SIM_BACKEND="physx_cuda"
-WANDB_PROJECT="maniskill_alpha_qgrad_grid"
+WANDB_PROJECT="maniskill_cpql_qlnorm_alpha_qgrad_grid"
 MAX_EPISODE_STEPS=100
 ENV_ID="LiftPegUpright-v1"
 CONTROL_MODE="pd_ee_delta_pose"
@@ -69,12 +69,12 @@ ALPHAS=(0.01 0.05 0.2 1.0)
 Q_GRAD_CONFIGS=(
     "single_step:0"
     "last_few:5"
-    "whole_grad:0"
+    # "whole_grad:0"
 )
 SEEDS=(0)
 
 DEMO_PATH="$HOME/.maniskill/demos/${ENV_ID}/rl/trajectory.rgb.${CONTROL_MODE}.physx_cuda.h5"
-LOG_DIR="/tmp/cpql_grid_search"
+LOG_DIR="/tmp/cpql_qlnorm_grid_search"
 mkdir -p "$LOG_DIR"
 
 echo "=========================================="
