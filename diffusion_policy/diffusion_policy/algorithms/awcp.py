@@ -34,6 +34,13 @@ class AWCPAgent(nn.Module):
     Uses Q-values to weight BC samples instead of directly maximizing Q.
     This is more stable for offline RL with expert demonstrations.
     
+    Consistency design (optimized from sweep):
+    - Full t range [0, 1] for temporal diversity
+    - Small fixed delta (0.01) for stable teacher target
+    - Teacher integrates from t_cons, student from t_plus (endpoint consistency)
+    - Endpoint loss space (not velocity-space) for better convergence
+    - 2-3 multi-step teacher for accurate target prediction
+    
     Args:
         velocity_net: VelocityUNet1D for velocity prediction (flow policy)
         q_network: DoubleQNetwork for Q-value estimation (critic)
@@ -97,12 +104,18 @@ class AWCPAgent(nn.Module):
         self.use_advantage = use_advantage
         self.device = device
         
-        # Consistency loss hyperparameters (aligned with CPQL)
-        self.t_min = 0.05  # Avoid boundary instability at t≈0
-        self.t_max = 0.95  # Avoid boundary instability at t≈1
-        self.delta_min = 0.02  # Minimum delta for consistency
-        self.delta_max = 0.15  # Maximum delta (avoid large teacher error)
+        # Consistency loss hyperparameters (optimized from sweep: flow_endpoint style)
+        # Use full t range [0, 1] and small fixed delta for stable consistency
+        self.t_min = 0.0  # Full t range [0, 1]
+        self.t_max = 1.0  # Full t range [0, 1]
+        self.delta_min = 0.01  # Small fixed delta for consistency
+        self.delta_max = 0.01  # Small fixed delta (avoid large teacher error)
         self.teacher_steps = 2  # Multi-step teacher for accurate targets
+        
+        # Additional consistency parameters (matching sweep recommendations)
+        self.cons_teacher_from = "t_cons"  # Teacher network starts from t_cons
+        self.cons_student_point = "t_plus"  # Student consistency at t_plus
+        self.cons_loss_space = "endpoint"  # Use endpoint consistency loss (not velocity)
         
         # EMA velocity network for consistency loss
         self.velocity_net_ema = copy.deepcopy(self.velocity_net)
@@ -256,17 +269,22 @@ class AWCPAgent(nn.Module):
         # Weighted average: higher Q samples get higher weight
         flow_loss = (weights * flow_loss_per_sample).mean()
         
-        # ===== Consistency Loss (same as CPQL, also weighted) =====
+        # ===== Consistency Loss (endpoint matching, not velocity-space) =====
+        # Sample t for consistency: use full range [t_min, t_max]
         t_cons = self.t_min + torch.rand(B, device=device) * (self.t_max - self.t_min)
-        delta_t = self.delta_min + torch.rand(B, device=device) * (self.delta_max - self.delta_min)
-        t_plus = torch.clamp(t_cons + delta_t, max=self.t_max)
+        # Fixed delta (not random range) for stable teacher target
+        delta_t = torch.full_like(t_cons, self.delta_min)
+        t_plus = torch.clamp(t_cons + delta_t, max=1.0)
         
+        x_t_cons = self._linear_interpolate(x_0, action_seq, t_cons)
         x_t_plus = self._linear_interpolate(x_0, action_seq, t_plus)
         
-        # Teacher: multi-step integration using EMA network
+        # Teacher: multi-step integration from t_cons (not t_plus) using EMA network
+        # This predicts x(1) starting from x(t_cons)
         with torch.no_grad():
-            x_teacher = x_t_plus.clone()
-            current_t = t_plus.clone()
+            # Teacher trajectory: x_t_cons -> x_t_plus -> ... -> x(1)
+            x_teacher = x_t_cons.clone()
+            current_t = t_cons.clone()
             remaining_time = 1.0 - current_t
             dt_teacher = remaining_time / self.teacher_steps
             
@@ -276,14 +294,23 @@ class AWCPAgent(nn.Module):
                 x_teacher = x_teacher + v_teacher * dt_expand
                 current_t = current_t + dt_teacher
             
-            target_x1 = x_teacher
+            target_x1 = x_teacher  # Teacher's prediction of final state
         
-        # Student consistency prediction
-        v_cons_target = target_x1 - x_0
-        v_cons_pred = self.velocity_net(x_t_plus, t_plus, global_cond=obs_cond)
+        # Student: predict x(1) from x(t_plus)
+        # Consistency: both should reach same final state
+        x_student = x_t_plus.clone()
+        current_t_student = t_plus.clone()
+        remaining_time_student = 1.0 - current_t_student
+        dt_student = remaining_time_student / self.teacher_steps
         
-        # Per-sample consistency loss, also weighted
-        consistency_loss_per_sample = F.mse_loss(v_cons_pred, v_cons_target, reduction="none")
+        for _ in range(self.teacher_steps):
+            v_student = self.velocity_net(x_student, current_t_student, global_cond=obs_cond)
+            dt_expand = dt_student.view(-1, 1, 1)
+            x_student = x_student + v_student * dt_expand
+            current_t_student = current_t_student + dt_student
+        
+        # Endpoint consistency loss: ||student_endpoint - teacher_endpoint||^2
+        consistency_loss_per_sample = F.mse_loss(x_student, target_x1, reduction="none")
         consistency_loss_per_sample = consistency_loss_per_sample.mean(dim=(1, 2))  # [B]
         consistency_loss = (weights * consistency_loss_per_sample).mean()
         

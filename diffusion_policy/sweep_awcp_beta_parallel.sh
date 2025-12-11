@@ -17,7 +17,7 @@ NUM_EVAL_EPISODES=100
 NUM_EVAL_ENVS=50
 NUM_DEMOS=1000
 SIM_BACKEND="physx_cuda"
-WANDB_PROJECT="maniskill_awcp_beta_grid_2"
+WANDB_PROJECT="maniskill_awcp_finetune_beta_grid"
 MAX_EPISODE_STEPS=100
 ENV_ID="LiftPegUpright-v1"
 CONTROL_MODE="pd_ee_delta_pose"
@@ -73,7 +73,7 @@ WEIGHT_CLIPS=(50.0 100.0 200.0 400.0)  # Can also sweep this if needed
 SEEDS=(0)
 
 DEMO_PATH="$HOME/.maniskill/demos/${ENV_ID}/rl/trajectory.rgb.${CONTROL_MODE}.physx_cuda.h5"
-LOG_DIR="/tmp/awcp_beta_grid_search_2"
+LOG_DIR="/tmp/awcp_finetune_beta_grid_search"
 mkdir -p "$LOG_DIR"
 
 echo "=========================================="

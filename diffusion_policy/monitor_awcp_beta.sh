@@ -5,7 +5,7 @@
 #
 # Usage: ./monitor_awcp_beta.sh [--log-dir /tmp/awcp_beta_grid_search]
 
-LOG_DIR="/tmp/awcp_beta_grid_search_2"
+LOG_DIR="/tmp/awcp_finetune_beta_grid_search"
 REFRESH=5  # seconds
 
 while [[ $# -gt 0 ]]; do
