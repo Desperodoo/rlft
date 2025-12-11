@@ -4,17 +4,43 @@ import torch
 from tqdm import tqdm
 from mani_skill.utils import common
 
-def evaluate(n: int, agent, eval_envs, device, sim_backend: str, progress_bar: bool = True):
+def evaluate(
+    n: int, 
+    agent, 
+    eval_envs, 
+    device, 
+    sim_backend: str, 
+    progress_bar: bool = True,
+    agent_kwargs: dict = None,
+):
+    """Evaluate agent in environment.
+    
+    Args:
+        n: Number of episodes to evaluate
+        agent: Agent with get_action() method
+        eval_envs: Evaluation environments
+        device: Torch device
+        sim_backend: Simulation backend ('physx_cpu' or 'physx_cuda')
+        progress_bar: Whether to show progress bar
+        agent_kwargs: Additional kwargs to pass to agent.get_action()
+            For ReinFlowAgent: {'deterministic': True, 'use_ema': True}
+    
+    Returns:
+        eval_metrics: Dict of metrics from evaluation
+    """
+    if agent_kwargs is None:
+        agent_kwargs = {}
+    
     agent.eval()
     if progress_bar:
-        pbar = tqdm(total=n)
+        pbar = tqdm(total=n, desc="Evaluating")
     with torch.no_grad():
         eval_metrics = defaultdict(list)
         obs, info = eval_envs.reset()
         eps_count = 0
         while eps_count < n:
             obs = common.to_tensor(obs, device)
-            action_seq = agent.get_action(obs)
+            action_seq = agent.get_action(obs, **agent_kwargs)
             if sim_backend == "physx_cpu":
                 action_seq = action_seq.cpu().numpy()
             for i in range(action_seq.shape[1]):

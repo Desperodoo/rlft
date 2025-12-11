@@ -9,6 +9,8 @@ Supports training multiple algorithms on ManiSkill environments:
 - shortcut_flow: ShortCut Flow with adaptive steps
 - diffusion_double_q: Diffusion Policy + Double Q-Learning (offline RL)
 - cpql: Consistency Policy Q-Learning (offline RL)
+- awcp: Advantage-Weighted Consistency Policy (offline RL)
+- aw_shortcut_flow: Advantage-Weighted ShortCut Flow (offline RL)
 
 Based on the official ManiSkill diffusion_policy implementation.
 """
@@ -44,6 +46,7 @@ from torch.utils.tensorboard import SummaryWriter
 from diffusion_policy.evaluate import evaluate
 from diffusion_policy.make_env import make_eval_envs
 from diffusion_policy.utils import (
+    AgentWrapper,
     IterationBasedBatchSampler,
     build_state_obs_extractor,
     convert_obs,
@@ -61,6 +64,7 @@ from diffusion_policy.algorithms import (
     DiffusionDoubleQAgent,
     CPQLAgent,
     AWCPAgent,
+    AWShortCutFlowAgent,
     DPPOAgent,
     ReinFlowAgent,
 )
@@ -90,7 +94,7 @@ class Args:
     # Environment settings
     env_id: str = "PegInsertionSide-v1"
     """the id of the environment"""
-    demo_path: str = "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cpu.h5"
+    demo_path: str = "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cuda.h5"
     """the path of demo dataset"""
     num_demos: Optional[int] = None
     """number of trajectories to load from the demo dataset"""
@@ -100,7 +104,7 @@ class Args:
     """the control mode"""
     obs_mode: str = "rgb+depth"
     """observation mode: rgb, depth, or rgb+depth"""
-    sim_backend: str = "physx_cpu"
+    sim_backend: str = "physx_cuda"
     """simulation backend for evaluation"""
 
     # Training settings
@@ -139,6 +143,7 @@ class Args:
         "diffusion_double_q", 
         "cpql",
         "awcp",
+        "aw_shortcut_flow",
         "dppo",
         "reinflow"
     ] = "diffusion_policy"
@@ -203,22 +208,22 @@ class Args:
     """maximum t for time sampling in shortcut_flow"""
     sc_t_sampling_mode: Literal["uniform", "truncated"] = "uniform"
     """time sampling mode: uniform (then clamp) or truncated (direct valid range)"""
-    sc_step_size_mode: Literal["power2", "uniform", "fixed"] = "power2"
-    """step size sampling mode: power2 (log-uniform), uniform, or fixed"""
+    sc_step_size_mode: Literal["power2", "uniform", "fixed"] = "fixed"
+    """step size sampling mode: power2 (log-uniform), uniform, or fixed. Sweep shows fixed small step is best."""
     sc_min_step_size: float = 0.0625
     """minimum step size (1/16 by default)"""
     sc_max_step_size: float = 0.5
     """maximum step size (1/2 by default)"""
-    sc_fixed_step_size: float = 0.125
-    """fixed step size when sc_step_size_mode=fixed"""
+    sc_fixed_step_size: float = 0.0625
+    """fixed step size when sc_step_size_mode=fixed. Sweep shows 1/16 is best for reliable teacher targets."""
     sc_target_mode: Literal["velocity", "endpoint"] = "velocity"
     """shortcut target mode: velocity (match v) or endpoint (match x1)"""
-    sc_teacher_steps: int = 2
-    """teacher rollout steps for shortcut target"""
+    sc_teacher_steps: int = 1
+    """teacher rollout steps for shortcut target. Sweep shows single step preserves locality best."""
     sc_use_ema_teacher: bool = True
     """whether to use EMA network as teacher for shortcut target"""
-    sc_inference_mode: Literal["adaptive", "uniform"] = "adaptive"
-    """inference mode: adaptive (variable step sizes) or uniform (fixed dt)"""
+    sc_inference_mode: Literal["adaptive", "uniform"] = "uniform"
+    """inference mode: adaptive (variable step sizes) or uniform (fixed dt). Sweep shows uniform avoids solver mismatch."""
     sc_num_inference_steps: int = 8
     """number of inference steps (for uniform mode or as fallback)"""
 
@@ -227,8 +232,8 @@ class Args:
     """Q-value weight for diffusion_double_q (0.01 for cpql)"""
     bc_weight: float = 1.0
     """BC/flow matching loss weight"""
-    consistency_weight: float = 1.0
-    """consistency loss weight (only for cpql)"""
+    consistency_weight: float = 0.3
+    """consistency/shortcut loss weight. Sweep shows flow-heavy (0.3-0.5) is best for ShortCut Flow."""
     gamma: float = 0.99
     """discount factor"""
     tau: float = 0.005
@@ -247,9 +252,9 @@ class Args:
     """Number of steps with gradient in last_few mode"""
     
     # AWCP (Advantage-Weighted Consistency Policy) specific hyperparameters
-    beta: float = 1.0
+    beta: float = 10.0
     """Temperature for advantage weighting in AWCP (higher = more selective)"""
-    weight_clip: float = 10.0
+    weight_clip: float = 100.0
     """Maximum weight to prevent outlier dominance in AWCP"""
 
     # Logging settings
@@ -809,6 +814,55 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
             device=device,
         )
     
+    elif algorithm == "aw_shortcut_flow":
+        shortcut_velocity_net = ShortCutVelocityUNet1D(
+            input_dim=action_dim,
+            global_cond_dim=global_cond_dim,
+            diffusion_step_embed_dim=args.diffusion_step_embed_dim,
+            down_dims=tuple(args.unet_dims),
+            n_groups=args.n_groups,
+        )
+        
+        # Q-Network for advantage weighting
+        q_network = DoubleQNetwork(
+            action_dim=action_dim,
+            obs_dim=global_cond_dim,
+            action_horizon=args.act_horizon,
+        )
+        
+        return AWShortCutFlowAgent(
+            velocity_net=shortcut_velocity_net,
+            q_network=q_network,
+            action_dim=action_dim,
+            obs_horizon=args.obs_horizon,
+            pred_horizon=args.pred_horizon,
+            act_horizon=args.act_horizon,
+            # Offline RL hyperparameters
+            beta=args.beta,
+            bc_weight=args.bc_weight,
+            shortcut_weight=args.consistency_weight,
+            self_consistency_k=args.self_consistency_k,
+            gamma=args.gamma,
+            tau=args.tau,
+            reward_scale=args.reward_scale,
+            q_target_clip=args.q_target_clip,
+            ema_decay=args.ema_decay,
+            weight_clip=args.weight_clip,
+            # ShortCut Flow parameters
+            step_size_mode=args.sc_step_size_mode,
+            fixed_step_size=args.sc_fixed_step_size,
+            min_step_size=args.sc_min_step_size,
+            max_step_size=args.sc_max_step_size,
+            target_mode=args.sc_target_mode,
+            teacher_steps=args.sc_teacher_steps,
+            use_ema_teacher=args.sc_use_ema_teacher,
+            t_min=args.sc_t_min,
+            t_max=args.sc_t_max,
+            inference_mode=args.sc_inference_mode,
+            num_inference_steps=args.sc_num_inference_steps,
+            device=device,
+        )
+    
     elif algorithm == "dppo":
         noise_pred_net = ConditionalUnet1D(
             input_dim=action_dim,
@@ -856,16 +910,24 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
         raise ValueError(f"Unknown algorithm: {algorithm}")
 
 
-def save_ckpt(run_name, tag, agent, ema_agent):
-    """Save checkpoint. Assumes ema_agent has already been updated with EMA params."""
+def save_ckpt(run_name, tag, agent, ema_agent, visual_encoder=None):
+    """Save checkpoint. Assumes ema_agent has already been updated with EMA params.
+    
+    Args:
+        run_name: Run directory name
+        tag: Checkpoint tag (e.g., 'best_eval_success_once')
+        agent: Agent model
+        ema_agent: EMA agent model
+        visual_encoder: Optional visual encoder model (PlainConv)
+    """
     os.makedirs(f"runs/{run_name}/checkpoints", exist_ok=True)
-    torch.save(
-        {
-            "agent": agent.state_dict(),
-            "ema_agent": ema_agent.state_dict(),
-        },
-        f"runs/{run_name}/checkpoints/{tag}.pt",
-    )
+    ckpt = {
+        "agent": agent.state_dict(),
+        "ema_agent": ema_agent.state_dict(),
+    }
+    if visual_encoder is not None:
+        ckpt["visual_encoder"] = visual_encoder.state_dict()
+    torch.save(ckpt, f"runs/{run_name}/checkpoints/{tag}.pt")
 
 
 if __name__ == "__main__":
@@ -1033,105 +1095,11 @@ if __name__ == "__main__":
     print(f"Agent ({args.algorithm}) parameters: {sum(p.numel() for p in agent.parameters()) / 1e6:.2f}M")
     
     # Create agent wrapper for evaluation (handles obs encoding)
-    # This mirrors the encode_obs and get_action logic from train_rgbd.py's Agent class
-    class AgentWrapper(nn.Module):
-        """Wrapper that combines visual encoder and agent for evaluation.
-        
-        Aligns with train_rgbd.py's Agent.encode_obs and Agent.get_action methods.
-        """
-        def __init__(self, agent, visual_encoder, include_rgb, include_depth, obs_horizon):
-            super().__init__()
-            self.agent = agent
-            self.visual_encoder = visual_encoder
-            self.include_rgb = include_rgb
-            self.include_depth = include_depth
-            self.obs_horizon = obs_horizon
-            
-        def encode_obs(self, obs_seq, eval_mode=True):
-            """Encode observations to get obs_cond for agents.
-            
-            Mirrors train_rgbd.py Agent.encode_obs exactly.
-            
-            Input from environment:
-                obs_seq["rgb"]: (B, obs_horizon, H, W, C) uint8
-                obs_seq["state"]: (B, obs_horizon, state_dim) float32
-            
-            Output:
-                obs_cond: (B, obs_horizon * (visual_dim + state_dim))
-            """
-            # Convert from NHWC to NCHW if needed (environment returns HWC)
-            if self.include_rgb and "rgb" in obs_seq:
-                rgb = obs_seq["rgb"]
-                if rgb.dim() == 5 and rgb.shape[-1] in [1, 3, 4]:
-                    # (B, T, H, W, C) -> (B, T, C, H, W)
-                    rgb = rgb.permute(0, 1, 4, 2, 3)
-                rgb = rgb.float() / 255.0
-                img_seq = rgb
-                
-            if self.include_depth and "depth" in obs_seq:
-                depth = obs_seq["depth"]
-                if depth.dim() == 5 and depth.shape[-1] == 1:
-                    depth = depth.permute(0, 1, 4, 2, 3)
-                depth = depth.float() / 1024.0
-                img_seq = depth
-                
-            if self.include_rgb and self.include_depth:
-                img_seq = torch.cat([rgb, depth], dim=2)  # (B, obs_horizon, C, H, W)
-            
-            features_list = []
-            
-            if self.visual_encoder is not None and (self.include_rgb or self.include_depth):
-                batch_size = img_seq.shape[0]
-                img_seq_flat = img_seq.flatten(end_dim=1)  # (B*obs_horizon, C, H, W)
-                visual_feature = self.visual_encoder(img_seq_flat)  # (B*obs_horizon, D)
-                visual_feature = visual_feature.reshape(
-                    batch_size, self.obs_horizon, visual_feature.shape[1]
-                )  # (B, obs_horizon, D)
-                features_list.append(visual_feature)
-            
-            # State
-            state = obs_seq["state"]  # (B, obs_horizon, state_dim)
-            features_list.append(state)
-            
-            # Concatenate: (B, obs_horizon, D+state_dim)
-            feature = torch.cat(features_list, dim=-1)
-            # Flatten: (B, obs_horizon * (D+state_dim))
-            obs_cond = feature.flatten(start_dim=1)
-            
-            return obs_cond
-        
-        def get_action(self, obs_seq):
-            """Get action from observations (for evaluation).
-            
-            Mirrors train_rgbd.py Agent.get_action.
-            """
-            with torch.no_grad():
-                # encode_obs returns (B, global_cond_dim) - flattened observation features
-                obs_cond = self.encode_obs(obs_seq, eval_mode=True)
-                
-                # Pass flattened obs_cond directly to agent.get_action
-                # The agent's velocity_net/noise_pred_net expects global_cond as (B, global_cond_dim)
-                action_seq = self.agent.get_action(obs_cond)
-                
-                # Only return act_horizon actions (aligned with train_rgbd.py)
-                start = self.obs_horizon - 1
-                end = start + args.act_horizon
-                return action_seq[:, start:end]
-        
-        def eval(self):
-            self.agent.eval()
-            if self.visual_encoder is not None:
-                self.visual_encoder.eval()
-            return self
-        
-        def train(self):
-            self.agent.train()
-            if self.visual_encoder is not None:
-                self.visual_encoder.train()
-            return self
-    
-    # Create wrapped agent for evaluation
-    agent_wrapper = AgentWrapper(agent, visual_encoder, include_rgb_flag, include_depth_flag, args.obs_horizon).to(device)
+    # AgentWrapper is imported from diffusion_policy.utils
+    agent_wrapper = AgentWrapper(
+        agent, visual_encoder, include_rgb_flag, include_depth_flag, 
+        args.obs_horizon, args.act_horizon
+    ).to(device)
     
     # Setup optimizers
     # IL algorithms (no critic): BC-only training
@@ -1247,7 +1215,7 @@ if __name__ == "__main__":
                 if k in eval_metrics and eval_metrics[k] > best_eval_metrics[k]:
                     best_eval_metrics[k] = eval_metrics[k]
                     # copy_ema_to_eval_agent is already called above, so ema_agent is up-to-date
-                    save_ckpt(run_name, f"best_eval_{k}", agent, ema_agent)
+                    save_ckpt(run_name, f"best_eval_{k}", agent, ema_agent, visual_encoder)
                     print(f"New best {k}: {eval_metrics[k]:.4f}. Saving checkpoint.")
     
     def log_metrics(iteration, losses):
@@ -1438,7 +1406,7 @@ if __name__ == "__main__":
         # Checkpoint
         if args.save_freq is not None and iteration % args.save_freq == 0:
             copy_ema_to_eval_agent()
-            save_ckpt(run_name, str(iteration), agent, ema_agent)
+            save_ckpt(run_name, str(iteration), agent, ema_agent, visual_encoder)
         
         pbar.update(1)
         pbar.set_postfix({k: f"{v:.4f}" for k, v in losses.items()})

@@ -49,7 +49,7 @@ class AWCPAgent(nn.Module):
         pred_horizon: Length of action sequence to predict (default: 16)
         act_horizon: Length of action sequence for Q-learning (default: 8)
         num_flow_steps: Number of ODE integration steps (default: 10)
-        beta: Temperature for advantage weighting (default: 1.0)
+        beta: Temperature for advantage weighting (default: 10.0)
         bc_weight: Weight for flow matching loss (default: 1.0)
         consistency_weight: Weight for consistency loss (default: 1.0)
         gamma: Discount factor (default: 0.99)
@@ -57,7 +57,7 @@ class AWCPAgent(nn.Module):
         reward_scale: Scale factor for rewards (default: 0.1)
         q_target_clip: Clip range for Q target (default: 100.0)
         ema_decay: Decay rate for EMA velocity network (default: 0.999)
-        weight_clip: Maximum weight to prevent outliers (default: 10.0)
+        weight_clip: Maximum weight to prevent outliers (default: 100.0)
         use_advantage: Whether to use advantage (Q - baseline) or raw Q (default: True)
         device: Device to run on (default: "cuda")
     """
@@ -71,7 +71,7 @@ class AWCPAgent(nn.Module):
         pred_horizon: int = 16,
         act_horizon: int = 8,
         num_flow_steps: int = 10,
-        beta: float = 1.0,
+        beta: float = 10.0,
         bc_weight: float = 1.0,
         consistency_weight: float = 1.0,
         gamma: float = 0.99,
@@ -79,7 +79,7 @@ class AWCPAgent(nn.Module):
         reward_scale: float = 0.1,
         q_target_clip: float = 100.0,
         ema_decay: float = 0.999,
-        weight_clip: float = 10.0,
+        weight_clip: float = 100.0,
         use_advantage: bool = True,
         device: str = "cuda",
     ):

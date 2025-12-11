@@ -101,6 +101,14 @@ class ShortCutFlowAgent(nn.Module):
     - Step size: step_size_mode (power2/uniform/fixed), min/max step sizes
     - Target: target_mode (velocity/endpoint), teacher_steps, use_ema_teacher
     - Inference: inference_mode (adaptive/uniform), num_inference_steps
+    
+    Based on sweep results, recommended config:
+    - step_size_mode: "fixed" with fixed_step_size=0.0625 (1/16)
+    - target_mode: "velocity" (not endpoint)
+    - use_ema_teacher: True
+    - teacher_steps: 1 (single step preserves locality)
+    - flow_weight > shortcut_weight (e.g., 1.0 vs 0.3)
+    - inference_mode: "uniform" (avoids solver mismatch)
     """
     
     def __init__(
@@ -112,23 +120,23 @@ class ShortCutFlowAgent(nn.Module):
         max_denoising_steps: int = 8,
         self_consistency_k: float = 0.25,  # Fraction of batch for consistency
         flow_weight: float = 1.0,
-        shortcut_weight: float = 1.0,
+        shortcut_weight: float = 0.3,  # Sweep: flow-heavy is best
         ema_decay: float = 0.999,
         # Time sampling hyperparameters
         t_min: float = 0.0,
         t_max: float = 1.0,
         t_sampling_mode: Literal["uniform", "truncated"] = "uniform",
-        # Step size hyperparameters
-        step_size_mode: Literal["power2", "uniform", "fixed"] = "power2",
+        # Step size hyperparameters (sweep: fixed small step is best)
+        step_size_mode: Literal["power2", "uniform", "fixed"] = "fixed",
         min_step_size: float = 0.0625,  # 1/16 by default
         max_step_size: float = 0.5,     # 1/2 by default
-        fixed_step_size: float = 0.125, # 1/8 for fixed mode
+        fixed_step_size: float = 0.0625, # 1/16 (sweep best)
         # Target computation hyperparameters
         target_mode: Literal["velocity", "endpoint"] = "velocity",
-        teacher_steps: int = 2,
+        teacher_steps: int = 1,  # Sweep: single step preserves locality
         use_ema_teacher: bool = True,
-        # Inference hyperparameters
-        inference_mode: Literal["adaptive", "uniform"] = "adaptive",
+        # Inference hyperparameters (sweep: uniform avoids solver mismatch)
+        inference_mode: Literal["adaptive", "uniform"] = "uniform",
         num_inference_steps: int = 8,
         device: str = "cuda",
     ):

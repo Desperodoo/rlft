@@ -210,3 +210,123 @@ def build_state_obs_extractor(env_id):
     # NOTE: You can tune/modify state observations specific to each environment here as you wish. By default we include all data
     # but in some use cases you might want to exclude e.g. obs["agent"]["qvel"] as qvel is not always something you query in the real world.
     return lambda obs: list(obs["agent"].values()) + list(obs["extra"].values())
+
+
+class AgentWrapper(nn.Module):
+    """Wrapper that combines visual encoder and agent for evaluation.
+    
+    Aligns with train_rgbd.py's Agent.encode_obs and Agent.get_action methods.
+    Can be used by both offline (train_offline_rl.py) and online (train_online_finetune.py) training.
+    
+    Args:
+        agent: The policy agent (diffusion policy, flow matching, etc.)
+        visual_encoder: Visual encoder for RGB/depth images (can be None for state-only)
+        include_rgb: Whether to include RGB in observations
+        include_depth: Whether to include depth in observations
+        obs_horizon: Number of observation frames to stack
+        act_horizon: Number of action frames to predict (optional, for slicing output)
+    """
+    def __init__(self, agent, visual_encoder, include_rgb, include_depth, obs_horizon, act_horizon=None):
+        super().__init__()
+        self.agent = agent
+        self.visual_encoder = visual_encoder
+        self.include_rgb = include_rgb
+        self.include_depth = include_depth
+        self.obs_horizon = obs_horizon
+        self.act_horizon = act_horizon if act_horizon is not None else obs_horizon
+        
+    def encode_obs(self, obs_seq, eval_mode=True):
+        """Encode observations to get obs_cond for agents.
+        
+        Mirrors train_rgbd.py Agent.encode_obs exactly.
+        
+        Input from environment:
+            obs_seq["rgb"]: (B, obs_horizon, H, W, C) uint8
+            obs_seq["state"]: (B, obs_horizon, state_dim) float32
+        
+        Output:
+            obs_cond: (B, obs_horizon * (visual_dim + state_dim))
+        """
+        # Convert from NHWC to NCHW if needed (environment returns HWC)
+        img_seq = None
+        
+        if self.include_rgb and "rgb" in obs_seq:
+            rgb = obs_seq["rgb"]
+            if rgb.dim() == 5 and rgb.shape[-1] in [1, 3, 4]:
+                # (B, T, H, W, C) -> (B, T, C, H, W)
+                rgb = rgb.permute(0, 1, 4, 2, 3)
+            rgb = rgb.float() / 255.0
+            img_seq = rgb
+            
+        if self.include_depth and "depth" in obs_seq:
+            depth = obs_seq["depth"]
+            if depth.dim() == 5 and depth.shape[-1] == 1:
+                depth = depth.permute(0, 1, 4, 2, 3)
+            depth = depth.float() / 1024.0
+            img_seq = depth
+            
+        if self.include_rgb and self.include_depth:
+            img_seq = torch.cat([rgb, depth], dim=2)  # (B, obs_horizon, C, H, W)
+        
+        features_list = []
+        
+        if self.visual_encoder is not None and img_seq is not None:
+            batch_size = img_seq.shape[0]
+            img_seq_flat = img_seq.flatten(end_dim=1)  # (B*obs_horizon, C, H, W)
+            visual_feature = self.visual_encoder(img_seq_flat)  # (B*obs_horizon, D)
+            visual_feature = visual_feature.reshape(
+                batch_size, self.obs_horizon, visual_feature.shape[1]
+            )  # (B, obs_horizon, D)
+            features_list.append(visual_feature)
+        
+        # State
+        state = obs_seq["state"]  # (B, obs_horizon, state_dim)
+        features_list.append(state)
+        
+        # Concatenate: (B, obs_horizon, D+state_dim)
+        feature = torch.cat(features_list, dim=-1)
+        # Flatten: (B, obs_horizon * (D+state_dim))
+        obs_cond = feature.flatten(start_dim=1)
+        
+        return obs_cond
+    
+    def get_action(self, obs_seq, **kwargs):
+        """Get action from observations (for evaluation).
+        
+        Mirrors train_rgbd.py Agent.get_action.
+        
+        Args:
+            obs_seq: Dict with 'rgb', 'depth', 'state' observations
+            **kwargs: Additional arguments to pass to agent.get_action()
+                - For ReinFlowAgent: deterministic=True, use_ema=True
+        """
+        with torch.no_grad():
+            # encode_obs returns (B, global_cond_dim) - flattened observation features
+            obs_cond = self.encode_obs(obs_seq, eval_mode=True)
+            
+            # Pass flattened obs_cond directly to agent.get_action
+            # The agent's velocity_net/noise_pred_net expects global_cond as (B, global_cond_dim)
+            result = self.agent.get_action(obs_cond, **kwargs)
+            
+            # Handle agents that return (action_seq, chains) tuple (e.g., ReinFlowAgent)
+            if isinstance(result, tuple):
+                action_seq = result[0]
+            else:
+                action_seq = result
+            
+            # Only return act_horizon actions (aligned with train_rgbd.py)
+            start = self.obs_horizon - 1
+            end = start + self.act_horizon
+            return action_seq[:, start:end]
+    
+    def eval(self):
+        self.agent.eval()
+        if self.visual_encoder is not None:
+            self.visual_encoder.eval()
+        return self
+    
+    def train(self):
+        self.agent.train()
+        if self.visual_encoder is not None:
+            self.visual_encoder.train()
+        return self
