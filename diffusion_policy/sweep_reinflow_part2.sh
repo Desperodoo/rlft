@@ -26,13 +26,8 @@ OBS_MODE="rgb"
 
 PRETRAINED_PATH_PATTERN="/home/wjz/rlft/diffusion_policy/runs/awsc-{ENV_ID}-seed0/checkpoints/best_eval_success_once.pt"
 
-# Part 2: LR + Inference + Rollout + Critic Stability (14 configs)
+# Part 2: LR + Inference + Rollout + Critic Stability (11 configs)
 CONFIGS=(
-    # === LEARNING RATE ABLATION (3) ===
-    "lr:low"
-    "lr:high"
-    "lr:equal"
-    
     # === INFERENCE STEPS ABLATION (2) ===
     "infer:4steps"
     "infer:16steps"
@@ -45,7 +40,6 @@ CONFIGS=(
     # === CRITIC STABILITY ABLATION (6) ===
     "critic:no_target_vnet"
     "critic:high_reward_scale"
-    "critic:low_reward_scale"
     "critic:no_return_norm"
     "critic:high_value_clip"
     "critic:fast_target_update"
@@ -122,13 +116,9 @@ run_task() {
     critic_warmup_steps=10
     noise_decay_type="linear"
     noise_decay_steps=500000
-    min_noise_std=0.01
-    max_noise_std=0.3
     clip_ratio=0.2
     entropy_coef=0.00
     value_coef=0.5
-    lr=3e-5
-    lr_critic=1e-4
     num_inference_steps=8
     rollout_steps=128
     ppo_epochs=1
@@ -138,7 +128,7 @@ run_task() {
     max_grad_norm=0.5
     freeze_visual_encoder=true
     normalize_rewards=true
-    reward_scale=0.1
+    reward_scale=0.5
     value_target_tau=0.005
     use_target_value_net=true
     value_target_clip=100.0
@@ -149,13 +139,6 @@ run_task() {
     profile="${category}-${variant}"
 
     case "$category" in
-        lr)
-            case "$variant" in
-                low) lr=1e-5; lr_critic=3e-5 ;;
-                high) lr=1e-4; lr_critic=3e-4 ;;
-                equal) lr=5e-5; lr_critic=5e-5 ;;
-            esac
-            ;;
         infer)
             case "$variant" in
                 4steps) num_inference_steps=4 ;;
@@ -172,8 +155,7 @@ run_task() {
         critic)
             case "$variant" in
                 no_target_vnet) use_target_value_net=false ;;
-                high_reward_scale) reward_scale=0.5 ;;
-                low_reward_scale) reward_scale=0.01 ;;
+                high_reward_scale) reward_scale=1.0 ;;
                 no_return_norm) normalize_returns=false ;;
                 high_value_clip) value_target_clip=500.0 ;;
                 fast_target_update) value_target_tau=0.05 ;;
@@ -195,9 +177,8 @@ run_task() {
         --track --wandb_project_name $WANDB_PROJECT \
         --critic_warmup_steps $critic_warmup_steps \
         --noise_decay_type $noise_decay_type --noise_decay_steps $noise_decay_steps \
-        --min_noise_std $min_noise_std --max_noise_std $max_noise_std \
         --clip_ratio $clip_ratio --entropy_coef $entropy_coef --value_coef $value_coef \
-        --lr $lr --lr_critic $lr_critic --num_inference_steps $num_inference_steps \
+        --num_inference_steps $num_inference_steps \
         --rollout_steps $rollout_steps --ppo_epochs $ppo_epochs \
         --minibatch_size $minibatch_size --gamma $gamma --gae_lambda $gae_lambda \
         --max_grad_norm $max_grad_norm --reward_scale $reward_scale \

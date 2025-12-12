@@ -32,9 +32,9 @@ CONFIGS=(
     "baseline:default"
     
     # === CRITIC WARMUP ABLATION (3) ===
-    "warmup:0"
-    "warmup:2k"
-    "warmup:5k"
+    "warmup:100"
+    "warmup:200"
+    "warmup:500"
     
     # === NOISE SCHEDULE ABLATION (5) ===
     "noise:constant"
@@ -119,16 +119,12 @@ run_task() {
     IFS=':' read -r category variant <<< "$cfg"
 
     # Default values
-    critic_warmup_steps=10
+    critic_warmup_steps=50
     noise_decay_type="linear"
     noise_decay_steps=500000
-    min_noise_std=0.01
-    max_noise_std=0.3
     clip_ratio=0.2
     entropy_coef=0.00
     value_coef=0.5
-    lr=3e-5
-    lr_critic=1e-4
     num_inference_steps=8
     rollout_steps=128
     ppo_epochs=1
@@ -138,7 +134,7 @@ run_task() {
     max_grad_norm=0.5
     freeze_visual_encoder=true
     normalize_rewards=true
-    reward_scale=0.1
+    reward_scale=0.5
     value_target_tau=0.005
     use_target_value_net=true
     value_target_clip=100.0
@@ -154,9 +150,9 @@ run_task() {
             ;;
         warmup)
             case "$variant" in
-                0) critic_warmup_steps=0 ;;
-                2k) critic_warmup_steps=20 ;;
-                5k) critic_warmup_steps=50 ;;
+                100) critic_warmup_steps=100 ;;
+                200) critic_warmup_steps=200 ;;
+                500) critic_warmup_steps=500 ;;
             esac
             ;;
         noise)
@@ -164,8 +160,6 @@ run_task() {
                 constant) noise_decay_type="constant" ;;
                 exp) noise_decay_type="exponential" ;;
                 fast) noise_decay_steps=200000 ;;
-                low_init) max_noise_std=0.15 ;;
-                high_init) max_noise_std=0.5 ;;
             esac
             ;;
         ppo)
@@ -193,9 +187,8 @@ run_task() {
         --track --wandb_project_name $WANDB_PROJECT \
         --critic_warmup_steps $critic_warmup_steps \
         --noise_decay_type $noise_decay_type --noise_decay_steps $noise_decay_steps \
-        --min_noise_std $min_noise_std --max_noise_std $max_noise_std \
         --clip_ratio $clip_ratio --entropy_coef $entropy_coef --value_coef $value_coef \
-        --lr $lr --lr_critic $lr_critic --num_inference_steps $num_inference_steps \
+        --num_inference_steps $num_inference_steps \
         --rollout_steps $rollout_steps --ppo_epochs $ppo_epochs \
         --minibatch_size $minibatch_size --gamma $gamma --gae_lambda $gae_lambda \
         --max_grad_norm $max_grad_norm --reward_scale $reward_scale \

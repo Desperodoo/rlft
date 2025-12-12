@@ -113,9 +113,9 @@ class Args:
     """number of PPO epochs per update"""
     minibatch_size: int = 5120
     """minibatch size for PPO updates"""
-    lr: float = 3e-5
+    lr: float = 1e-5
     """learning rate for policy"""
-    lr_critic: float = 1e-4
+    lr_critic: float = 3e-5
     """learning rate for value network"""
     max_grad_norm: float = 0.5
     """maximum gradient norm for clipping"""
@@ -157,7 +157,7 @@ class Args:
     # Noise scheduling
     min_noise_std: float = 0.01
     """minimum exploration noise std"""
-    max_noise_std: float = 0.3
+    max_noise_std: float = 0.15
     """maximum exploration noise std"""
     noise_decay_type: Literal["constant", "linear", "exponential"] = "linear"
     """noise decay schedule type"""
@@ -179,7 +179,7 @@ class Args:
     """clip value predictions to [-range, range] for stable training"""
     
     # === NEW: Critic stability improvements (borrowed from AWCP) ===
-    reward_scale: float = 0.1
+    reward_scale: float = 0.5
     """scale factor for rewards (like AWCP's reward_scale, helps stabilize critic)"""
     value_target_tau: float = 0.005
     """soft update rate for target value network (like AWCP's tau)"""
