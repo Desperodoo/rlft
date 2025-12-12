@@ -14,8 +14,8 @@ DRY_RUN=false
 TOTAL_UPDATES=10000
 EVAL_FREQ=100
 LOG_FREQ=1
-NUM_EVAL_EPISODES=20
-NUM_EVAL_ENVS=5
+NUM_EVAL_EPISODES=21
+NUM_EVAL_ENVS=3
 NUM_ENVS=25
 SIM_BACKEND="physx_cuda"
 WANDB_PROJECT="maniskill_reinflow_grid"
@@ -39,7 +39,7 @@ CONFIGS=(
     
     # === ROLLOUT CONFIG ABLATION (3) ===
     "rollout:short"
-    "rollout:long"
+    # "rollout:long"
     "rollout:more_epochs"
     
     # === CRITIC STABILITY ABLATION (6) ===
@@ -165,7 +165,7 @@ run_task() {
         rollout)
             case "$variant" in
                 short) rollout_steps=128; minibatch_size=2048 ;;
-                long) rollout_steps=512; minibatch_size=10240 ;;
+                # long) rollout_steps=512; minibatch_size=10240 ;;
                 more_epochs) rollout_steps=256; ppo_epochs=10 ;;
             esac
             ;;
