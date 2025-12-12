@@ -85,9 +85,9 @@ class Args:
     # Environment settings
     env_id: str = "LiftPegUpright-v1"
     """the id of the environment"""
-    num_envs: int = 50
+    num_envs: int = 20
     """number of parallel environments for training"""
-    num_eval_envs: int = 50
+    num_eval_envs: int = 5
     """number of parallel eval environments"""
     max_episode_steps: Optional[int] = None
     """max episode steps"""
@@ -105,13 +105,13 @@ class Args:
     """whether to freeze visual encoder during fine-tuning"""
 
     # Training settings
-    total_updates: int = 20_000
+    total_updates: int = 10_000
     """total training timesteps (env steps, not policy steps)"""
-    rollout_steps: int = 128
+    rollout_steps: int = 256
     """number of SMDP chunks to collect before each update"""
-    ppo_epochs: int = 2
+    ppo_epochs: int = 10
     """number of PPO epochs per update"""
-    minibatch_size: int = 6400
+    minibatch_size: int = 5120
     """minibatch size for PPO updates"""
     lr: float = 3e-5
     """learning rate for policy"""
@@ -127,7 +127,7 @@ class Args:
     """GAE lambda"""
     clip_ratio: float = 0.2
     """PPO clip ratio"""
-    entropy_coef: float = 0.01
+    entropy_coef: float = 0.00
     """entropy coefficient"""
     value_coef: float = 0.5
     """value loss coefficient"""
@@ -165,7 +165,7 @@ class Args:
     """steps over which to decay exploration noise"""
 
     # Critic warmup
-    critic_warmup_steps: int = 5000
+    critic_warmup_steps: int = 10
     """number of steps to train critic only (policy frozen)"""
 
     # Reward processing
@@ -177,6 +177,24 @@ class Args:
     """whether to clip value loss to reduce vloss explosion"""
     value_clip_range: float = 10.0
     """clip value predictions to [-range, range] for stable training"""
+    
+    # === NEW: Critic stability improvements (borrowed from AWCP) ===
+    reward_scale: float = 0.1
+    """scale factor for rewards (like AWCP's reward_scale, helps stabilize critic)"""
+    value_target_tau: float = 0.005
+    """soft update rate for target value network (like AWCP's tau)"""
+    use_target_value_net: bool = True
+    """whether to use target value network for stable value estimation"""
+    value_target_clip: float = 100.0
+    """clip value targets to prevent extreme values (like AWCP's q_target_clip)"""
+    normalize_returns: bool = True
+    """whether to normalize returns using running mean/std"""
+    
+    # === NEW: KL divergence early stopping ===
+    target_kl: Optional[float] = 0.02
+    """target KL divergence for early stopping PPO epochs (None to disable)"""
+    kl_early_stop: bool = True
+    """whether to enable KL-based early stopping of PPO epochs"""
 
     # Logging settings (in number of updates, not timesteps)
     log_freq: int = 1
@@ -185,7 +203,7 @@ class Args:
     """evaluation frequency (in number of updates)"""
     save_freq: int = 10000000
     """checkpoint save frequency (in number of updates)"""
-    num_eval_episodes: int = 50
+    num_eval_episodes: int = 20
     """number of evaluation episodes"""
 
 
@@ -243,6 +261,30 @@ class RewardNormalizer:
     def normalize(self, reward: float) -> float:
         """Normalize a single reward by dividing by std."""
         return reward / (self.rms.std + self.epsilon)
+
+
+class ReturnNormalizer:
+    """Running mean/std for return normalization (like AWCP's reward scaling).
+    
+    Tracks the running statistics of returns and normalizes them to have
+    approximately unit variance, which helps stabilize value network training.
+    """
+    
+    def __init__(self, epsilon: float = 1e-8):
+        self.epsilon = epsilon
+        self.rms = RunningMeanStd(epsilon=epsilon)
+    
+    def update(self, returns: np.ndarray):
+        """Update running statistics with batch of returns."""
+        self.rms.update(returns.flatten())
+    
+    def normalize(self, returns: np.ndarray) -> np.ndarray:
+        """Normalize returns by dividing by std (not subtracting mean)."""
+        return returns / (self.rms.std + self.epsilon)
+    
+    @property
+    def std(self) -> float:
+        return self.rms.std
 
 
 def make_train_envs(env_id: str, num_envs: int, sim_backend: str, 
@@ -424,6 +466,11 @@ def main():
         noise_decay_type=args.noise_decay_type,
         noise_decay_steps=args.noise_decay_steps,
         critic_warmup_steps=args.critic_warmup_steps,
+        # === NEW: Critic stability parameters ===
+        reward_scale=args.reward_scale,
+        value_target_tau=args.value_target_tau,
+        use_target_value_net=args.use_target_value_net,
+        value_target_clip=args.value_target_clip,
     ).to(device)
     
     # Load pretrained checkpoint
@@ -450,6 +497,18 @@ def main():
         for param in visual_encoder.parameters():
             param.requires_grad = False
         print("Visual encoder frozen")
+    
+    # Calculate and log model statistics
+    total_params = sum(p.numel() for p in agent.parameters())
+    trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
+    visual_params = 0
+    if include_rgb or include_depth:
+        visual_params = sum(p.numel() for p in visual_encoder.parameters())
+        trainable_visual_params = sum(p.numel() for p in visual_encoder.parameters() if p.requires_grad)
+        print(f"Visual encoder parameters: {visual_params / 1e6:.2f}M (trainable: {trainable_visual_params / 1e6:.2f}M)")
+    
+    print(f"Agent parameters: {total_params / 1e6:.2f}M (trainable: {trainable_params / 1e6:.2f}M)")
+    print(f"Total model parameters: {(total_params + visual_params) / 1e6:.2f}M")
     
     # Set up optimizers
     policy_params = list(agent.noisy_velocity_net.parameters())
@@ -538,6 +597,7 @@ def main():
     
     # Training statistics
     reward_normalizer = RewardNormalizer(gamma=args.gamma)
+    return_normalizer = ReturnNormalizer()  # NEW: For return normalization
     global_step = 0
     num_updates = 0
     start_time = time.time()
@@ -571,6 +631,49 @@ def main():
     print(f"Log every {args.log_freq} updates, Eval every {args.eval_freq} updates, Save every {args.save_freq} updates")
     print(f"Critic warmup steps: {args.critic_warmup_steps}")
     print(f"Noise schedule: {args.noise_decay_type}, {args.max_noise_std} -> {args.min_noise_std} over {args.noise_decay_steps} steps")
+    
+    # Log configuration and model info to tensorboard and wandb
+    config_text = f"""
+    ## Training Configuration
+    - Algorithm: ReinFlow (Online RL Fine-tuning)
+    - Environment: {args.env_id}
+    - Observation Mode: {args.obs_mode}
+    - Simulation Backend: {args.sim_backend}
+    
+    ## Model Configuration
+    - Total Parameters: {(total_params + visual_params) / 1e6:.2f}M
+    - Agent Parameters: {total_params / 1e6:.2f}M
+    - Visual Encoder Parameters: {visual_params / 1e6:.2f}M
+    - Frozen Visual Encoder: {args.freeze_visual_encoder}
+    
+    ## Training Settings
+    - Total Timesteps: {total_timesteps}
+    - Total Updates: {args.total_updates}
+    - Batch Size (per env): {args.num_envs}
+    - Rollout Steps: {args.rollout_steps}
+    - PPO Epochs: {args.ppo_epochs}
+    - Minibatch Size: {args.minibatch_size}
+    - Learning Rate: {args.lr}
+    - Critic Learning Rate: {args.lr_critic}
+    
+    ## PPO Hyperparameters
+    - Gamma (discount): {args.gamma}
+    - GAE Lambda: {args.gae_lambda}
+    - Clip Ratio: {args.clip_ratio}
+    - Entropy Coefficient: {args.entropy_coef}
+    - Value Coefficient: {args.value_coef}
+    - Max Grad Norm: {args.max_grad_norm}
+    
+    ## Exploration Settings
+    - Noise Schedule: {args.noise_decay_type}
+    - Max Noise Std: {args.max_noise_std}
+    - Min Noise Std: {args.min_noise_std}
+    - Noise Decay Steps: {args.noise_decay_steps}
+    - Critic Warmup Steps: {args.critic_warmup_steps}
+    """
+    writer.add_text("config/training", config_text)
+    if args.track:
+        wandb.log({"config/training": wandb.Html(config_text.replace("\n", "<br>"))})
     
     # Track done state for GAE (following ppo_rgb.py)
     next_done = torch.zeros(args.num_envs, device=device)
@@ -665,7 +768,11 @@ def main():
                 chunk_done_flags = chunk_done_flags | chunk_dones_tensor[i]
                 discount *= args.gamma
             
-            # Optional: normalize rewards
+            # === NEW: Apply reward scaling (like AWCP's reward_scale) ===
+            # This is critical for stabilizing critic training
+            cum_rewards = cum_rewards * args.reward_scale
+            
+            # Optional: normalize rewards (additional normalization on top of scaling)
             if args.normalize_rewards:
                 reward_normalizer.update(cum_rewards.cpu().numpy())
                 cum_rewards = torch.tensor(
@@ -718,6 +825,14 @@ def main():
             next_done=next_done,
         )
         
+        # === NEW: Optional return normalization for stable critic training ===
+        if args.normalize_returns:
+            # Update return statistics and normalize
+            returns_np = buffer.returns.cpu().numpy().flatten()
+            return_normalizer.update(returns_np)
+            # Normalize returns in buffer (in-place)
+            buffer.returns = buffer.returns / (return_normalizer.std + 1e-8)
+        
         # PPO update
         last_tick = time.time()
         agent.sync_old_policy()
@@ -725,9 +840,17 @@ def main():
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
+        total_policy_grad_norm = 0.0
+        total_critic_grad_norm = 0.0
+        total_kl_div = 0.0
         num_batches = 0
+        kl_early_stopped = False  # NEW: Track if we early stopped
         
         for epoch in range(args.ppo_epochs):
+            # === NEW: Check for KL early stopping at epoch level ===
+            if kl_early_stopped:
+                break
+                
             batches = buffer.get_batches(args.minibatch_size, shuffle=True)
             
             for batch in batches:
@@ -743,6 +866,15 @@ def main():
                     value_clip_range=args.value_clip_range,
                 )
                 
+                # === NEW: KL early stopping check ===
+                if args.kl_early_stop and args.target_kl is not None:
+                    current_kl = loss_dict.get("approx_kl", 0.0)
+                    if isinstance(current_kl, torch.Tensor):
+                        current_kl = current_kl.item()
+                    if current_kl > args.target_kl * 1.5:  # Allow some margin
+                        kl_early_stopped = True
+                        break
+                
                 # Update noise schedule
                 agent.update_noise_schedule()
                 
@@ -751,25 +883,36 @@ def main():
                     # During warmup, only update critic
                     critic_optimizer.zero_grad()
                     loss_dict["loss"].backward()
-                    nn.utils.clip_grad_norm_(critic_params, args.max_grad_norm)
+                    critic_grad_norm = nn.utils.clip_grad_norm_(critic_params, args.max_grad_norm)
                     critic_optimizer.step()
+                    total_critic_grad_norm += critic_grad_norm
                 else:
                     # Full PPO update
                     policy_optimizer.zero_grad()
                     critic_optimizer.zero_grad()
                     loss_dict["loss"].backward()
-                    nn.utils.clip_grad_norm_(policy_params, args.max_grad_norm)
-                    nn.utils.clip_grad_norm_(critic_params, args.max_grad_norm)
+                    policy_grad_norm = nn.utils.clip_grad_norm_(policy_params, args.max_grad_norm)
+                    critic_grad_norm = nn.utils.clip_grad_norm_(critic_params, args.max_grad_norm)
                     policy_optimizer.step()
                     critic_optimizer.step()
+                    total_policy_grad_norm += policy_grad_norm
+                    total_critic_grad_norm += critic_grad_norm
                 
                 total_policy_loss += loss_dict["policy_loss"].item()
                 total_value_loss += loss_dict["value_loss"].item()
                 total_entropy += loss_dict["entropy"].item()
+                # === UPDATED: Use approx_kl instead of kl_div ===
+                if "approx_kl" in loss_dict:
+                    kl_val = loss_dict["approx_kl"]
+                    if isinstance(kl_val, torch.Tensor):
+                        kl_val = kl_val.item()
+                    total_kl_div += kl_val
                 num_batches += 1
         
         # Update EMA
         agent.update_ema()
+        # === NEW: Update target value network (like AWCP's update_target()) ===
+        agent.update_target_value_net()
         num_updates += 1
         
         # Timing for PPO update
@@ -779,6 +922,9 @@ def main():
         avg_policy_loss = total_policy_loss / max(1, num_batches)
         avg_value_loss = total_value_loss / max(1, num_batches)
         avg_entropy = total_entropy / max(1, num_batches)
+        avg_policy_grad_norm = total_policy_grad_norm / max(1, num_batches)
+        avg_critic_grad_norm = total_critic_grad_norm / max(1, num_batches)
+        avg_kl_div = total_kl_div / max(1, num_batches) if total_kl_div > 0 else 0.0
         min_noise, max_noise = agent.get_current_noise_std()
         
         # Prepare losses dict for pbar display (always available)
@@ -789,6 +935,7 @@ def main():
             "noise": max_noise,
             "episode_reward": np.mean(episode_rewards) if len(episode_rewards) > 0 else 0.0,
             "success_rate": np.mean(episode_successes) if len(episode_successes) > 0 else 0.0,
+            "global_step": global_step,
         }
         if num_updates < args.critic_warmup_steps:
             losses_dict["warmup"] = 1.0
@@ -797,22 +944,50 @@ def main():
         if num_updates % args.log_freq == 0 and num_updates > 0:
             last_tick = time.time()
             
-            # Log to tensorboard
-            writer.add_scalar("charts/learning_rate", policy_optimizer.param_groups[0]["lr"], num_updates)
-            writer.add_scalar("losses/policy_loss", avg_policy_loss, num_updates)
-            writer.add_scalar("losses/value_loss", avg_value_loss, num_updates)
-            writer.add_scalar("losses/entropy", avg_entropy, num_updates)
-            writer.add_scalar("losses/noise_std_max", max_noise, num_updates)
-            writer.add_scalar("losses/in_warmup", float(bool(num_updates < args.critic_warmup_steps)), num_updates)
+            # Prepare logging dict
+            log_dict = {
+                "charts/learning_rate": policy_optimizer.param_groups[0]["lr"],
+                "charts/critic_learning_rate": critic_optimizer.param_groups[0]["lr"],
+                "losses/policy_loss": avg_policy_loss,
+                "losses/value_loss": avg_value_loss,
+                "losses/entropy": avg_entropy,
+                "losses/noise_std_max": max_noise,
+                "losses/noise_std_min": min_noise,
+                "losses/in_warmup": float(bool(num_updates < args.critic_warmup_steps)),
+                "optimizer/policy_grad_norm": avg_policy_grad_norm,
+                "optimizer/critic_grad_norm": avg_critic_grad_norm,
+                # === NEW: Add critic stability diagnostics ===
+                "critic/return_normalizer_std": return_normalizer.std if args.normalize_returns else 1.0,
+                "critic/reward_scale": args.reward_scale,
+            }
             
-            # Log timings
+            # Add KL divergence if available
+            if avg_kl_div > 0:
+                log_dict["losses/kl_div"] = avg_kl_div
+            
+            # Add timings
             for k, v in timings.items():
-                writer.add_scalar(f"time/{k}", v, num_updates)
+                log_dict[f"time/{k}"] = v
             
+            # Add episode statistics
             if len(episode_rewards) > 0:
-                writer.add_scalar("charts/episode_reward", np.mean(episode_rewards), num_updates)
-                writer.add_scalar("charts/episode_length", np.mean(episode_lengths), num_updates)
-                writer.add_scalar("charts/success_rate", np.mean(episode_successes), num_updates)
+                log_dict["charts/episode_reward"] = np.mean(episode_rewards)
+                log_dict["charts/episode_length"] = np.mean(episode_lengths)
+                log_dict["charts/success_rate"] = np.mean(episode_successes)
+                log_dict["charts/episode_reward_std"] = np.std(episode_rewards) if len(episode_rewards) > 1 else 0
+            
+            # Add global step and num updates
+            log_dict["training/global_step"] = global_step
+            log_dict["training/num_updates"] = num_updates
+            log_dict["training/num_epochs"] = num_updates * args.ppo_epochs
+            
+            # Log to tensorboard
+            for k, v in log_dict.items():
+                writer.add_scalar(k, v, num_updates)
+            
+            # Log to wandb
+            if args.track:
+                wandb.log(log_dict, step=num_updates)
             
             timings["logging"] += time.time() - last_tick
         
@@ -830,7 +1005,7 @@ def main():
             )
             timings["eval"] += time.time() - last_tick
             
-            print(f"\nEvaluated {len(eval_metrics['success_at_end'])} episodes")
+            print(f"\n[Update {num_updates}] Evaluated {len(eval_metrics['success_at_end'])} episodes in {time.time() - last_tick:.2f}s")
             
             # Average metrics and log (aligned with offline format)
             for k in eval_metrics.keys():
@@ -849,10 +1024,15 @@ def main():
                         "config": vars(args),
                     }
                     torch.save(checkpoint, checkpoint_path)
-                    print(f"New best {k}: {eval_metrics[k]:.4f}. Saving checkpoint.")
+                    print(f"  ✓ New best {k}: {eval_metrics[k]:.4f}. Saved checkpoint.")
             
             if args.track:
-                wandb.log({f"eval/{k}": v for k, v in eval_metrics.items()}, step=num_updates)
+                eval_log = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                # Add best metrics to wandb
+                eval_log["eval/best_success_once"] = best_eval_metrics["success_once"]
+                eval_log["eval/best_success_at_end"] = best_eval_metrics["success_at_end"]
+                eval_log["training/eval_timestep"] = global_step
+                wandb.log(eval_log, step=num_updates)
         
         # Save checkpoint (periodic)
         if num_updates % args.save_freq == 0 and num_updates > 0:
@@ -871,7 +1051,7 @@ def main():
         
         # Update progress bar with losses (aligned with offline format)
         pbar.set_postfix({k: f"{v:.4f}" for k, v in losses_dict.items()})
-        pbar.update(args.num_envs * args.act_horizon * args.rollout_steps)
+        pbar.update(1)
     
     pbar.close()
     
@@ -884,6 +1064,35 @@ def main():
     }
     torch.save(checkpoint, final_path)
     print(f"Final model saved to {final_path}")
+    
+    # Training summary
+    total_time = time.time() - start_time
+    print("\n" + "="*60)
+    print("TRAINING SUMMARY")
+    print("="*60)
+    print(f"Total training time: {total_time / 3600:.2f} hours ({total_time / 60:.1f} minutes)")
+    print(f"Total updates completed: {num_updates}")
+    print(f"Total timesteps collected: {global_step}")
+    print(f"Best eval success_once: {best_eval_metrics['success_once']:.4f}")
+    print(f"Best eval success_at_end: {best_eval_metrics['success_at_end']:.4f}")
+    print("\nTiming breakdown:")
+    for k, v in sorted(timings.items(), key=lambda x: -x[1]):
+        pct = 100 * v / total_time if total_time > 0 else 0
+        print(f"  {k}: {v / 60:.1f} min ({pct:.1f}%)")
+    print("="*60)
+    
+    # Log final summary to wandb
+    if args.track:
+        final_summary = {
+            "training/total_time_hours": total_time / 3600,
+            "training/total_updates": num_updates,
+            "training/total_timesteps": global_step,
+            "eval/final_success_once": best_eval_metrics["success_once"],
+            "eval/final_success_at_end": best_eval_metrics["success_at_end"],
+        }
+        for k, v in timings.items():
+            final_summary[f"timing/{k}_minutes"] = v / 60
+        wandb.log(final_summary)
     
     # Cleanup
     train_envs.close()

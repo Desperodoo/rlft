@@ -284,6 +284,11 @@ class ReinFlowAgent(nn.Module):
         noise_decay_steps: int = 100000,
         # Critic warmup
         critic_warmup_steps: int = 0,
+        # === NEW: Critic stability improvements (borrowed from AWCP) ===
+        reward_scale: float = 1.0,  # Scale rewards to stabilize critic training
+        value_target_tau: float = 0.005,  # Soft update rate for target value network
+        use_target_value_net: bool = True,  # Whether to use target value network
+        value_target_clip: float = 100.0,  # Clip value targets
     ):
         super().__init__()
         
@@ -312,6 +317,12 @@ class ReinFlowAgent(nn.Module):
         self.critic_warmup_steps = critic_warmup_steps
         self._current_step = 0
         
+        # === NEW: Critic stability parameters ===
+        self.reward_scale = reward_scale
+        self.value_target_tau = value_target_tau
+        self.use_target_value_net = use_target_value_net
+        self.value_target_clip = value_target_clip
+        
         # Fixed step size for inference (uniform steps)
         self.fixed_step_size = 1.0 / num_inference_steps
         
@@ -334,6 +345,14 @@ class ReinFlowAgent(nn.Module):
         
         # Value network for PPO (predicts V(s_0) = expected return)
         self.value_net = ValueNetwork(obs_dim=obs_dim)
+        
+        # === NEW: Target value network for stable critic training (borrowed from AWCP) ===
+        if use_target_value_net:
+            self.value_net_target = copy.deepcopy(self.value_net)
+            for param in self.value_net_target.parameters():
+                param.requires_grad = False
+        else:
+            self.value_net_target = None
         
         # Old policy for PPO ratio
         self.noisy_velocity_net_old = NoisyVelocityUNet1D(
@@ -381,6 +400,15 @@ class ReinFlowAgent(nn.Module):
                 self.velocity_net_ema,
                 self.noisy_velocity_net.base_net,
                 1 - self.ema_decay
+            )
+    
+    def update_target_value_net(self):
+        """Soft update target value network (borrowed from AWCP's target critic update)."""
+        if self.value_net_target is not None:
+            soft_update(
+                self.value_net_target,
+                self.value_net,
+                self.value_target_tau
             )
     
     def sync_old_policy(self):
@@ -618,12 +646,17 @@ class ReinFlowAgent(nn.Module):
         
         Supports critic warmup: during warmup, only value_loss is computed.
         
+        === IMPROVEMENTS FOR CRITIC STABILITY (borrowed from AWCP) ===
+        1. Reward scaling: returns are assumed to be pre-scaled by reward_scale
+        2. Value target clipping: clip targets to prevent extreme values
+        3. Huber loss option: more robust to outliers than MSE
+        
         Args:
             obs_cond: (B, obs_dim) observation features
             actions: (B, pred_horizon, act_dim) action sequence
             old_log_probs: (B,) log probs from old policy
             advantages: (B,) GAE advantages
-            returns: (B,) discounted returns
+            returns: (B,) discounted returns (should be pre-scaled by reward_scale)
             chains: Optional denoising chains from rollout
             old_values: (B,) old value predictions (for value clipping)
             clip_value: Whether to clip value loss
@@ -635,22 +668,25 @@ class ReinFlowAgent(nn.Module):
         # Compute value predictions
         values = self.value_net(obs_cond).squeeze(-1)
         
-        # Clip returns to reasonable range to prevent vloss explosion
-        # This is critical for the first few iterations when returns are very large
-        returns_clipped = torch.clamp(returns, -value_clip_range, value_clip_range)
-        values_clipped = torch.clamp(values, -value_clip_range, value_clip_range)
+        # === IMPROVEMENT 1: Clip returns using value_target_clip (like AWCP's q_target_clip) ===
+        # This is critical to prevent extreme return values from destabilizing critic
+        effective_clip = min(value_clip_range, self.value_target_clip)
+        returns_clipped = torch.clamp(returns, -effective_clip, effective_clip)
         
-        # Value loss (optionally clipped like in PPO2)
+        # === IMPROVEMENT 2: More robust value loss computation ===
         if clip_value and old_values is not None:
-            # Clipped value loss (PPO2 style)
-            value_pred_clipped = old_values + torch.clamp(
-                values - old_values, -value_clip_range, value_clip_range
+            # Clipped value loss (PPO2 style) with additional safeguards
+            old_values_clipped = torch.clamp(old_values, -effective_clip, effective_clip)
+            value_pred_clipped = old_values_clipped + torch.clamp(
+                values - old_values_clipped, -value_clip_range, value_clip_range
             )
-            value_loss1 = F.mse_loss(values_clipped, returns_clipped)
-            value_loss2 = F.mse_loss(value_pred_clipped, returns_clipped)
+            # Use Huber loss for robustness to outliers
+            value_loss1 = F.smooth_l1_loss(values, returns_clipped)
+            value_loss2 = F.smooth_l1_loss(value_pred_clipped, returns_clipped)
             value_loss = torch.max(value_loss1, value_loss2)
         else:
-            value_loss = F.mse_loss(values_clipped, returns_clipped)
+            # Use Huber loss (smooth L1) instead of MSE for robustness
+            value_loss = F.smooth_l1_loss(values, returns_clipped)
         
         # Compute new log probs
         new_log_probs, entropy = self.compute_action_log_prob(
@@ -659,9 +695,19 @@ class ReinFlowAgent(nn.Module):
         
         # PPO clipped objective
         ratio = torch.exp(new_log_probs - old_log_probs)
+        # Clamp ratio to prevent extreme values
+        ratio = torch.clamp(ratio, 0.0, 10.0)
         surr1 = ratio * advantages
         surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
         policy_loss = -torch.min(surr1, surr2).mean()
+        
+        # === NEW: Compute approximate KL divergence for early stopping ===
+        # Using the approximation: KL ≈ (ratio - 1) - log(ratio)
+        # This is more stable than the exact KL when ratio is close to 1
+        with torch.no_grad():
+            log_ratio = new_log_probs - old_log_probs
+            approx_kl = ((ratio - 1) - log_ratio).mean()
+            # Alternative: approx_kl = 0.5 * ((log_ratio) ** 2).mean()
         
         # Entropy bonus
         entropy_loss = -entropy.mean()
@@ -676,6 +722,11 @@ class ReinFlowAgent(nn.Module):
             "entropy": entropy.mean(),
             "ratio_mean": ratio.mean(),
             "ratio_std": ratio.std(),
+            "returns_mean": returns.mean(),
+            "returns_std": returns.std(),
+            "values_mean": values.mean(),
+            "values_std": values.std(),
+            "approx_kl": approx_kl,  # NEW: For KL early stopping
             "in_warmup": False,
         }
     
@@ -700,10 +751,18 @@ class ReinFlowAgent(nn.Module):
                 "noise_decay_type": self.noise_decay_type,
                 "noise_decay_steps": self.noise_decay_steps,
                 "critic_warmup_steps": self.critic_warmup_steps,
+                # === NEW: Save critic stability parameters ===
+                "reward_scale": self.reward_scale,
+                "value_target_tau": self.value_target_tau,
+                "use_target_value_net": self.use_target_value_net,
+                "value_target_clip": self.value_target_clip,
             },
         }
         if self.velocity_net_ema is not None:
             checkpoint["velocity_net_ema"] = self.velocity_net_ema.state_dict()
+        # === NEW: Save target value network ===
+        if self.value_net_target is not None:
+            checkpoint["value_net_target"] = self.value_net_target.state_dict()
         torch.save(checkpoint, path)
     
     def load(self, path: str, device: str = "cpu"):
@@ -715,6 +774,9 @@ class ReinFlowAgent(nn.Module):
             self.noisy_velocity_net_old.load_state_dict(checkpoint["noisy_velocity_net_old"])
         if "velocity_net_ema" in checkpoint and self.velocity_net_ema is not None:
             self.velocity_net_ema.load_state_dict(checkpoint["velocity_net_ema"])
+        # === NEW: Load target value network ===
+        if "value_net_target" in checkpoint and self.value_net_target is not None:
+            self.value_net_target.load_state_dict(checkpoint["value_net_target"])
         if "current_step" in checkpoint:
             self._current_step = checkpoint["current_step"]
         self.sync_old_policy()

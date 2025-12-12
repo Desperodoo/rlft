@@ -55,14 +55,14 @@
 set -e
 
 # Default configurations
-GPUS=(0 1)
+GPUS=(2 3 4 5 6 7 8 9)
 DRY_RUN=false
-TOTAL_UPDATES=20000           # Aligned with train_online_finetune.py default
-EVAL_FREQ=10                   # In number of updates (aligned with train_online_finetune.py)
+TOTAL_UPDATES=10000           # Aligned with train_online_finetune.py default
+EVAL_FREQ=100                   # In number of updates (aligned with train_online_finetune.py)
 LOG_FREQ=1                     # In number of updates (aligned with train_online_finetune.py)
-NUM_EVAL_EPISODES=50           # Aligned with train_online_finetune.py default
-NUM_EVAL_ENVS=50               # Aligned with train_online_finetune.py default
-NUM_ENVS=50                    # Aligned with train_online_finetune.py default
+NUM_EVAL_EPISODES=20           # Aligned with train_online_finetune.py default
+NUM_EVAL_ENVS=5               # Aligned with train_online_finetune.py default
+NUM_ENVS=25                  # Aligned with train_online_finetune.py default
 SIM_BACKEND="physx_cuda"
 WANDB_PROJECT="maniskill_reinflow_grid"
 MAX_EPISODE_STEPS=100
@@ -72,7 +72,7 @@ OBS_MODE="rgb"
 
 # Pretrained checkpoint path pattern (will be formatted with ENV_ID)
 # Note: Use best_eval_success_once.pt which includes visual_encoder
-PRETRAINED_PATH_PATTERN="/home/amax/rlft/diffusion_policy/runs/awsc-{ENV_ID}-seed0/checkpoints/best_eval_success_once.pt"
+PRETRAINED_PATH_PATTERN="/home/wjz/rlft/diffusion_policy/runs/awsc-{ENV_ID}-seed0/checkpoints/best_eval_success_once.pt"
 
 # Config variants organized by ablation category
 # Format: "category:variant"
@@ -85,8 +85,7 @@ CONFIGS=(
     # === CRITIC WARMUP ABLATION ===
     "warmup:0"
     "warmup:2k"
-    # "warmup:5k"  # Same as baseline
-    "warmup:10k"
+    "warmup:5k"
     
     # === NOISE SCHEDULE ABLATION ===
     "noise:constant"
@@ -120,6 +119,14 @@ CONFIGS=(
     "rollout:short"
     "rollout:long"
     "rollout:more_epochs"
+    
+    # === NEW: CRITIC STABILITY ABLATION (borrowed from AWCP) ===
+    "critic:no_target_vnet"
+    "critic:high_reward_scale"
+    "critic:low_reward_scale"
+    "critic:no_return_norm"
+    "critic:high_value_clip"
+    "critic:fast_target_update"
 )
 
 SEEDS=(0)
@@ -208,7 +215,7 @@ echo "  - rollout: Rollout configuration"
 echo "=========================================="
 echo ""
 
-cd /home/amax/rlft/diffusion_policy
+cd /home/wjz/rlft/diffusion_policy
 
 # Check pretrained checkpoint
 if [ "$DRY_RUN" = false ] && [ ! -f "$PRETRAINED_PATH" ]; then
@@ -241,7 +248,7 @@ run_task() {
     # DEFAULT VALUES (baseline configuration)
     # =========================================================================
     # Critic warmup
-    critic_warmup_steps=5000
+    critic_warmup_steps=10
     
     # Noise schedule
     noise_decay_type="linear"
@@ -251,7 +258,7 @@ run_task() {
     
     # PPO hyperparameters
     clip_ratio=0.2
-    entropy_coef=0.01
+    entropy_coef=0.00
     value_coef=0.5
     
     # Learning rate
@@ -263,8 +270,8 @@ run_task() {
     
     # Rollout config (aligned with train_online_finetune.py defaults)
     rollout_steps=128
-    ppo_epochs=2                    # Aligned with train_online_finetune.py default
-    minibatch_size=6400             # Aligned with train_online_finetune.py default
+    ppo_epochs=1                    # Aligned with train_online_finetune.py default
+    minibatch_size=5120             # Aligned with train_online_finetune.py default
     
     # Other defaults
     gamma=0.99
@@ -272,6 +279,13 @@ run_task() {
     max_grad_norm=0.5
     freeze_visual_encoder=true
     normalize_rewards=true
+    
+    # === NEW: Critic stability defaults (borrowed from AWCP) ===
+    reward_scale=0.1
+    value_target_tau=0.005
+    use_target_value_net=true
+    value_target_clip=100.0
+    normalize_returns=true
     
     # Profile name for logging
     profile="${category}-${variant}"
@@ -291,13 +305,10 @@ run_task() {
                     critic_warmup_steps=0
                     ;;
                 2k)
-                    critic_warmup_steps=2000
+                    critic_warmup_steps=20
                     ;;
                 5k)
-                    critic_warmup_steps=5000
-                    ;;
-                10k)
-                    critic_warmup_steps=10000
+                    critic_warmup_steps=50
                     ;;
                 *)
                     echo "Unknown warmup variant: $variant"
@@ -409,27 +420,52 @@ run_task() {
         rollout)
             case "$variant" in
                 default)
-                    rollout_steps=128
-                    ppo_epochs=2
-                    minibatch_size=6400
+                    rollout_steps=256
+                    minibatch_size=5120
                     ;;
                 short)
-                    rollout_steps=64
-                    ppo_epochs=2
-                    minibatch_size=3200
+                    rollout_steps=128
+                    minibatch_size=2048
                     ;;
                 long)
-                    rollout_steps=256
-                    ppo_epochs=2
-                    minibatch_size=12800
+                    rollout_steps=512
+                    minibatch_size=10240
                     ;;
                 more_epochs)
-                    rollout_steps=128
-                    ppo_epochs=4
-                    minibatch_size=6400
+                    rollout_steps=256
+                    ppo_epochs=10
+                    minibatch_size=5120
                     ;;
                 *)
                     echo "Unknown rollout variant: $variant"
+                    return 1
+                    ;;
+            esac
+            ;;
+        
+        # === NEW: CRITIC STABILITY ABLATION ===
+        critic)
+            case "$variant" in
+                no_target_vnet)
+                    use_target_value_net=false
+                    ;;
+                high_reward_scale)
+                    reward_scale=0.5
+                    ;;
+                low_reward_scale)
+                    reward_scale=0.01
+                    ;;
+                no_return_norm)
+                    normalize_returns=false
+                    ;;
+                high_value_clip)
+                    value_target_clip=500.0
+                    ;;
+                fast_target_update)
+                    value_target_tau=0.05
+                    ;;
+                *)
+                    echo "Unknown critic variant: $variant"
                     return 1
                     ;;
             esac
@@ -479,11 +515,16 @@ run_task() {
         --minibatch_size $minibatch_size \
         --gamma $gamma \
         --gae_lambda $gae_lambda \
-        --max_grad_norm $max_grad_norm"
+        --max_grad_norm $max_grad_norm \
+        --reward_scale $reward_scale \
+        --value_target_tau $value_target_tau \
+        --value_target_clip $value_target_clip"
     
     # Append boolean flags
     if [ "$freeze_visual_encoder" = true ]; then CMD+=" --freeze_visual_encoder"; fi
     if [ "$normalize_rewards" = true ]; then CMD+=" --normalize_rewards"; fi
+    if [ "$use_target_value_net" = true ]; then CMD+=" --use_target_value_net"; fi
+    if [ "$normalize_returns" = true ]; then CMD+=" --normalize_returns"; fi
 
     if [ "$DRY_RUN" = true ]; then
         echo "[GPU $gpu] [DRY RUN] $exp_name"
