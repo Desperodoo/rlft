@@ -866,15 +866,6 @@ def main():
                     value_clip_range=args.value_clip_range,
                 )
                 
-                # === NEW: KL early stopping check ===
-                if args.kl_early_stop and args.target_kl is not None:
-                    current_kl = loss_dict.get("approx_kl", 0.0)
-                    if isinstance(current_kl, torch.Tensor):
-                        current_kl = current_kl.item()
-                    if current_kl > args.target_kl * 1.5:  # Allow some margin
-                        kl_early_stopped = True
-                        break
-                
                 # Update noise schedule
                 agent.update_noise_schedule()
                 
@@ -898,16 +889,25 @@ def main():
                     total_policy_grad_norm += policy_grad_norm
                     total_critic_grad_norm += critic_grad_norm
                 
+                # Accumulate statistics (MUST happen before KL early stop check)
                 total_policy_loss += loss_dict["policy_loss"].item()
                 total_value_loss += loss_dict["value_loss"].item()
                 total_entropy += loss_dict["entropy"].item()
-                # === UPDATED: Use approx_kl instead of kl_div ===
                 if "approx_kl" in loss_dict:
                     kl_val = loss_dict["approx_kl"]
                     if isinstance(kl_val, torch.Tensor):
                         kl_val = kl_val.item()
                     total_kl_div += kl_val
                 num_batches += 1
+                
+                # === KL early stopping check (after stats accumulation) ===
+                if args.kl_early_stop and args.target_kl is not None:
+                    current_kl = loss_dict.get("approx_kl", 0.0)
+                    if isinstance(current_kl, torch.Tensor):
+                        current_kl = current_kl.item()
+                    if current_kl > args.target_kl * 1.5:  # Allow some margin
+                        kl_early_stopped = True
+                        break
         
         # Update EMA
         agent.update_ema()
