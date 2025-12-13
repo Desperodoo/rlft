@@ -14,12 +14,12 @@ DRY_RUN=false
 TOTAL_UPDATES=10000
 EVAL_FREQ=100
 LOG_FREQ=1
-NUM_EVAL_EPISODES=21
-NUM_EVAL_ENVS=3
-NUM_ENVS=25
+NUM_EVAL_EPISODES=20
+NUM_EVAL_ENVS=5
+NUM_ENVS=50
 SIM_BACKEND="physx_cuda"
 WANDB_PROJECT="maniskill_reinflow_grid_2"
-MAX_EPISODE_STEPS=100
+MAX_EPISODE_STEPS=64
 ENV_ID="LiftPegUpright-v1"
 CONTROL_MODE="pd_ee_delta_pose"
 OBS_MODE="rgb"
@@ -29,7 +29,7 @@ PRETRAINED_PATH_PATTERN="/home/wjz/rlft/diffusion_policy/runs/awsc-{ENV_ID}-seed
 # Part 2: LR + Inference + Rollout + Critic Stability (11 configs)
 CONFIGS=(    
     # === ROLLOUT CONFIG ABLATION (3) ===
-    "rollout:short"
+    "rollout:less_epochs"
     "rollout:more_epochs"
     
     # === CRITIC STABILITY ABLATION (6) ===
@@ -108,14 +108,14 @@ run_task() {
     IFS=':' read -r category variant <<< "$cfg"
 
     # Default values
-    critic_warmup_steps=10
+    critic_warmup_steps=50
     noise_decay_type="linear"
     noise_decay_steps=500000
-    clip_ratio=0.2
+    clip_ratio=0.1
     entropy_coef=0.00
     value_coef=0.5
     num_inference_steps=8
-    rollout_steps=128
+    rollout_steps=64
     ppo_epochs=1
     minibatch_size=5120
     gamma=0.99
@@ -136,8 +136,8 @@ run_task() {
     case "$category" in
         rollout)
             case "$variant" in
-                short) rollout_steps=128; minibatch_size=2048 ;;
-                more_epochs) rollout_steps=256; ppo_epochs=10 ;;
+                less_epochs) ppo_epochs=2 ;;
+                more_epochs) ppo_epochs=20 ;;
             esac
             ;;
         critic)

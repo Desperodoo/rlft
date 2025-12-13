@@ -16,10 +16,10 @@ EVAL_FREQ=100
 LOG_FREQ=1
 NUM_EVAL_EPISODES=20
 NUM_EVAL_ENVS=5
-NUM_ENVS=25
+NUM_ENVS=50
 SIM_BACKEND="physx_cuda"
-WANDB_PROJECT="maniskill_reinflow_grid"
-MAX_EPISODE_STEPS=100
+WANDB_PROJECT="maniskill_reinflow_grid_2"
+MAX_EPISODE_STEPS=64
 ENV_ID="LiftPegUpright-v1"
 CONTROL_MODE="pd_ee_delta_pose"
 OBS_MODE="rgb"
@@ -34,18 +34,12 @@ CONFIGS=(
     # === CRITIC WARMUP ABLATION (3) ===
     "warmup:100"
     "warmup:200"
-    "warmup:500"
     
     # === NOISE SCHEDULE ABLATION (5) ===
     "noise:constant"
-    "noise:exp"
-    "noise:fast"
-    "noise:low_init"
-    "noise:high_init"
     
     # === PPO HYPERPARAMETERS ABLATION (5) ===
     "ppo:clip_tight"
-    "ppo:clip_loose"
     "ppo:high_entropy"
     "ppo:low_entropy"
     "ppo:high_value"
@@ -122,12 +116,12 @@ run_task() {
     critic_warmup_steps=50
     noise_decay_type="linear"
     noise_decay_steps=500000
-    clip_ratio=0.2
+    clip_ratio=0.1
     entropy_coef=0.00
     value_coef=0.5
     num_inference_steps=8
-    rollout_steps=128
-    ppo_epochs=1
+    rollout_steps=64
+    ppo_epochs=10
     minibatch_size=5120
     gamma=0.99
     gae_lambda=0.95
@@ -152,20 +146,16 @@ run_task() {
             case "$variant" in
                 100) critic_warmup_steps=100 ;;
                 200) critic_warmup_steps=200 ;;
-                500) critic_warmup_steps=500 ;;
             esac
             ;;
         noise)
             case "$variant" in
-                constant) noise_decay_type="constant" ;;
                 exp) noise_decay_type="exponential" ;;
-                fast) noise_decay_steps=200000 ;;
             esac
             ;;
         ppo)
             case "$variant" in
-                clip_tight) clip_ratio=0.1 ;;
-                clip_loose) clip_ratio=0.3 ;;
+                clip_tight) clip_ratio=0.05 ;;
                 high_entropy) entropy_coef=0.05 ;;
                 low_entropy) entropy_coef=0.001 ;;
                 high_value) value_coef=1.0 ;;

@@ -85,7 +85,7 @@ class Args:
     # Environment settings
     env_id: str = "LiftPegUpright-v1"
     """the id of the environment"""
-    num_envs: int = 20
+    num_envs: int = 50
     """number of parallel environments for training"""
     num_eval_envs: int = 5
     """number of parallel eval environments"""
@@ -107,7 +107,7 @@ class Args:
     # Training settings
     total_updates: int = 10_000
     """total training timesteps (env steps, not policy steps)"""
-    rollout_steps: int = 256
+    rollout_steps: int = 64
     """number of SMDP chunks to collect before each update"""
     ppo_epochs: int = 10
     """number of PPO epochs per update"""
@@ -125,7 +125,7 @@ class Args:
     """discount factor"""
     gae_lambda: float = 0.95
     """GAE lambda"""
-    clip_ratio: float = 0.2
+    clip_ratio: float = 0.1
     """PPO clip ratio"""
     entropy_coef: float = 0.00
     """entropy coefficient"""
@@ -165,7 +165,7 @@ class Args:
     """steps over which to decay exploration noise"""
 
     # Critic warmup
-    critic_warmup_steps: int = 10
+    critic_warmup_steps: int = 50
     """number of steps to train critic only (policy frozen)"""
 
     # Reward processing
