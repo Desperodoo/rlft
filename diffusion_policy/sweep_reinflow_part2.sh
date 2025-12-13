@@ -18,7 +18,7 @@ NUM_EVAL_EPISODES=21
 NUM_EVAL_ENVS=3
 NUM_ENVS=25
 SIM_BACKEND="physx_cuda"
-WANDB_PROJECT="maniskill_reinflow_grid"
+WANDB_PROJECT="maniskill_reinflow_grid_2"
 MAX_EPISODE_STEPS=100
 ENV_ID="LiftPegUpright-v1"
 CONTROL_MODE="pd_ee_delta_pose"
@@ -27,14 +27,9 @@ OBS_MODE="rgb"
 PRETRAINED_PATH_PATTERN="/home/wjz/rlft/diffusion_policy/runs/awsc-{ENV_ID}-seed0/checkpoints/best_eval_success_once.pt"
 
 # Part 2: LR + Inference + Rollout + Critic Stability (11 configs)
-CONFIGS=(
-    # === INFERENCE STEPS ABLATION (2) ===
-    "infer:4steps"
-    "infer:16steps"
-    
+CONFIGS=(    
     # === ROLLOUT CONFIG ABLATION (3) ===
     "rollout:short"
-    # "rollout:long"
     "rollout:more_epochs"
     
     # === CRITIC STABILITY ABLATION (6) ===
@@ -139,16 +134,9 @@ run_task() {
     profile="${category}-${variant}"
 
     case "$category" in
-        infer)
-            case "$variant" in
-                4steps) num_inference_steps=4 ;;
-                16steps) num_inference_steps=16 ;;
-            esac
-            ;;
         rollout)
             case "$variant" in
                 short) rollout_steps=128; minibatch_size=2048 ;;
-                # long) rollout_steps=512; minibatch_size=10240 ;;
                 more_epochs) rollout_steps=256; ppo_epochs=10 ;;
             esac
             ;;

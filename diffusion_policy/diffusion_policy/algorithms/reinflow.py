@@ -541,12 +541,19 @@ class ReinFlowAgent(nn.Module):
         actions = torch.clamp(x, -1.0, 1.0)
         return actions, chains
     
-    def compute_value(self, obs_cond: torch.Tensor) -> torch.Tensor:
+    def compute_value(self, obs_cond: torch.Tensor, use_target: bool = False) -> torch.Tensor:
         """Compute state value V(s_0).
         
         In ReinFlow's denoising MDP, V(s_0) predicts the expected return
         from executing the generated action chunk in the environment.
+        
+        Args:
+            obs_cond: (B, obs_dim) observation features
+            use_target: If True and target value network exists, use target network
+                       for more stable bootstrap value estimation (recommended for GAE)
         """
+        if use_target and self.use_target_value_net and self.value_net_target is not None:
+            return self.value_net_target(obs_cond)
         return self.value_net(obs_cond)
     
     def compute_action_log_prob(

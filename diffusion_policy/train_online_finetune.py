@@ -704,7 +704,8 @@ def main():
                 )
                 
                 # Compute value and log_prob
-                values = agent.compute_value(obs_cond)
+                # Use target value network for more stable GAE computation when enabled
+                values = agent.compute_value(obs_cond, use_target=args.use_target_value_net)
                 log_probs, _ = agent.compute_action_log_prob(
                     obs_cond, actions, chains=chains, use_old_policy=False
                 )
@@ -801,7 +802,8 @@ def main():
                         for k in obs.keys()
                     }
                     final_obs_cond = encode_observations(final_obs_seq)
-                    final_vals = agent.compute_value(final_obs_cond[done_mask])
+                    # Use target value network for bootstrap value when enabled
+                    final_vals = agent.compute_value(final_obs_cond[done_mask], use_target=args.use_target_value_net)
                 buffer.set_final_values(rollout_step, done_mask, final_vals)
             
             # Update next_done for GAE
@@ -816,7 +818,8 @@ def main():
             }
             
             obs_cond = encode_observations(obs_seq)
-            next_value = agent.compute_value(obs_cond).squeeze(-1)
+            # Use target value network for bootstrap value when enabled
+            next_value = agent.compute_value(obs_cond, use_target=args.use_target_value_net).squeeze(-1)
         
         # Vectorized GAE computation (following ppo_rgb.py)
         # Note: advantage normalization is handled inside buffer if enabled
