@@ -113,7 +113,7 @@ class Args:
     """number of PPO epochs per update"""
     minibatch_size: int = 5120
     """minibatch size for PPO updates"""
-    lr: float = 1e-5
+    lr: float = 3e-5
     """learning rate for policy"""
     lr_critic: float = 3e-5
     """learning rate for value network"""
@@ -702,28 +702,29 @@ def main():
                     return_chains=True,
                 )
                 
-                # Compute value and log_prob
+                # Compute value and log_prob for PPO
                 # Use target value network for more stable GAE computation when enabled
                 values = agent.compute_value(obs_cond, use_target=args.use_target_value_net)
-                log_probs, entropy_rollout = agent.compute_action_log_prob(
-                    obs_cond, actions, x_chain=x_chain, use_old_policy=False
+                # old_log_probs are computed here and stored in buffer
+                # They will be compared with new_log_probs in PPO update
+                log_probs, _ = agent.compute_action_log_prob(
+                    obs_cond, actions, x_chain=x_chain
                 )
                 
-                # === DEBUG: Log rollout statistics (first step only) ===
-                if rollout_step == 0 and num_updates % args.log_freq == 0:
-                    print(f"\n[DEBUG Rollout] Update {num_updates}")
-                    print(f"  x_chain shape: {x_chain.shape}")
-                    print(f"  x_chain[0] (x_0) stats: mean={x_chain[:, 0].mean():.4f}, std={x_chain[:, 0].std():.4f}")
-                    print(f"  x_chain[-1] (x_K) stats: mean={x_chain[:, -1].mean():.4f}, std={x_chain[:, -1].std():.4f}")
-                    # Check diff between consecutive x_chain states
-                    diffs = []
-                    for k in range(x_chain.shape[1] - 1):
-                        diff = (x_chain[:, k+1] - x_chain[:, k]).abs().mean().item()
-                        diffs.append(diff)
-                    print(f"  x_chain step diffs (mean abs): {[f'{d:.4f}' for d in diffs]}")
-                    print(f"  log_probs: mean={log_probs.mean():.4f}, std={log_probs.std():.4f}, min={log_probs.min():.4f}, max={log_probs.max():.4f}")
-                    print(f"  entropy: mean={entropy_rollout.mean():.4f}")
-                    print(f"  values: mean={values.mean():.4f}, std={values.std():.4f}")
+                # # === DEBUG: Log rollout statistics (first step only) ===
+                # if rollout_step == 0 and num_updates % args.log_freq == 0:
+                #     print(f"\n[DEBUG Rollout] Update {num_updates}")
+                #     print(f"  x_chain shape: {x_chain.shape}")
+                #     print(f"  x_chain[0] (x_0) stats: mean={x_chain[:, 0].mean():.4f}, std={x_chain[:, 0].std():.4f}")
+                #     print(f"  x_chain[-1] (x_K) stats: mean={x_chain[:, -1].mean():.4f}, std={x_chain[:, -1].std():.4f}")
+                #     # Check diff between consecutive x_chain states
+                #     diffs = []
+                #     for k in range(x_chain.shape[1] - 1):
+                #         diff = (x_chain[:, k+1] - x_chain[:, k]).abs().mean().item()
+                #         diffs.append(diff)
+                #     print(f"  x_chain step diffs (mean abs): {[f'{d:.4f}' for d in diffs]}")
+                #     print(f"  log_probs: mean={log_probs.mean():.4f}, std={log_probs.std():.4f}, min={log_probs.min():.4f}, max={log_probs.max():.4f}")
+                #     print(f"  values: mean={values.mean():.4f}, std={values.std():.4f}")
             
             # Execute action chunk (SMDP)
             chunk_rewards = []
@@ -791,19 +792,18 @@ def main():
             # Optional: normalize rewards (additional normalization on top of scaling)
             if args.normalize_rewards:
                 reward_normalizer.update(cum_rewards.cpu().numpy())
-                cum_rewards = torch.tensor(
-                    [reward_normalizer.normalize(r.item()) for r in cum_rewards],
-                    device=device
-                )
+                # Vectorized normalization instead of Python loop
+                cum_rewards = cum_rewards / (reward_normalizer.rms.std + 1e-8)
             
             # Add to buffer (vectorized)
             # x_chain is essential for accurate log_prob computation in PPO updates
+            # Store log_probs computed during rollout as the "old" log probs for PPO ratio
             buffer.add(
                 obs=obs_cond,
                 actions=actions,
                 rewards=cum_rewards,
                 values=values,
-                log_probs=log_probs,
+                log_probs=log_probs,  # old_log_probs for PPO ratio computation
                 dones=chunk_done_flags.float(),
                 x_chain=x_chain,  # (num_envs, K+1, pred_horizon, act_dim)
             )
@@ -888,19 +888,19 @@ def main():
                 )
                 
                 # === DEBUG: Log PPO statistics (first batch of first epoch only) ===
-                if epoch == 0 and num_batches == 0 and num_updates % args.log_freq == 0:
-                    print(f"\n[DEBUG PPO] Update {num_updates}, Epoch {epoch}, Batch 0")
-                    print(f"  Batch size: {batch['obs'].shape[0]}")
-                    print(f"  old_log_probs (from buffer): mean={batch['log_probs'].mean():.4f}, std={batch['log_probs'].std():.4f}")
-                    print(f"  new_log_probs (recomputed): mean={loss_dict['new_log_probs_mean']:.4f}, std={loss_dict['new_log_probs_std']:.4f}")
-                    print(f"  log_ratio (new - old): mean={loss_dict['log_ratio_mean']:.6f}, std={loss_dict['log_ratio_std']:.6f}")
-                    print(f"  ratio: mean={loss_dict['ratio_mean']:.6f}, std={loss_dict['ratio_std']:.6f}, min={loss_dict['ratio_min']:.6f}, max={loss_dict['ratio_max']:.6f}")
-                    print(f"  advantages: mean={batch['advantages'].mean():.4f}, std={batch['advantages'].std():.4f}")
-                    print(f"  returns: mean={batch['returns'].mean():.4f}, std={batch['returns'].std():.4f}")
-                    print(f"  policy_loss: {loss_dict['policy_loss']:.8f}")
-                    print(f"  value_loss: {loss_dict['value_loss']:.6f}")
-                    print(f"  entropy: {loss_dict['entropy']:.4f}")
-                    print(f"  approx_kl: {loss_dict['approx_kl']:.8f}")
+                # if epoch == 0 and num_batches == 0 and num_updates % args.log_freq == 0:
+                #     print(f"\n[DEBUG PPO] Update {num_updates}, Epoch {epoch}, Batch 0")
+                #     print(f"  Batch size: {batch['obs'].shape[0]}")
+                #     print(f"  old_log_probs (from buffer): mean={batch['log_probs'].mean():.4f}, std={batch['log_probs'].std():.4f}")
+                #     print(f"  new_log_probs (recomputed): mean={loss_dict['new_log_probs_mean']:.4f}, std={loss_dict['new_log_probs_std']:.4f}")
+                #     print(f"  log_ratio (new - old): mean={loss_dict['log_ratio_mean']:.6f}, std={loss_dict['log_ratio_std']:.6f}")
+                #     print(f"  ratio: mean={loss_dict['ratio_mean']:.6f}, std={loss_dict['ratio_std']:.6f}, min={loss_dict['ratio_min']:.6f}, max={loss_dict['ratio_max']:.6f}")
+                #     print(f"  advantages: mean={batch['advantages'].mean():.4f}, std={batch['advantages'].std():.4f}")
+                #     print(f"  returns: mean={batch['returns'].mean():.4f}, std={batch['returns'].std():.4f}")
+                #     print(f"  policy_loss: {loss_dict['policy_loss']:.8f}")
+                #     print(f"  value_loss: {loss_dict['value_loss']:.6f}")
+                #     print(f"  entropy: {loss_dict['entropy']:.4f}")
+                #     print(f"  approx_kl: {loss_dict['approx_kl']:.8f}")
                                 
                 # Backward pass
                 if num_updates < args.critic_warmup_steps:
@@ -963,6 +963,12 @@ def main():
             # del batches
             # torch.cuda.empty_cache()
         
+        # === DEBUG: Log rollout utilization stats ===
+        actual_epochs = epoch + 1 if not kl_early_stopped else epoch + 1  # epoch is 0-indexed
+        if num_updates % args.log_freq == 0:
+            early_stop_msg = " (KL early stopped)" if kl_early_stopped else ""
+            print(f"  [ROLLOUT] Completed {actual_epochs}/{args.ppo_epochs} epochs, {num_batches} minibatch updates{early_stop_msg}")
+        
         # Update EMA
         agent.update_ema()
         # Update noise schedule
@@ -1015,6 +1021,10 @@ def main():
                 # === NEW: Add critic stability diagnostics ===
                 "critic/return_normalizer_std": return_normalizer.std if args.normalize_returns else 1.0,
                 "critic/reward_scale": args.reward_scale,
+                # === NEW: Add rollout utilization stats ===
+                "training/actual_epochs": actual_epochs,
+                "training/minibatch_updates": num_batches,
+                "training/kl_early_stopped": float(kl_early_stopped),
             }
             
             # Add KL divergence if available
