@@ -169,8 +169,8 @@ class Args:
     # Reward processing
     normalize_rewards: bool = True
     """whether to normalize rewards using running mean/std"""
-    normalize_advantages: bool = True
-    """whether to normalize advantages (recommended for stable training)"""
+    normalize_advantages: bool = False
+    """whether to normalize advantages in buffer (set False since we normalize per minibatch)"""
     clip_value_loss: bool = True
     """whether to clip value loss to reduce vloss explosion"""
     value_clip_range: float = 10.0
@@ -525,6 +525,7 @@ def main():
         obs_dim=obs_dim,
         pred_horizon=args.pred_horizon,
         act_dim=act_dim,
+        num_inference_steps=args.num_inference_steps,  # For x_chain storage
         gamma=args.gamma,
         gae_lambda=args.gae_lambda,
         normalize_advantages=args.normalize_advantages,
@@ -693,7 +694,8 @@ def main():
                 obs_cond = encode_observations(obs_seq)
                 
                 # Get action with exploration
-                actions, chains = agent.get_action(
+                # x_chain is (B, K+1, H, A) complete denoising trajectory
+                actions, x_chain = agent.get_action(
                     obs_cond, 
                     deterministic=False, 
                     use_ema=False,
@@ -703,9 +705,25 @@ def main():
                 # Compute value and log_prob
                 # Use target value network for more stable GAE computation when enabled
                 values = agent.compute_value(obs_cond, use_target=args.use_target_value_net)
-                log_probs, _ = agent.compute_action_log_prob(
-                    obs_cond, actions, chains=chains, use_old_policy=False
+                log_probs, entropy_rollout = agent.compute_action_log_prob(
+                    obs_cond, actions, x_chain=x_chain, use_old_policy=False
                 )
+                
+                # === DEBUG: Log rollout statistics (first step only) ===
+                if rollout_step == 0 and num_updates % args.log_freq == 0:
+                    print(f"\n[DEBUG Rollout] Update {num_updates}")
+                    print(f"  x_chain shape: {x_chain.shape}")
+                    print(f"  x_chain[0] (x_0) stats: mean={x_chain[:, 0].mean():.4f}, std={x_chain[:, 0].std():.4f}")
+                    print(f"  x_chain[-1] (x_K) stats: mean={x_chain[:, -1].mean():.4f}, std={x_chain[:, -1].std():.4f}")
+                    # Check diff between consecutive x_chain states
+                    diffs = []
+                    for k in range(x_chain.shape[1] - 1):
+                        diff = (x_chain[:, k+1] - x_chain[:, k]).abs().mean().item()
+                        diffs.append(diff)
+                    print(f"  x_chain step diffs (mean abs): {[f'{d:.4f}' for d in diffs]}")
+                    print(f"  log_probs: mean={log_probs.mean():.4f}, std={log_probs.std():.4f}, min={log_probs.min():.4f}, max={log_probs.max():.4f}")
+                    print(f"  entropy: mean={entropy_rollout.mean():.4f}")
+                    print(f"  values: mean={values.mean():.4f}, std={values.std():.4f}")
             
             # Execute action chunk (SMDP)
             chunk_rewards = []
@@ -779,6 +797,7 @@ def main():
                 )
             
             # Add to buffer (vectorized)
+            # x_chain is essential for accurate log_prob computation in PPO updates
             buffer.add(
                 obs=obs_cond,
                 actions=actions,
@@ -786,6 +805,7 @@ def main():
                 values=values,
                 log_probs=log_probs,
                 dones=chunk_done_flags.float(),
+                x_chain=x_chain,  # (num_envs, K+1, pred_horizon, act_dim)
             )
             
             # Handle final values for episodes that ended (following ppo_rgb.py)
@@ -835,7 +855,6 @@ def main():
         
         # PPO update
         last_tick = time.time()
-        agent.sync_old_policy()
         
         total_policy_loss = 0.0
         total_value_loss = 0.0
@@ -855,16 +874,33 @@ def main():
             
             for batch in batches:
                 # Forward pass with value clipping to prevent vloss explosion
+                # x_chain is essential for accurate log_prob computation
                 loss_dict = agent.compute_ppo_loss(
                     obs_cond=batch["obs"],
                     actions=batch["actions"],
                     old_log_probs=batch["log_probs"],
                     advantages=batch["advantages"],
                     returns=batch["returns"],
+                    x_chain=batch["x_chain"],  # (B, K+1, H, A) denoising trajectory
                     old_values=batch.get("values"),  # For value clipping
                     clip_value=args.clip_value_loss,
                     value_clip_range=args.value_clip_range,
                 )
+                
+                # === DEBUG: Log PPO statistics (first batch of first epoch only) ===
+                if epoch == 0 and num_batches == 0 and num_updates % args.log_freq == 0:
+                    print(f"\n[DEBUG PPO] Update {num_updates}, Epoch {epoch}, Batch 0")
+                    print(f"  Batch size: {batch['obs'].shape[0]}")
+                    print(f"  old_log_probs (from buffer): mean={batch['log_probs'].mean():.4f}, std={batch['log_probs'].std():.4f}")
+                    print(f"  new_log_probs (recomputed): mean={loss_dict['new_log_probs_mean']:.4f}, std={loss_dict['new_log_probs_std']:.4f}")
+                    print(f"  log_ratio (new - old): mean={loss_dict['log_ratio_mean']:.6f}, std={loss_dict['log_ratio_std']:.6f}")
+                    print(f"  ratio: mean={loss_dict['ratio_mean']:.6f}, std={loss_dict['ratio_std']:.6f}, min={loss_dict['ratio_min']:.6f}, max={loss_dict['ratio_max']:.6f}")
+                    print(f"  advantages: mean={batch['advantages'].mean():.4f}, std={batch['advantages'].std():.4f}")
+                    print(f"  returns: mean={batch['returns'].mean():.4f}, std={batch['returns'].std():.4f}")
+                    print(f"  policy_loss: {loss_dict['policy_loss']:.8f}")
+                    print(f"  value_loss: {loss_dict['value_loss']:.6f}")
+                    print(f"  entropy: {loss_dict['entropy']:.4f}")
+                    print(f"  approx_kl: {loss_dict['approx_kl']:.8f}")
                                 
                 # Backward pass
                 if num_updates < args.critic_warmup_steps:
@@ -879,6 +915,23 @@ def main():
                     policy_optimizer.zero_grad()
                     critic_optimizer.zero_grad()
                     loss_dict["loss"].backward()
+                    
+                    # === DEBUG: Check gradients before clipping (first batch of first epoch only) ===
+                    if epoch == 0 and num_batches == 0 and num_updates % args.log_freq == 0:
+                        # Check velocity net gradients
+                        velocity_grad_norm = 0.0
+                        noise_net_grad_norm = 0.0
+                        for name, param in agent.noisy_velocity_net.named_parameters():
+                            if param.grad is not None:
+                                if 'explore_noise_net' in name:
+                                    noise_net_grad_norm += param.grad.norm().item() ** 2
+                                else:
+                                    velocity_grad_norm += param.grad.norm().item() ** 2
+                        velocity_grad_norm = velocity_grad_norm ** 0.5
+                        noise_net_grad_norm = noise_net_grad_norm ** 0.5
+                        print(f"  [GRAD] velocity_net grad norm: {velocity_grad_norm:.6f}")
+                        print(f"  [GRAD] explore_noise_net grad norm: {noise_net_grad_norm:.6f}")
+                    
                     policy_grad_norm = nn.utils.clip_grad_norm_(policy_params, args.max_grad_norm)
                     critic_grad_norm = nn.utils.clip_grad_norm_(critic_params, args.max_grad_norm)
                     policy_optimizer.step()
@@ -897,14 +950,18 @@ def main():
                     total_kl_div += kl_val
                 num_batches += 1
                 
+                # Free memory after each batch to prevent accumulation
+                # del loss_dict
+                
                 # === KL early stopping check (after stats accumulation) ===
                 if args.kl_early_stop and args.target_kl is not None:
-                    current_kl = loss_dict.get("approx_kl", 0.0)
-                    if isinstance(current_kl, torch.Tensor):
-                        current_kl = current_kl.item()
-                    if current_kl > args.target_kl * 1.5:  # Allow some margin
+                    if kl_val > args.target_kl * 1.5:  # Allow some margin
                         kl_early_stopped = True
                         break
+            
+            # Clear CUDA cache after each epoch to prevent memory buildup
+            # del batches
+            # torch.cuda.empty_cache()
         
         # Update EMA
         agent.update_ema()

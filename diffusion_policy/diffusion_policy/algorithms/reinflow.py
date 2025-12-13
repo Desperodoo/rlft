@@ -188,7 +188,7 @@ class NoisyVelocityUNet1D(nn.Module):
         Returns:
             velocity: (B, pred_horizon, action_dim) predicted velocity
             noise: (B, pred_horizon, action_dim) sampled noise (or None)
-            noise_std: (B, action_dim) noise scale
+            noise_std: (B, action_dim) noise scale (clamped for numerical stability)
         """
         # Get base velocity prediction (with step_size for ShortCut Flow)
         velocity = self.base_net(sample, timestep, step_size, global_cond)
@@ -198,7 +198,11 @@ class NoisyVelocityUNet1D(nn.Module):
         obs_emb = self.obs_embed(global_cond)
         
         # Predict noise scale
-        noise_std = self.explore_noise_net(t_emb, obs_emb)
+        noise_std_raw = self.explore_noise_net(t_emb, obs_emb)
+        
+        # Clamp noise_std for numerical stability
+        # Following original ReinFlow: min_sampling_denoising_std and max_logprob_denoising_std
+        noise_std = torch.clamp(noise_std_raw, min=self.min_noise_std, max=self.max_noise_std)
         
         # Sample noise if requested
         if sample_noise:
@@ -353,17 +357,6 @@ class ReinFlowAgent(nn.Module):
                 param.requires_grad = False
         else:
             self.value_net_target = None
-        
-        # Old policy for PPO ratio
-        self.noisy_velocity_net_old = NoisyVelocityUNet1D(
-            base_velocity_net=copy.deepcopy(velocity_net),
-            obs_dim=obs_dim,
-            action_dim=act_dim,
-            min_noise_std=min_noise_std,
-            max_noise_std=max_noise_std,
-        )
-        for param in self.noisy_velocity_net_old.parameters():
-            param.requires_grad = False
     
     def get_current_noise_std(self) -> Tuple[float, float]:
         """Get current noise bounds based on decay schedule."""
@@ -391,7 +384,6 @@ class ReinFlowAgent(nn.Module):
         
         min_std, max_std = self.get_current_noise_std()
         self.noisy_velocity_net.update_noise_bounds(min_std, max_std)
-        self.noisy_velocity_net_old.update_noise_bounds(min_std, max_std)
     
     def update_ema(self):
         """Update EMA of velocity network."""
@@ -410,21 +402,6 @@ class ReinFlowAgent(nn.Module):
                 self.value_net,
                 self.value_target_tau
             )
-    
-    def sync_old_policy(self):
-        """Sync old policy with current for PPO ratio."""
-        self.noisy_velocity_net_old.base_net.load_state_dict(
-            self.noisy_velocity_net.base_net.state_dict()
-        )
-        self.noisy_velocity_net_old.explore_noise_net.load_state_dict(
-            self.noisy_velocity_net.explore_noise_net.state_dict()
-        )
-        self.noisy_velocity_net_old.time_embed.load_state_dict(
-            self.noisy_velocity_net.time_embed.state_dict()
-        )
-        self.noisy_velocity_net_old.obs_embed.load_state_dict(
-            self.noisy_velocity_net.obs_embed.state_dict()
-        )
     
     def compute_loss(
         self,
@@ -479,11 +456,14 @@ class ReinFlowAgent(nn.Module):
         deterministic: bool = True,
         use_ema: bool = True,
         return_chains: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Sample action using fixed-step flow integration.
         
         For offline BC training evaluation: use deterministic=True (default)
         For online RL exploration: use deterministic=False to inject learned noise
+        
+        Following original ReinFlow implementation, stores complete x_chain trajectory
+        for accurate log_prob computation in PPO updates.
         
         Args:
             obs_cond: (B, obs_horizon * obs_dim) observation features
@@ -493,10 +473,14 @@ class ReinFlowAgent(nn.Module):
             
         Returns:
             actions: (B, pred_horizon, act_dim) sampled action sequence
-            chains: List of (x_k, noise_std_k) tuples if return_chains=True, else None
+            x_chain: (B, K+1, pred_horizon, act_dim) complete denoising trajectory
+                     if return_chains=True, else None
+                     x_chain[:, 0] is initial noise x_0
+                     x_chain[:, K] is final action (before clamp)
         """
         B = obs_cond.shape[0]
         device = obs_cond.device
+        K = self.num_inference_steps
         
         # Start from Gaussian noise
         x = torch.randn((B, self.pred_horizon, self.act_dim), device=device)
@@ -505,41 +489,47 @@ class ReinFlowAgent(nn.Module):
         dt = self.fixed_step_size
         d = torch.full((B,), dt, device=device)
         
-        # Store chains for log_prob computation
-        chains = [] if return_chains else None
+        # Store complete x_chain for log_prob computation: [B, K+1, H, A]
+        if return_chains:
+            x_chain = torch.zeros((B, K + 1, self.pred_horizon, self.act_dim), device=device)
+            x_chain[:, 0] = x.clone()  # Store initial noise x_0
+        else:
+            x_chain = None
         
         # Choose velocity network
         if use_ema and self.velocity_net_ema is not None and deterministic:
             # Use EMA for deterministic inference
-            for i in range(self.num_inference_steps):
+            for i in range(K):
                 t = torch.full((B,), i * dt, device=device)
                 velocity = self.velocity_net_ema(x, t, d, obs_cond)
                 x = x + velocity * dt
+                if return_chains:
+                    x_chain[:, i + 1] = x.clone()
         else:
             # Use noisy velocity net
-            for i in range(self.num_inference_steps):
+            for i in range(K):
                 t = torch.full((B,), i * dt, device=device)
                 
                 if deterministic:
                     velocity, _, noise_std = self.noisy_velocity_net(
                         x, t, d, obs_cond, sample_noise=False
                     )
-                    if return_chains:
-                        chains.append((x.clone(), noise_std.clone()))
                     x = x + velocity * dt
                 else:
                     velocity, noise, noise_std = self.noisy_velocity_net(
                         x, t, d, obs_cond, sample_noise=True
                     )
-                    if return_chains:
-                        chains.append((x.clone(), noise_std.clone()))
                     x = x + velocity * dt
-                    # Add exploration noise
+                    # Add exploration noise (following original ReinFlow: no sqrt(dt) factor)
+                    # Original: dist = Normal(xt, std); xt = dist.sample()
                     if noise is not None:
-                        x = x + noise * np.sqrt(dt)
+                        x = x + noise  # noise already has std = noise_std
+                
+                if return_chains:
+                    x_chain[:, i + 1] = x.clone()
         
         actions = torch.clamp(x, -1.0, 1.0)
-        return actions, chains
+        return actions, x_chain
     
     def compute_value(self, obs_cond: torch.Tensor, use_target: bool = False) -> torch.Tensor:
         """Compute state value V(s_0).
@@ -560,80 +550,107 @@ class ReinFlowAgent(nn.Module):
         self,
         obs_cond: torch.Tensor,
         actions: torch.Tensor,
-        chains: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-        use_old_policy: bool = False,
+        x_chain: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute log probability of actions.
+        """Compute log probability of actions using Markov chain transition probabilities.
         
-        Uses local Gaussian approximation based on accumulated noise.
-        If chains is provided, uses stored trajectories for more accurate estimation.
+        Following original ReinFlow implementation:
+        log p(trajectory | policy) = sum_{k=0}^{K-1} log p(x_{k+1} | x_k, s, policy)
+        
+        Note: We do NOT include log p(x_0) because:
+        1. x_0 ~ N(0, I) is policy-independent (same for old and new policy)
+        2. In PPO ratio computation, log p(x_0) cancels out
+        3. Including it would make log_prob values unnecessarily large
+        
+        where:
+        - p(x_{k+1} | x_k, s) = N(x_k + v_k * dt, sigma_k)
         
         Args:
             obs_cond: (B, obs_dim) observation features
-            actions: (B, pred_horizon, act_dim) action sequence
-            chains: Optional list of (x_k, noise_std_k) from get_action
-            use_old_policy: Whether to use old policy
+            actions: (B, pred_horizon, act_dim) action sequence (not used if x_chain provided)
+            x_chain: (B, K+1, pred_horizon, act_dim) complete denoising trajectory from get_action
+                     x_chain[:, 0] is initial noise x_0, x_chain[:, K] is final action
             
         Returns:
-            log_prob: (B,) log probability
-            entropy: (B,) policy entropy
+            log_prob: (B,) log probability of the trajectory (transitions only)
+            entropy: (B,) policy entropy estimate
         """
-        B = actions.shape[0]
-        device = actions.device
+        if x_chain is None:
+            raise ValueError("x_chain is required for accurate log_prob computation. "
+                           "Call get_action with return_chains=True.")
         
-        net = self.noisy_velocity_net_old if use_old_policy else self.noisy_velocity_net
+        B = x_chain.shape[0]
+        K = self.num_inference_steps
+        device = x_chain.device
         
         dt = self.fixed_step_size
         d = torch.full((B,), dt, device=device)
         
-        # Accumulate noise variance
-        total_noise_var = torch.zeros((B, self.act_dim), device=device)
+        # === Compute sum of transition log probabilities ===
+        # For each step k: log p(x_{k+1} | x_k, s) = log N(x_{k+1}; mean_k, std_k)
+        # where mean_k = x_k + v_k * dt, std_k = noise_std_k (following original ReinFlow)
+        #
+        # NOTE: We do NOT include log p(x_0) because it's policy-independent
+        # and would cancel out in the PPO ratio anyway.
         
-        if chains is not None:
-            # Use stored chains for more accurate estimation
-            with torch.set_grad_enabled(not use_old_policy):
-                for i, (x_k, noise_std_k) in enumerate(chains):
-                    noise_std_clamped = torch.clamp(noise_std_k, min=0.01, max=0.3)
-                    total_noise_var = total_noise_var + (noise_std_clamped ** 2) * dt
+        total_log_prob_trans = torch.zeros(B, device=device)
+        total_entropy = torch.zeros(B, device=device)
+        
+        for k in range(K):
+            # Detach x_chain states since they're fixed from rollout
+            # Only the network parameters should have gradients
+            x_k = x_chain[:, k].detach()        # (B, H, A) - current state  
+            x_next = x_chain[:, k + 1].detach()  # (B, H, A) - next state
             
-            # Mean is approximately the given actions
-            mean_action = actions
-        else:
-            # Re-run deterministic flow to get expected trajectory
-            x = torch.randn((B, self.pred_horizon, self.act_dim), device=device)
+            # Compute timestep
+            t = torch.full((B,), k * dt, device=device)
             
-            with torch.set_grad_enabled(not use_old_policy):
-                for i in range(self.num_inference_steps):
-                    t = torch.full((B,), i * dt, device=device)
-                    velocity, _, noise_std = net(x, t, d, obs_cond, sample_noise=False)
-                    
-                    # Accumulate variance
-                    noise_std_clamped = torch.clamp(noise_std, min=0.01, max=0.3)
-                    total_noise_var = total_noise_var + (noise_std_clamped ** 2) * dt
-                    
-                    # Deterministic step
-                    x = x + velocity * dt
+            # Get velocity and noise_std from policy network
+            velocity, _, noise_std = self.noisy_velocity_net(x_k, t, d, obs_cond, sample_noise=False)
+            # noise_std: (B, A)
             
-            mean_action = torch.clamp(x, -1.0, 1.0)
+            # Mean of transition: x_k + velocity * dt
+            mean_next = x_k + velocity * dt  # (B, H, A)
+            
+            # Std of transition: noise_std directly (following original ReinFlow)
+            # Original: dist = Normal(xt, std); logprob = dist.log_prob(xt).sum()
+            trans_std = noise_std  # (B, A) - no sqrt(dt) factor!
+            
+            # Expand std to match action shape: (B, A) -> (B, H, A)
+            trans_std_expanded = trans_std.unsqueeze(1).expand(-1, self.pred_horizon, -1)
+            
+            # Compute log p(x_{k+1} | x_k) = log N(x_{k+1}; mean_next, trans_std)
+            # = -0.5 * ((x_next - mean_next) / trans_std)^2 - log(trans_std) - 0.5 * log(2*pi)
+            diff = x_next - mean_next
+            
+            # Normalized squared distance
+            normalized_diff = diff / trans_std_expanded
+            
+            # For numerical stability, clip the normalized difference
+            normalized_diff = torch.clamp(normalized_diff, -10.0, 10.0)
+            
+            log_prob_trans = -0.5 * normalized_diff ** 2 \
+                             - torch.log(trans_std_expanded) \
+                             - 0.5 * np.log(2 * np.pi)
+            
+            # Sum over dimensions (H, A) to get per-sample log_prob
+            log_prob_trans = log_prob_trans.sum(dim=[1, 2])  # (B,)
+            
+            total_log_prob_trans = total_log_prob_trans + log_prob_trans
+            
+            # Accumulate entropy: H = 0.5 * (1 + log(2*pi*sigma^2)) per dim
+            entropy_per_dim = 0.5 * (1 + np.log(2 * np.pi)) + torch.log(trans_std_expanded)
+            total_entropy = total_entropy + entropy_per_dim.sum(dim=[1, 2])
         
-        # Total std
-        total_std = torch.sqrt(total_noise_var + 1e-6)
-        total_std = torch.clamp(total_std, min=0.05, max=0.8)
+        # === Final log probability ===
+        # Only transition probabilities, not including log p(x_0)
+        log_prob = total_log_prob_trans
         
-        # Expand std for action sequence: (B, act_dim) -> (B, pred_horizon, act_dim)
-        total_std_expanded = total_std.unsqueeze(1).expand(-1, self.pred_horizon, -1)
+        # No clamping here - let the values flow through for proper gradient computation
+        # The ratio will be clamped in compute_ppo_loss anyway
         
-        # Log probability
-        diff = actions - mean_action
-        log_prob = -0.5 * (diff / total_std_expanded) ** 2 - torch.log(total_std_expanded)
-        log_prob = log_prob - 0.5 * np.log(2 * np.pi)
-        log_prob = log_prob.sum(dim=[1, 2])
-        log_prob = torch.clamp(log_prob, min=-20.0, max=5.0)
-        
-        # Entropy: Gaussian entropy H = 0.5 * (1 + log(2πσ²)) per dimension
-        # total_std is (B, act_dim), expand to (B, pred_horizon, act_dim) and sum
-        entropy_per_dim = 0.5 * (1 + np.log(2 * np.pi)) + torch.log(total_std_expanded)
-        entropy = entropy_per_dim.sum(dim=[1, 2])  # sum over (pred_horizon, act_dim)
+        # Average entropy per step
+        entropy = total_entropy / K
         
         return log_prob, entropy
     
@@ -644,19 +661,14 @@ class ReinFlowAgent(nn.Module):
         old_log_probs: torch.Tensor,
         advantages: torch.Tensor,
         returns: torch.Tensor,
-        chains: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        x_chain: Optional[torch.Tensor] = None,
         old_values: Optional[torch.Tensor] = None,
         clip_value: bool = False,
         value_clip_range: float = 10.0,
     ) -> Dict[str, torch.Tensor]:
         """Compute PPO loss for online RL.
         
-        Supports critic warmup: during warmup, only value_loss is computed.
-        
-        === IMPROVEMENTS FOR CRITIC STABILITY (borrowed from AWCP) ===
-        1. Reward scaling: returns are assumed to be pre-scaled by reward_scale
-        2. Value target clipping: clip targets to prevent extreme values
-        3. Huber loss option: more robust to outliers than MSE
+        Following original ReinFlow implementation (ppoflow.py).
         
         Args:
             obs_cond: (B, obs_dim) observation features
@@ -664,7 +676,7 @@ class ReinFlowAgent(nn.Module):
             old_log_probs: (B,) log probs from old policy
             advantages: (B,) GAE advantages
             returns: (B,) discounted returns (should be pre-scaled by reward_scale)
-            chains: Optional denoising chains from rollout
+            x_chain: (B, K+1, pred_horizon, act_dim) complete denoising trajectory
             old_values: (B,) old value predictions (for value clipping)
             clip_value: Whether to clip value loss
             value_clip_range: Range for value clipping
@@ -675,46 +687,52 @@ class ReinFlowAgent(nn.Module):
         # Compute value predictions
         values = self.value_net(obs_cond).squeeze(-1)
         
-        # === IMPROVEMENT 1: Clip returns using value_target_clip (like AWCP's q_target_clip) ===
-        # This is critical to prevent extreme return values from destabilizing critic
-        effective_clip = min(value_clip_range, self.value_target_clip)
-        returns_clipped = torch.clamp(returns, -effective_clip, effective_clip)
-        
-        # === IMPROVEMENT 2: More robust value loss computation ===
+        # === Value loss (following original ReinFlow: MSE with 0.5 coefficient) ===
         if clip_value and old_values is not None:
-            # Clipped value loss (PPO2 style) with additional safeguards
-            old_values_clipped = torch.clamp(old_values, -effective_clip, effective_clip)
-            value_pred_clipped = old_values_clipped + torch.clamp(
-                values - old_values_clipped, -value_clip_range, value_clip_range
+            # Clipped value loss (PPO2 style)
+            # Original: v_loss = 0.5 * torch.max((newvalues - returns) ** 2, (v_clipped - returns) ** 2).mean()
+            v_clipped = old_values + torch.clamp(
+                values - old_values, -value_clip_range, value_clip_range
             )
-            # Use Huber loss for robustness to outliers
-            value_loss1 = F.smooth_l1_loss(values, returns_clipped)
-            value_loss2 = F.smooth_l1_loss(value_pred_clipped, returns_clipped)
-            value_loss = torch.max(value_loss1, value_loss2)
+            v_loss_unclipped = (values - returns) ** 2
+            v_loss_clipped = (v_clipped - returns) ** 2
+            value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
         else:
-            # Use Huber loss (smooth L1) instead of MSE for robustness
-            value_loss = F.smooth_l1_loss(values, returns_clipped)
+            # Original: v_loss = 0.5 * ((newvalues - returns) ** 2).mean()
+            value_loss = 0.5 * ((values - returns) ** 2).mean()
         
         # Compute new log probs
         new_log_probs, entropy = self.compute_action_log_prob(
-            obs_cond, actions, chains=chains, use_old_policy=False
+            obs_cond, actions, x_chain=x_chain
         )
         
-        # PPO clipped objective
-        ratio = torch.exp(new_log_probs - old_log_probs)
-        # Clamp ratio to prevent extreme values
-        ratio = torch.clamp(ratio, 0.0, 10.0)
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-        policy_loss = -torch.min(surr1, surr2).mean()
+        # === Log prob handling ===
+        # NOTE: Original ReinFlow uses normalized log_probs (divided by K or by dimensions)
+        # with clamp range [-5, 2]. Our implementation uses joint log_prob (sum over K steps),
+        # which results in much larger values (~400-500 for K=8, H=16, A=7).
+        # 
+        # We have two options:
+        # 1. Normalize log_probs by dividing by (K * H * A) - but this changes gradient scale
+        # 2. Don't clamp, since the ratio is what matters for PPO, not absolute log_prob values
+        #
+        # We choose option 2: no clamping, because:
+        # - The ratio exp(new_log_prob - old_log_prob) is numerically stable if the difference is small
+        # - Clamping would destroy gradients when values are at the boundary
+        # - The PPO clip already handles extreme ratios
         
-        # === NEW: Compute approximate KL divergence for early stopping ===
-        # Using the approximation: KL ≈ (ratio - 1) - log(ratio)
-        # This is more stable than the exact KL when ratio is close to 1
+        # PPO clipped objective (no log_prob clamping)
+        log_ratio = new_log_probs - old_log_probs
+        ratio = torch.exp(log_ratio)
+        
+        # === Compute approximate KL divergence ===
         with torch.no_grad():
-            log_ratio = new_log_probs - old_log_probs
             approx_kl = ((ratio - 1) - log_ratio).mean()
-            # Alternative: approx_kl = 0.5 * ((log_ratio) ** 2).mean()
+            clipfrac = ((ratio - 1.0).abs() > self.clip_ratio).float().mean().item()
+                
+        # Policy loss with clipping (original doesn't clamp ratio before this)
+        pg_loss1 = -advantages * ratio
+        pg_loss2 = -advantages * torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio)
+        policy_loss = torch.max(pg_loss1, pg_loss2).mean()
         
         # Entropy bonus
         entropy_loss = -entropy.mean()
@@ -729,11 +747,20 @@ class ReinFlowAgent(nn.Module):
             "entropy": entropy.mean(),
             "ratio_mean": ratio.mean(),
             "ratio_std": ratio.std(),
+            "ratio_min": ratio.min(),
+            "ratio_max": ratio.max(),
+            "log_ratio_mean": log_ratio.mean(),
+            "log_ratio_std": log_ratio.std(),
+            "new_log_probs_mean": new_log_probs.mean(),
+            "new_log_probs_std": new_log_probs.std(),
+            "old_log_probs_mean": old_log_probs.mean(),
+            "old_log_probs_std": old_log_probs.std(),
             "returns_mean": returns.mean(),
             "returns_std": returns.std(),
             "values_mean": values.mean(),
             "values_std": values.std(),
-            "approx_kl": approx_kl,  # NEW: For KL early stopping
+            "approx_kl": approx_kl,
+            "clipfrac": clipfrac,
             "in_warmup": False,
         }
     
@@ -742,7 +769,6 @@ class ReinFlowAgent(nn.Module):
         checkpoint = {
             "noisy_velocity_net": self.noisy_velocity_net.state_dict(),
             "value_net": self.value_net.state_dict(),
-            "noisy_velocity_net_old": self.noisy_velocity_net_old.state_dict(),
             "current_step": self._current_step,
             "config": {
                 "obs_dim": self.obs_dim,
@@ -777,8 +803,6 @@ class ReinFlowAgent(nn.Module):
         checkpoint = torch.load(path, map_location=device)
         self.noisy_velocity_net.load_state_dict(checkpoint["noisy_velocity_net"])
         self.value_net.load_state_dict(checkpoint["value_net"])
-        if "noisy_velocity_net_old" in checkpoint:
-            self.noisy_velocity_net_old.load_state_dict(checkpoint["noisy_velocity_net_old"])
         if "velocity_net_ema" in checkpoint and self.velocity_net_ema is not None:
             self.velocity_net_ema.load_state_dict(checkpoint["velocity_net_ema"])
         # === NEW: Load target value network ===
@@ -786,7 +810,6 @@ class ReinFlowAgent(nn.Module):
             self.value_net_target.load_state_dict(checkpoint["value_net_target"])
         if "current_step" in checkpoint:
             self._current_step = checkpoint["current_step"]
-        self.sync_old_policy()
     
     def load_from_aw_shortcut_flow(
         self,
@@ -851,9 +874,6 @@ class ReinFlowAgent(nn.Module):
         if self.velocity_net_ema is not None:
             self.velocity_net_ema.load_state_dict(velocity_weights, strict=False)
         
-        # Sync old policy
-        self.sync_old_policy()
-        
         print(f"Loaded velocity network from {checkpoint_path}")
         
         # Note: We don't load critic because AW-ShortCut Flow uses DoubleQNetwork
@@ -887,7 +907,6 @@ class ReinFlowAgent(nn.Module):
             self.noisy_velocity_net.base_net.load_state_dict(weights)
             if self.velocity_net_ema is not None:
                 self.velocity_net_ema.load_state_dict(weights)
-            self.sync_old_policy()
             print(f"Loaded velocity network from {checkpoint_path}")
         elif "model" in checkpoint:
             # Generic model key
@@ -895,14 +914,12 @@ class ReinFlowAgent(nn.Module):
             self.noisy_velocity_net.base_net.load_state_dict(weights)
             if self.velocity_net_ema is not None:
                 self.velocity_net_ema.load_state_dict(weights)
-            self.sync_old_policy()
             print(f"Loaded velocity network from {checkpoint_path}")
         else:
             # Try loading directly (might be just the state dict)
             self.noisy_velocity_net.base_net.load_state_dict(checkpoint)
             if self.velocity_net_ema is not None:
                 self.velocity_net_ema.load_state_dict(checkpoint)
-            self.sync_old_policy()
             print(f"Loaded velocity network from {checkpoint_path}")
 
 
@@ -915,12 +932,16 @@ class VectorizedRolloutBuffer:
     Adapted for SMDP (action chunks) where each "step" executes an entire
     action chunk over act_horizon environment steps.
     
+    Now also stores x_chain trajectories for accurate log_prob computation
+    following the original ReinFlow implementation.
+    
     Args:
         num_steps: Number of rollout steps per update
         num_envs: Number of parallel environments
         obs_dim: Observation dimension
         pred_horizon: Action prediction horizon
         act_dim: Action dimension
+        num_inference_steps: Number of denoising steps (K) for x_chain storage
         gamma: Discount factor for GAE
         gae_lambda: GAE lambda parameter
         normalize_advantages: Whether to normalize advantages
@@ -934,6 +955,7 @@ class VectorizedRolloutBuffer:
         obs_dim: int,
         pred_horizon: int,
         act_dim: int,
+        num_inference_steps: int = 8,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         normalize_advantages: bool = True,
@@ -944,6 +966,7 @@ class VectorizedRolloutBuffer:
         self.obs_dim = obs_dim
         self.pred_horizon = pred_horizon
         self.act_dim = act_dim
+        self.num_inference_steps = num_inference_steps
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.normalize_advantages = normalize_advantages
@@ -956,6 +979,13 @@ class VectorizedRolloutBuffer:
         self.values = torch.zeros((num_steps, num_envs), device=device)
         self.log_probs = torch.zeros((num_steps, num_envs), device=device)
         self.dones = torch.zeros((num_steps, num_envs), device=device)
+        
+        # x_chain storage: (num_steps, num_envs, K+1, pred_horizon, act_dim)
+        # This is essential for accurate log_prob computation in PPO updates
+        self.x_chains = torch.zeros(
+            (num_steps, num_envs, num_inference_steps + 1, pred_horizon, act_dim), 
+            device=device
+        )
         
         # For handling episode boundaries (following ppo_rgb.py)
         self.final_values = torch.zeros((num_steps, num_envs), device=device)
@@ -981,17 +1011,26 @@ class VectorizedRolloutBuffer:
         values: torch.Tensor,        # (num_envs,)
         log_probs: torch.Tensor,     # (num_envs,)
         dones: torch.Tensor,         # (num_envs,)
+        x_chain: Optional[torch.Tensor] = None,  # (num_envs, K+1, pred_horizon, act_dim)
     ):
-        """Add a step of transitions for all environments."""
+        """Add a step of transitions for all environments.
+        
+        All tensors are detached to prevent gradient graph accumulation.
+        """
         if self.ptr >= self.num_steps:
             return
         
-        self.obs[self.ptr] = obs
-        self.actions[self.ptr] = actions
-        self.rewards[self.ptr] = rewards
-        self.values[self.ptr] = values.flatten()
-        self.log_probs[self.ptr] = log_probs
-        self.dones[self.ptr] = dones
+        # Detach all tensors to ensure no gradient graph is retained
+        # This is critical to prevent memory leaks during rollout
+        self.obs[self.ptr] = obs.detach()
+        self.actions[self.ptr] = actions.detach()
+        self.rewards[self.ptr] = rewards.detach()
+        self.values[self.ptr] = values.detach().flatten()
+        self.log_probs[self.ptr] = log_probs.detach()
+        self.dones[self.ptr] = dones.detach()
+        
+        if x_chain is not None:
+            self.x_chains[self.ptr] = x_chain.detach()
         
         self.ptr += 1
     
@@ -1003,7 +1042,7 @@ class VectorizedRolloutBuffer:
             env_mask: Boolean mask of which envs ended (num_envs,)
             final_vals: Value estimates for final observations (num_masked,)
         """
-        self.final_values[step, env_mask] = final_vals.flatten()
+        self.final_values[step, env_mask] = final_vals.detach().flatten()
     
     def compute_returns_and_advantages(
         self,
@@ -1052,19 +1091,27 @@ class VectorizedRolloutBuffer:
         """Get mini-batches for PPO updates.
         
         Flattens (num_steps, num_envs) to (num_steps * num_envs,) and creates batches.
+        Now includes x_chain for accurate log_prob computation.
+        
+        IMPORTANT: All tensors are detached to ensure no gradient graph is retained
+        from rollout phase. This prevents "backward through graph twice" errors
+        when PPO updates iterate over multiple epochs.
         """
         if self.advantages is None:
             raise RuntimeError("Must call compute_returns_and_advantages first")
         
         # Flatten (num_steps, num_envs, ...) -> (num_steps * num_envs, ...)
         n = self.ptr * self.num_envs
+        K = self.num_inference_steps
         
-        b_obs = self.obs[:self.ptr].reshape(n, -1)
-        b_actions = self.actions[:self.ptr].reshape(n, self.pred_horizon, self.act_dim)
-        b_log_probs = self.log_probs[:self.ptr].reshape(n)
-        b_values = self.values[:self.ptr].reshape(n)
-        b_advantages = self.advantages.reshape(n)
-        b_returns = self.returns.reshape(n)
+        # Detach all tensors to ensure no gradient graph from rollout
+        b_obs = self.obs[:self.ptr].reshape(n, -1).detach()
+        b_actions = self.actions[:self.ptr].reshape(n, self.pred_horizon, self.act_dim).detach()
+        b_log_probs = self.log_probs[:self.ptr].reshape(n).detach()
+        b_values = self.values[:self.ptr].reshape(n).detach()
+        b_advantages = self.advantages.reshape(n).detach()
+        b_returns = self.returns.reshape(n).detach()
+        b_x_chains = self.x_chains[:self.ptr].reshape(n, K + 1, self.pred_horizon, self.act_dim).detach()
         
         indices = torch.randperm(n, device=self.device) if shuffle else torch.arange(n, device=self.device)
         
@@ -1080,6 +1127,7 @@ class VectorizedRolloutBuffer:
                 "values": b_values[batch_indices],
                 "advantages": b_advantages[batch_indices],
                 "returns": b_returns[batch_indices],
+                "x_chain": b_x_chains[batch_indices],
             }
             batches.append(batch)
         

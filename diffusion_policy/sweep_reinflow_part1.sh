@@ -149,7 +149,7 @@ run_task() {
             ;;
         noise)
             case "$variant" in
-                exp) noise_decay_type="exponential" ;;
+                constant) noise_decay_type="constant" ;;
             esac
             ;;
         ppo)
