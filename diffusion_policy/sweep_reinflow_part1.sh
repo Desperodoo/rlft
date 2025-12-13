@@ -9,7 +9,7 @@
 set -e
 
 # Default configurations
-GPUS=(0 1 2 3 4 5 6 7)
+GPUS=(2 3 4 5 6 7 8 9)
 DRY_RUN=false
 TOTAL_UPDATES=10000
 EVAL_FREQ=100
@@ -27,7 +27,7 @@ OBS_MODE="rgb"
 PRETRAINED_PATH_PATTERN="/home/wjz/rlft/diffusion_policy/runs/awsc-{ENV_ID}-seed0/checkpoints/best_eval_success_once.pt"
 
 # ============================================================================
-# Part 1 Configurations (16 experiments)
+# Part 1 Configurations (11 experiments)
 # ============================================================================
 CONFIGS=(
     # === BASELINE (1) ===
@@ -45,10 +45,8 @@ CONFIGS=(
     # === PPO CLIP RATIO ABLATION (3) ===
     "clip:tight"
     "clip:loose"
-    "clip:very_tight"
     
     # === ENTROPY COEFFICIENT ABLATION (3) ===
-    "entropy:medium"
     "entropy:high"
     
     # === VALUE COEFFICIENT ABLATION (2) ===
@@ -158,7 +156,7 @@ run_task() {
     gae_lambda=0.95
     
     # Gradient/optimization settings
-    max_grad_norm=0.5
+    max_grad_norm=10.0
     lr=3e-5
     lr_critic=3e-5
     
@@ -197,12 +195,10 @@ run_task() {
             case "$variant" in
                 tight) clip_ratio=0.05 ;;
                 loose) clip_ratio=0.2 ;;
-                very_tight) clip_ratio=0.02 ;;
             esac
             ;;
         entropy)
             case "$variant" in
-                medium) entropy_coef=0.01 ;;
                 high) entropy_coef=0.05 ;;
             esac
             ;;

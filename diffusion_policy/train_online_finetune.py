@@ -117,7 +117,7 @@ class Args:
     """learning rate for policy"""
     lr_critic: float = 3e-5
     """learning rate for value network"""
-    max_grad_norm: float = 0.5
+    max_grad_norm: float = 10.0
     """maximum gradient norm for clipping"""
 
     # PPO hyperparameters
@@ -964,7 +964,7 @@ def main():
             # torch.cuda.empty_cache()
         
         # === DEBUG: Log rollout utilization stats ===
-        actual_epochs = epoch + 1 if not kl_early_stopped else epoch + 1  # epoch is 0-indexed
+        actual_epochs = epoch if not kl_early_stopped else epoch + 1  # epoch is 0-indexed
         if num_updates % args.log_freq == 0:
             early_stop_msg = " (KL early stopped)" if kl_early_stopped else ""
             print(f"  [ROLLOUT] Completed {actual_epochs}/{args.ppo_epochs} epochs, {num_batches} minibatch updates{early_stop_msg}")

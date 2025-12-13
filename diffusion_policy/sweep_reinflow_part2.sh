@@ -9,13 +9,13 @@
 set -e
 
 # Default configurations
-GPUS=(0 1 2 3 4 5 6 7)
+GPUS=(2 3 4 5 6 7 8 9)
 DRY_RUN=false
 TOTAL_UPDATES=10000
 EVAL_FREQ=100
 LOG_FREQ=1
-NUM_EVAL_EPISODES=20
-NUM_EVAL_ENVS=5
+NUM_EVAL_EPISODES=50
+NUM_EVAL_ENVS=10
 NUM_ENVS=50
 SIM_BACKEND="physx_cuda"
 WANDB_PROJECT="maniskill_reinflow_sweep"
@@ -35,8 +35,7 @@ CONFIGS=(
     "lr:low"
     
     # === PPO EPOCHS ABLATION (3) ===
-    "epochs:few"
-    "epochs:many"
+    "epochs:one"
     
     # === CRITIC STABILITY ABLATION (5) ===
     "critic:no_target_vnet"
@@ -148,7 +147,7 @@ run_task() {
     gae_lambda=0.95
     
     # Gradient/optimization settings
-    max_grad_norm=0.5
+    max_grad_norm=10.0
     lr=3e-5
     lr_critic=3e-5
     
@@ -175,15 +174,7 @@ run_task() {
             ;;
         epochs)
             case "$variant" in
-                few) ppo_epochs=3 ;;
-                many) ppo_epochs=20 ;;
-            esac
-            ;;
-        gae)
-            case "$variant" in
-                high_lambda) gae_lambda=0.99 ;;
-                low_lambda) gae_lambda=0.8 ;;
-                low_gamma) gamma=0.95 ;;
+                one) ppo_epochs=1 ;;
             esac
             ;;
         critic)
