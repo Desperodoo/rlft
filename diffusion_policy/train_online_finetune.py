@@ -161,8 +161,6 @@ class Args:
     """maximum exploration noise std"""
     noise_decay_type: Literal["constant", "linear", "exponential"] = "linear"
     """noise decay schedule type"""
-    noise_decay_steps: int = 500000
-    """steps over which to decay exploration noise"""
 
     # Critic warmup
     critic_warmup_steps: int = 50
@@ -464,7 +462,7 @@ def main():
         min_noise_std=args.min_noise_std,
         max_noise_std=args.max_noise_std,
         noise_decay_type=args.noise_decay_type,
-        noise_decay_steps=args.noise_decay_steps,
+        noise_decay_steps=args.total_updates,
         critic_warmup_steps=args.critic_warmup_steps,
         # === NEW: Critic stability parameters ===
         reward_scale=args.reward_scale,
@@ -630,7 +628,7 @@ def main():
     print(f"Expected updates: {args.total_updates}")
     print(f"Log every {args.log_freq} updates, Eval every {args.eval_freq} updates, Save every {args.save_freq} updates")
     print(f"Critic warmup steps: {args.critic_warmup_steps}")
-    print(f"Noise schedule: {args.noise_decay_type}, {args.max_noise_std} -> {args.min_noise_std} over {args.noise_decay_steps} steps")
+    print(f"Noise schedule: {args.noise_decay_type}, {args.max_noise_std} -> {args.min_noise_std}")
     
     # Log configuration and model info to tensorboard and wandb
     config_text = f"""
@@ -668,7 +666,6 @@ def main():
     - Noise Schedule: {args.noise_decay_type}
     - Max Noise Std: {args.max_noise_std}
     - Min Noise Std: {args.min_noise_std}
-    - Noise Decay Steps: {args.noise_decay_steps}
     - Critic Warmup Steps: {args.critic_warmup_steps}
     """
     writer.add_text("config/training", config_text)
@@ -868,10 +865,7 @@ def main():
                     clip_value=args.clip_value_loss,
                     value_clip_range=args.value_clip_range,
                 )
-                
-                # Update noise schedule
-                agent.update_noise_schedule()
-                
+                                
                 # Backward pass
                 if num_updates < args.critic_warmup_steps:
                     # During warmup, only update critic
@@ -914,6 +908,8 @@ def main():
         
         # Update EMA
         agent.update_ema()
+        # Update noise schedule
+        agent.update_noise_schedule()
         # === NEW: Update target value network (like AWCP's update_target()) ===
         agent.update_target_value_net()
         num_updates += 1
