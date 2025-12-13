@@ -110,13 +110,12 @@ run_task() {
     # Default values
     critic_warmup_steps=50
     noise_decay_type="linear"
-    noise_decay_steps=500000
     clip_ratio=0.1
     entropy_coef=0.00
     value_coef=0.5
     num_inference_steps=8
     rollout_steps=64
-    ppo_epochs=1
+    ppo_epochs=10
     minibatch_size=5120
     gamma=0.99
     gae_lambda=0.95
@@ -164,7 +163,7 @@ run_task() {
         --max_episode_steps $MAX_EPISODE_STEPS --exp_name $exp_name \
         --track --wandb_project_name $WANDB_PROJECT \
         --critic_warmup_steps $critic_warmup_steps \
-        --noise_decay_type $noise_decay_type --noise_decay_steps $noise_decay_steps \
+        --noise_decay_type $noise_decay_type \
         --clip_ratio $clip_ratio --entropy_coef $entropy_coef --value_coef $value_coef \
         --num_inference_steps $num_inference_steps \
         --rollout_steps $rollout_steps --ppo_epochs $ppo_epochs \

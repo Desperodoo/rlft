@@ -5,7 +5,7 @@
 #
 # Usage: ./monitor_reinflow.sh [--log-dir /tmp/reinflow_grid] [--interval 5]
 
-LOG_DIR="/tmp/reinflow_grid_part2"
+LOG_DIR="/tmp/reinflow_grid_part1"
 REFRESH=5  # seconds
 
 while [[ $# -gt 0 ]]; do
