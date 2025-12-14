@@ -18,7 +18,7 @@ NUM_EVAL_EPISODES=20
 NUM_EVAL_ENVS=5
 NUM_ENVS=50
 SIM_BACKEND="physx_cuda"
-WANDB_PROJECT="maniskill_reinflow_sweep"
+WANDB_PROJECT="maniskill_reinflow_sweep_2"
 MAX_EPISODE_STEPS=64
 ENV_ID="LiftPegUpright-v1"
 CONTROL_MODE="pd_ee_delta_pose"
@@ -55,7 +55,7 @@ CONFIGS=(
 )
 
 SEEDS=(0)
-LOG_DIR="/tmp/reinflow_sweep_part1"
+LOG_DIR="/tmp/reinflow_sweep_2_part1"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -148,7 +148,7 @@ run_task() {
     
     # Rollout/training settings
     rollout_steps=64
-    ppo_epochs=10
+    ppo_epochs=20
     minibatch_size=5120
     
     # GAE/discount settings
@@ -157,8 +157,8 @@ run_task() {
     
     # Gradient/optimization settings
     max_grad_norm=10.0
-    lr=3e-5
-    lr_critic=3e-5
+    lr=1e-6
+    lr_critic=1e-6
     
     # Critic stability settings
     reward_scale=0.5

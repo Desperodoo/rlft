@@ -109,13 +109,13 @@ class Args:
     """total training timesteps (env steps, not policy steps)"""
     rollout_steps: int = 64
     """number of SMDP chunks to collect before each update"""
-    ppo_epochs: int = 10
+    ppo_epochs: int = 20
     """number of PPO epochs per update"""
     minibatch_size: int = 5120
     """minibatch size for PPO updates"""
-    lr: float = 3e-5
+    lr: float = 1e-6
     """learning rate for policy"""
-    lr_critic: float = 3e-5
+    lr_critic: float = 1e-6
     """learning rate for value network"""
     max_grad_norm: float = 10.0
     """maximum gradient norm for clipping"""

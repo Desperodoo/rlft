@@ -18,7 +18,7 @@ NUM_EVAL_EPISODES=50
 NUM_EVAL_ENVS=10
 NUM_ENVS=50
 SIM_BACKEND="physx_cuda"
-WANDB_PROJECT="maniskill_reinflow_sweep"
+WANDB_PROJECT="maniskill_reinflow_sweep_2"
 MAX_EPISODE_STEPS=64
 ENV_ID="LiftPegUpright-v1"
 CONTROL_MODE="pd_ee_delta_pose"
@@ -46,7 +46,7 @@ CONFIGS=(
 )
 
 SEEDS=(0)
-LOG_DIR="/tmp/reinflow_sweep_part2"
+LOG_DIR="/tmp/reinflow_sweep_2_part2"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
