@@ -181,7 +181,7 @@ echo "  - cons: Consistency fraction"
 echo "=========================================="
 echo ""
 
-cd /home/wjz/rlft/diffusion_policy
+cd /home/amax/rlft/diffusion_policy
 
 # Check demo file
 if [ ! -f "$DEMO_PATH" ]; then

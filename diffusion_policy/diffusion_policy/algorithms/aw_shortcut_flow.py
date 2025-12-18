@@ -24,12 +24,12 @@ References:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Literal
+from typing import Optional, Dict, Literal, Union
 import copy
 import math
 
 from .shortcut_flow import ShortCutVelocityUNet1D
-from .networks import DoubleQNetwork, soft_update
+from .networks import DoubleQNetwork, EnsembleQNetwork, soft_update
 
 
 class AWShortCutFlowAgent(nn.Module):
@@ -38,6 +38,10 @@ class AWShortCutFlowAgent(nn.Module):
     Combines ShortCut Flow (local ODE solver) with AWAC-style Q-weighting.
     Uses Q-values to weight BC samples instead of directly maximizing Q,
     which is more stable for offline RL with expert demonstrations.
+    
+    Supports both DoubleQNetwork (num_qs=2) and EnsembleQNetwork (num_qs>=2)
+    for critic architecture. When using EnsembleQNetwork, it enables seamless
+    checkpoint transfer to online RLPD training (AWSC Agent).
     
     Based on sweep results, recommended config for offline RL stage:
     - step_size_mode: "fixed" with fixed_step_size=0.0625 (1/16)
@@ -48,7 +52,8 @@ class AWShortCutFlowAgent(nn.Module):
     
     Args:
         velocity_net: ShortCutVelocityUNet1D for velocity prediction
-        q_network: DoubleQNetwork for Q-value estimation
+        q_network: DoubleQNetwork or EnsembleQNetwork for Q-value estimation.
+            EnsembleQNetwork recommended for downstream online RL fine-tuning.
         action_dim: Dimension of action space
         obs_horizon: Number of observation frames (default: 2)
         pred_horizon: Length of action sequence to predict (default: 16)
@@ -82,7 +87,7 @@ class AWShortCutFlowAgent(nn.Module):
     def __init__(
         self,
         velocity_net: ShortCutVelocityUNet1D,
-        q_network: DoubleQNetwork,
+        q_network: Union[DoubleQNetwork, EnsembleQNetwork],
         action_dim: int,
         obs_horizon: int = 2,
         pred_horizon: int = 16,
@@ -117,6 +122,8 @@ class AWShortCutFlowAgent(nn.Module):
         
         self.velocity_net = velocity_net
         self.critic = q_network
+        # Track critic type for correct Q-value computation
+        self._use_ensemble_q = isinstance(q_network, EnsembleQNetwork)
         self.action_dim = action_dim
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
@@ -274,8 +281,14 @@ class AWShortCutFlowAgent(nn.Module):
         # ===== Compute AWAC-style weights from Q-values =====
         with torch.no_grad():
             # Get Q-values for the dataset actions (no gradient needed)
-            q1_data, q2_data = self.critic(actions_for_q, obs_cond)
-            q_data = torch.min(q1_data, q2_data)  # Conservative Q estimate
+            # Compatible with both DoubleQNetwork and EnsembleQNetwork
+            if self._use_ensemble_q:
+                # EnsembleQNetwork: use get_min_q for conservative estimate
+                q_data = self.critic.get_min_q(actions_for_q, obs_cond, random_subset=True)
+            else:
+                # DoubleQNetwork: use min(q1, q2)
+                q1_data, q2_data = self.critic(actions_for_q, obs_cond)
+                q_data = torch.min(q1_data, q2_data)  # Conservative Q estimate
             
             # Compute advantage: A(s,a) = Q(s,a) - V(s) ≈ Q(s,a) - E[Q(s,a')]
             # Use batch mean as baseline (simple but effective)
@@ -472,9 +485,13 @@ class AWShortCutFlowAgent(nn.Module):
             next_actions_full = self._sample_actions_batch(next_obs_cond, use_ema=True)
             next_actions = next_actions_full[:, :self.act_horizon, :]
             
-            # Compute target Q-values (conservative double Q)
-            target_q1, target_q2 = self.critic_target(next_actions, next_obs_cond)
-            target_q = torch.min(target_q1, target_q2)
+            # Compute target Q-values (conservative estimate)
+            # Compatible with both DoubleQNetwork and EnsembleQNetwork
+            if self._use_ensemble_q:
+                target_q = self.critic_target.get_min_q(next_actions, next_obs_cond, random_subset=True)
+            else:
+                target_q1, target_q2 = self.critic_target(next_actions, next_obs_cond)
+                target_q = torch.min(target_q1, target_q2)
             
             # TD target with SMDP discount
             target_q = scaled_rewards + (1 - d) * gamma_tau * target_q
@@ -482,11 +499,17 @@ class AWShortCutFlowAgent(nn.Module):
             if self.q_target_clip is not None:
                 target_q = torch.clamp(target_q, -self.q_target_clip, self.q_target_clip)
         
-        # Current Q-values
-        current_q1, current_q2 = self.critic(action_seq, obs_cond)
-        
-        # MSE loss
-        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+        # Current Q-values and critic loss
+        # Compatible with both DoubleQNetwork and EnsembleQNetwork
+        if self._use_ensemble_q:
+            # EnsembleQNetwork: compute loss over all Q-networks
+            q_all = self.critic(action_seq, obs_cond)  # (num_qs, B, 1)
+            # Mean squared error across all Q-networks
+            critic_loss = F.mse_loss(q_all, target_q.unsqueeze(0).expand_as(q_all))
+        else:
+            # DoubleQNetwork: traditional double Q loss
+            current_q1, current_q2 = self.critic(action_seq, obs_cond)
+            critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
         
         return critic_loss
     

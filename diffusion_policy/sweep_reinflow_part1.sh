@@ -9,7 +9,7 @@
 set -e
 
 # Default configurations
-GPUS=(2 3 4 5 6 7 8 9)
+GPUS=(1)
 DRY_RUN=false
 TOTAL_UPDATES=10000
 EVAL_FREQ=100
@@ -24,7 +24,7 @@ ENV_ID="LiftPegUpright-v1"
 CONTROL_MODE="pd_ee_delta_pose"
 OBS_MODE="rgb"
 
-PRETRAINED_PATH_PATTERN="/home/wjz/rlft/diffusion_policy/runs/awsc-{ENV_ID}-seed0/checkpoints/best_eval_success_once.pt"
+PRETRAINED_PATH_PATTERN="/home/amax/rlft/diffusion_policy/runs/awsc-{ENV_ID}-seed0/checkpoints/best_eval_success_once.pt"
 
 # ============================================================================
 # Part 1 Configurations (11 experiments)
@@ -106,7 +106,7 @@ echo "Log directory: $LOG_DIR"
 echo "Pretrained: $PRETRAINED_PATH"
 echo "=========================================="
 
-cd /home/wjz/rlft/diffusion_policy
+cd /home/amax/rlft/diffusion_policy
 
 declare -a TASKS
 idx=0

@@ -8,7 +8,7 @@
 set -e
 
 # Default configurations
-GPUS=(2 3 4 5 6 7 8 9)
+GPUS=(0 1)
 DRY_RUN=false
 TOTAL_ITERS=30000
 EVAL_FREQ=2000
@@ -88,7 +88,7 @@ echo "Dry run: $DRY_RUN"
 echo "=========================================="
 echo ""
 
-cd /home/wjz/rlft/diffusion_policy
+cd /home/amax/rlft/diffusion_policy
 
 # Check demo file
 if [ ! -f "$DEMO_PATH" ]; then

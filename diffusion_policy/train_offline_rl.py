@@ -68,7 +68,7 @@ from diffusion_policy.algorithms import (
     DPPOAgent,
     ReinFlowAgent,
 )
-from diffusion_policy.algorithms.networks import VelocityUNet1D, DoubleQNetwork
+from diffusion_policy.algorithms.networks import VelocityUNet1D, DoubleQNetwork, EnsembleQNetwork
 
 
 @dataclass
@@ -92,18 +92,18 @@ class Args:
     """whether to capture videos of the agent performances"""
 
     # Environment settings
-    env_id: str = "PegInsertionSide-v1"
+    env_id: str = "LiftPegUpright-v1"
     """the id of the environment"""
-    demo_path: str = "demos/PegInsertionSide-v1/trajectory.state.pd_ee_delta_pose.physx_cuda.h5"
+    demo_path: str = "~/.maniskill/demos/LiftPegUpright-v1/rl/trajectory.rgb.pd_ee_delta_pose.physx_cuda.h5"
     """the path of demo dataset"""
     num_demos: Optional[int] = None
     """number of trajectories to load from the demo dataset"""
     max_episode_steps: Optional[int] = None
     """max episode steps for evaluation"""
-    control_mode: str = "pd_joint_delta_pos"
+    control_mode: str = "pd_ee_delta_pose"
     """the control mode"""
-    obs_mode: str = "rgb+depth"
-    """observation mode: rgb, depth, or rgb+depth"""
+    obs_mode: str = "rgb"
+    """observation mode: state or rgb"""
     sim_backend: str = "physx_cuda"
     """simulation backend for evaluation"""
 
@@ -257,6 +257,17 @@ class Args:
     weight_clip: float = 100.0
     """Maximum weight to prevent outlier dominance in AWCP"""
 
+    # Ensemble Q-Network settings (for AWShortCutFlow -> RLPD fine-tuning compatibility)
+    use_ensemble_q: bool = True
+    """Use EnsembleQNetwork instead of DoubleQNetwork for aw_shortcut_flow.
+    Recommended True for seamless checkpoint transfer to online RLPD training."""
+    num_qs: int = 10
+    """Number of Q-networks in ensemble (RLPD sample-efficient default: 10)"""
+    num_min_qs: int = 2
+    """Number of Q-networks for subsample + min (RLPD default: 2)"""
+    q_hidden_dims: List[int] = field(default_factory=lambda: [256, 256, 256])
+    """Hidden dimensions for Q-network MLP (RLPD default: [256, 256, 256])"""
+
     # Logging settings
     log_freq: int = 1000
     """logging frequency"""
@@ -302,38 +313,59 @@ class OfflineRLDataset(Dataset):
     The SMDP Bellman equation is:
     Q(s_t, â_t) = R_t^(τ) + (1 - d_t^(τ)) * γ^τ * max_{â'} Q(s_{t+τ}, â')
     
-    All other aspects (action padding, slicing, obs processing) are
-    aligned with the official implementation.
+    Args:
+        data_path: Path to HDF5 demo file
+        include_rgb: Whether to include RGB observations
+        device: Device to store tensors on
+        num_traj: Number of trajectories to load (None = all)
+        obs_horizon: Observation stacking horizon
+        pred_horizon: Action prediction horizon
+        act_horizon: Action execution horizon (for SMDP)
+        control_mode: Control mode for action padding detection
+        env_id: Environment ID for state extraction (required if obs_process_fn not provided)
+        obs_process_fn: Optional custom observation processing function
+        obs_space: Optional observation space for reordering keys
+        gamma: Discount factor for SMDP
     """
     
     def __init__(
         self,
         data_path: str,
-        obs_process_fn,
-        obs_space,
         include_rgb: bool,
-        include_depth: bool,
         device,
         num_traj: Optional[int],
         obs_horizon: int,
         pred_horizon: int,
         act_horizon: int,
         control_mode: str,
+        env_id: str = None,  # Required if obs_process_fn not provided
+        obs_process_fn=None,  # If None, will use create_obs_process_fn
+        obs_space=None,
+        rgb_format: str = "NCHW",  # "NCHW" for GPU training, "NHWC" for online mixing
         gamma: float = 0.99,
     ):
         self.include_rgb = include_rgb
-        self.include_depth = include_depth
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
         self.act_horizon = act_horizon
         self.gamma = gamma
         self.device = device
+        self.rgb_format = rgb_format
         
         # Load demo dataset with RL signals
-        from diffusion_policy.utils import load_traj_hdf5
+        from diffusion_policy.utils import load_traj_hdf5, create_obs_process_fn
         raw_data = load_traj_hdf5(data_path, num_traj=num_traj)
         
         print("Raw trajectory loaded, beginning observation pre-processing...")
+        
+        # Create obs_process_fn if not provided
+        if obs_process_fn is None:
+            if env_id is None:
+                raise ValueError("env_id is required when obs_process_fn is not provided")
+            obs_process_fn = create_obs_process_fn(env_id, output_format=rgb_format)
+            use_reorder_keys = False
+        else:
+            use_reorder_keys = obs_space is not None
         
         # Process trajectories
         trajectories = {
@@ -347,14 +379,13 @@ class OfflineRLDataset(Dataset):
             traj = raw_data[traj_key]
             
             # Process observations
-            obs_dict = reorder_keys(traj["obs"], obs_space)
-            obs_dict = obs_process_fn(obs_dict)
+            if use_reorder_keys:
+                obs_dict = reorder_keys(traj["obs"], obs_space)
+                obs_dict = obs_process_fn(obs_dict)
+            else:
+                obs_dict = obs_process_fn(traj["obs"])
             
             processed_obs = {}
-            if include_depth:
-                processed_obs["depth"] = torch.Tensor(
-                    obs_dict["depth"].astype(np.float32)
-                ).to(device=device, dtype=torch.float16)
             if include_rgb:
                 processed_obs["rgb"] = torch.from_numpy(obs_dict["rgb"]).to(device)
             processed_obs["state"] = torch.from_numpy(obs_dict["state"]).to(device)
@@ -824,11 +855,23 @@ def create_agent(algorithm: str, action_dim: int, global_cond_dim: int, args):
         )
         
         # Q-Network for advantage weighting
-        q_network = DoubleQNetwork(
-            action_dim=action_dim,
-            obs_dim=global_cond_dim,
-            action_horizon=args.act_horizon,
-        )
+        # Use EnsembleQNetwork by default for RLPD fine-tuning compatibility
+        if args.use_ensemble_q:
+            q_network = EnsembleQNetwork(
+                action_dim=action_dim,
+                obs_dim=global_cond_dim,
+                action_horizon=args.act_horizon,
+                hidden_dims=args.q_hidden_dims,
+                num_qs=args.num_qs,
+                num_min_qs=args.num_min_qs,
+            )
+        else:
+            # Backward compatibility: use DoubleQNetwork
+            q_network = DoubleQNetwork(
+                action_dim=action_dim,
+                obs_dim=global_cond_dim,
+                action_horizon=args.act_horizon,
+            )
         
         return AWShortCutFlowAgent(
             velocity_net=shortcut_velocity_net,
@@ -966,9 +1009,10 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
     
     # Create evaluation environment
+    # Note: Use dense reward to match offline dataset reward mode
     env_kwargs = dict(
         control_mode=args.control_mode,
-        reward_mode="sparse",
+        reward_mode="dense",
         obs_mode=args.obs_mode,
         render_mode="rgb_array",
         human_render_camera_configs=dict(shader_pack="default"),
@@ -1020,14 +1064,12 @@ if __name__ == "__main__":
         concat_fn=partial(np.concatenate, axis=-1),
         transpose_fn=partial(np.transpose, axes=(0, 3, 1, 2)),
         state_obs_extractor=build_state_obs_extractor(args.env_id),
-        depth="rgbd" in args.demo_path,
     )
     
     # Get observation space from temp env
     tmp_env = gym.make(args.env_id, **env_kwargs)
     original_obs_space = tmp_env.observation_space
     include_rgb = tmp_env.unwrapped.obs_mode_struct.visual.rgb
-    include_depth = tmp_env.unwrapped.obs_mode_struct.visual.depth
     tmp_env.close()
     
     # Create dataset
@@ -1036,7 +1078,6 @@ if __name__ == "__main__":
         obs_process_fn=obs_process_fn,
         obs_space=original_obs_space,
         include_rgb=include_rgb,
-        include_depth=include_depth,
         device=device,
         num_traj=args.num_demos,
         obs_horizon=args.obs_horizon,
@@ -1066,13 +1107,10 @@ if __name__ == "__main__":
     
     # Create visual encoder
     include_rgb_flag = "rgb" in dataset.obs_keys
-    include_depth_flag = "depth" in dataset.obs_keys
     
     in_channels = 0
     if include_rgb_flag:
         in_channels += 3
-    if include_depth_flag:
-        in_channels += 1
     
     visual_encoder = None
     visual_feature_dim = 0
@@ -1097,7 +1135,7 @@ if __name__ == "__main__":
     # Create agent wrapper for evaluation (handles obs encoding)
     # AgentWrapper is imported from diffusion_policy.utils
     agent_wrapper = AgentWrapper(
-        agent, visual_encoder, include_rgb_flag, include_depth_flag, 
+        agent, visual_encoder, include_rgb_flag, 
         args.obs_horizon, args.act_horizon
     ).to(device)
     
@@ -1176,7 +1214,7 @@ if __name__ == "__main__":
         
         ema_agent = create_agent(args.algorithm, action_dim, global_cond_dim, args).to(device)
     
-    ema_agent_wrapper = AgentWrapper(ema_agent, visual_encoder, include_rgb_flag, include_depth_flag, args.obs_horizon).to(device)
+    ema_agent_wrapper = AgentWrapper(ema_agent, visual_encoder, include_rgb_flag, args.obs_horizon).to(device)
     
     best_eval_metrics = defaultdict(float)
     timings = defaultdict(float)
@@ -1250,15 +1288,7 @@ if __name__ == "__main__":
             if "rgb" in obs_seq:
                 rgb = obs_seq["rgb"]  # [B, T, C, H, W]
                 rgb_flat = rgb.view(B * T, *rgb.shape[2:]).float() / 255.0
-                if "depth" in obs_seq:
-                    depth = obs_seq["depth"]  # [B, T, 1, H, W]
-                    depth_flat = depth.view(B * T, *depth.shape[2:]).float()
-                    visual_input = torch.cat([rgb_flat, depth_flat], dim=1)
-                else:
-                    visual_input = rgb_flat
-            elif "depth" in obs_seq:
-                depth = obs_seq["depth"]
-                visual_input = depth.view(B * T, *depth.shape[2:]).float()
+                visual_input = rgb_flat
             else:
                 visual_input = None
             

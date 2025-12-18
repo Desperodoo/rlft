@@ -7,8 +7,8 @@ import torch.nn as nn
 import numpy as np
 from typing import List, Tuple
 
-from ..conditional_unet1d import ConditionalUnet1D
-
+from ..conditional_unet1d import ConditionalUnet1D# Import EnsembleQNetwork from rlpd for unified offline/online Q-network architecture
+from ..rlpd.networks import EnsembleQNetwork
 
 class VelocityUNet1D(nn.Module):
     """1D U-Net for velocity field prediction (Flow Matching).

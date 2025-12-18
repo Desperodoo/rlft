@@ -55,10 +55,14 @@ from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils.wrappers.flatten import FlattenRGBDObservationWrapper
 
 from diffusion_policy.make_env import make_eval_envs
-from diffusion_policy.utils import AgentWrapper, build_state_obs_extractor, convert_obs
+from diffusion_policy.utils import (
+    AgentWrapper, ObservationStacker, build_state_obs_extractor, 
+    convert_obs, encode_observations
+)
 from diffusion_policy.plain_conv import PlainConv
 from diffusion_policy.algorithms.shortcut_flow import ShortCutVelocityUNet1D
-from diffusion_policy.algorithms.reinflow import ReinFlowAgent, VectorizedRolloutBuffer, compute_smdp_rewards
+from diffusion_policy.algorithms.reinflow import ReinFlowAgent
+from diffusion_policy.rlpd import RolloutBufferPPO
 from diffusion_policy.evaluate import evaluate
 
 
@@ -94,7 +98,7 @@ class Args:
     control_mode: str = "pd_joint_delta_pos"
     """the control mode"""
     obs_mode: str = "rgb"
-    """observation mode: rgb, depth, or rgb+depth"""
+    """observation mode: rgb or state"""
     sim_backend: str = "physx_cuda"
     """simulation backend (physx_cuda for parallel training)"""
 
@@ -288,14 +292,16 @@ class ReturnNormalizer:
 def make_train_envs(env_id: str, num_envs: int, sim_backend: str, 
                     control_mode: str, obs_mode: str, 
                     max_episode_steps: Optional[int] = None,
+                    reward_mode: str = "dense",
                     record_video: bool = False,
                     video_path: str = None):
     """Create parallel training environments."""
     env_kwargs = dict(
-        obs_mode="rgbd" if "rgb" in obs_mode or "depth" in obs_mode else "state",
+        obs_mode="rgbd" if "rgb" in obs_mode else "state",
         control_mode=control_mode,
         sim_backend=sim_backend,
         num_envs=num_envs,
+        reward_mode=reward_mode,
     )
     
     if max_episode_steps is not None:
@@ -307,14 +313,12 @@ def make_train_envs(env_id: str, num_envs: int, sim_backend: str,
     
     env = gym.make(env_id, **env_kwargs)
     
-    # Wrap for RGBD observations
-    if "rgb" in obs_mode or "depth" in obs_mode:
-        include_rgb = "rgb" in obs_mode
-        include_depth = "depth" in obs_mode
+    # Wrap for RGB observations
+    if "rgb" in obs_mode:
         env = FlattenRGBDObservationWrapper(
             env, 
-            rgb=include_rgb, 
-            depth=include_depth, 
+            rgb=True, 
+            depth=False, 
             state=True
         )
     
@@ -369,6 +373,7 @@ def main():
         control_mode=args.control_mode,
         obs_mode=args.obs_mode,
         max_episode_steps=args.max_episode_steps,
+        reward_mode="dense",
     )
     
     print("Creating evaluation environments...")
@@ -377,6 +382,7 @@ def main():
         max_episode_steps=args.max_episode_steps,
         obs_mode=args.obs_mode,  # Must match training obs_mode for AgentWrapper
         render_mode="rgb_array",  # For video recording compatibility
+        reward_mode="dense",  # Match training reward mode
     )
     eval_other_kwargs = dict(
         obs_horizon=args.obs_horizon,
@@ -410,16 +416,10 @@ def main():
     
     # Check observation mode
     include_rgb = "rgb" in args.obs_mode
-    include_depth = "depth" in args.obs_mode
     
     # Build visual encoder
-    if include_rgb or include_depth:
-        if include_rgb and include_depth:
-            in_channels = 4  # RGB + Depth
-        elif include_rgb:
-            in_channels = 3
-        else:
-            in_channels = 3  # Depth repeated to 3 channels
+    if include_rgb:
+        in_channels = 3  # RGB only
         
         visual_encoder = PlainConv(
             in_channels=in_channels,
@@ -429,7 +429,7 @@ def main():
         
         obs_dim = (args.visual_feature_dim + state_dim) * args.obs_horizon
     else:
-        visual_encoder = nn.Identity()
+        visual_encoder = None
         obs_dim = state_dim * args.obs_horizon
     
     print(f"Observation dimension (flattened): {obs_dim}")
@@ -483,7 +483,7 @@ def main():
             agent.load_pretrained(args.pretrained_path, device=str(device))
         
         # Load visual encoder if available
-        if include_rgb or include_depth:
+        if include_rgb:
             if "visual_encoder" in checkpoint:
                 visual_encoder.load_state_dict(checkpoint["visual_encoder"])
                 print("Loaded visual encoder from checkpoint")
@@ -491,7 +491,7 @@ def main():
         print("Pretrained model loaded successfully")
     
     # Freeze visual encoder if specified
-    if args.freeze_visual_encoder and (include_rgb or include_depth):
+    if args.freeze_visual_encoder and include_rgb:
         for param in visual_encoder.parameters():
             param.requires_grad = False
         print("Visual encoder frozen")
@@ -500,7 +500,7 @@ def main():
     total_params = sum(p.numel() for p in agent.parameters())
     trainable_params = sum(p.numel() for p in agent.parameters() if p.requires_grad)
     visual_params = 0
-    if include_rgb or include_depth:
+    if include_rgb:
         visual_params = sum(p.numel() for p in visual_encoder.parameters())
         trainable_visual_params = sum(p.numel() for p in visual_encoder.parameters() if p.requires_grad)
         print(f"Visual encoder parameters: {visual_params / 1e6:.2f}M (trainable: {trainable_visual_params / 1e6:.2f}M)")
@@ -512,14 +512,14 @@ def main():
     policy_params = list(agent.noisy_velocity_net.parameters())
     critic_params = list(agent.value_net.parameters())
     
-    if not args.freeze_visual_encoder and (include_rgb or include_depth):
+    if not args.freeze_visual_encoder and include_rgb:
         policy_params += list(visual_encoder.parameters())
     
     policy_optimizer = optim.AdamW(policy_params, lr=args.lr)
     critic_optimizer = optim.AdamW(critic_params, lr=args.lr_critic)
     
-    # Create vectorized rollout buffer (following official PPO implementation)
-    buffer = VectorizedRolloutBuffer(
+    # Create PPO rollout buffer (following official PPO implementation)
+    buffer = RolloutBufferPPO(
         num_steps=args.rollout_steps,
         num_envs=args.num_envs,
         obs_dim=obs_dim,
@@ -534,62 +534,27 @@ def main():
     
     # Create agent wrapper for evaluation (aligns with train_offline_rl.py)
     agent_wrapper = AgentWrapper(
-        agent, visual_encoder, include_rgb, include_depth, 
+        agent, visual_encoder, include_rgb, 
         args.obs_horizon, args.act_horizon
     ).to(device)
     
-    # Helper function to encode observations (following train_offline_rl.py pattern)
-    def encode_observations(obs_seq):
+    # Local encode_observations function using the public utility from utils.py
+    def local_encode_observations(obs_seq):
         """Encode observation sequence to get conditioning features.
         
         Args:
-            obs_seq: dict with 'state' and optionally 'rgb'/'depth'
+            obs_seq: dict with 'state' and optionally 'rgb'
                     shapes: state [B, T, state_dim], rgb [B, T, H, W, C]
         
         Returns:
             obs_cond: [B, obs_horizon * (visual_dim + state_dim)]
         """
-        B = obs_seq["state"].shape[0]
-        T = obs_seq["state"].shape[1]
-        
-        features_list = []
-        
-        # Visual features
-        if include_rgb or include_depth:
-            if include_rgb:
-                rgb = obs_seq["rgb"]  # [B, T, H, W, C]
-                # Convert to [B*T, C, H, W] and normalize
-                rgb_flat = rgb.reshape(B * T, *rgb.shape[2:])
-                rgb_flat = rgb_flat.permute(0, 3, 1, 2).float() / 255.0
-                
-                if include_depth and "depth" in obs_seq:
-                    depth = obs_seq["depth"]  # [B, T, H, W, 1]
-                    depth_flat = depth.reshape(B * T, *depth.shape[2:])
-                    depth_flat = depth_flat.permute(0, 3, 1, 2).float()
-                    visual_input = torch.cat([rgb_flat, depth_flat], dim=1)
-                else:
-                    visual_input = rgb_flat
-            elif include_depth:
-                depth = obs_seq["depth"]
-                depth_flat = depth.reshape(B * T, *depth.shape[2:])
-                depth_flat = depth_flat.permute(0, 3, 1, 2).float()
-                # Repeat depth to 3 channels for encoder
-                visual_input = depth_flat.repeat(1, 3, 1, 1)
-            
-            visual_feat = visual_encoder(visual_input)  # [B*T, visual_dim]
-            visual_feat = visual_feat.view(B, T, -1)  # [B, T, visual_dim]
-            features_list.append(visual_feat)
-        
-        # State features - already flattened by FlattenRGBDObservationWrapper
-        state = obs_seq["state"]  # [B, T, state_dim]
-        if isinstance(state, np.ndarray):
-            state = torch.from_numpy(state).float().to(device)
-        features_list.append(state)
-        
-        # Concatenate features: [B, T, visual_dim + state_dim]
-        obs_features = torch.cat(features_list, dim=-1)
+        # Use the public encode_observations from utils.py
+        # It handles NCHW auto-detection and RGB normalization
+        obs_features = encode_observations(obs_seq, visual_encoder, include_rgb, device)
         
         # Flatten to [B, T * (visual_dim + state_dim)]
+        B = obs_seq["state"].shape[0]
         obs_cond = obs_features.reshape(B, -1)
         
         return obs_cond
@@ -609,11 +574,10 @@ def main():
     episode_lengths = deque(maxlen=100)
     episode_successes = deque(maxlen=100)
     
-    # Observation buffer
+    # Observation stacker using common utility
     obs, _ = train_envs.reset()
-    obs_deque = deque(maxlen=args.obs_horizon)
-    for _ in range(args.obs_horizon):
-        obs_deque.append(obs)
+    obs_stacker = ObservationStacker(args.obs_horizon)
+    obs_stacker.reset(obs)
     
     # Per-env episode tracking
     env_episode_rewards = np.zeros(args.num_envs)
@@ -683,15 +647,12 @@ def main():
         buffer.reset()
         
         for rollout_step in range(args.rollout_steps):
-            # Process observations: stack obs_deque along time dimension
-            obs_seq = {
-                k: torch.stack([o[k] for o in obs_deque], dim=1)
-                for k in obs.keys()
-            }
+            # Get stacked observations
+            obs_seq = obs_stacker.get_stacked()
             
             # Encode observations using unified function
             with torch.no_grad():
-                obs_cond = encode_observations(obs_seq)
+                obs_cond = local_encode_observations(obs_seq)
                 
                 # Get action with exploration
                 # x_chain is (B, K+1, H, A) complete denoising trajectory
@@ -758,7 +719,7 @@ def main():
                         env_episode_rewards[i] = 0.0
                         env_episode_lengths[i] = 0
                 
-                obs_deque.append(next_obs)
+                obs_stacker.append(next_obs)
                 obs = next_obs
                 global_step += args.num_envs
                 
@@ -814,11 +775,8 @@ def main():
                 # Get value estimate for the new state after reset
                 with torch.no_grad():
                     # The obs after episode end is already the new episode's first obs
-                    final_obs_seq = {
-                        k: torch.stack([o[k] for o in obs_deque], dim=1)
-                        for k in obs.keys()
-                    }
-                    final_obs_cond = encode_observations(final_obs_seq)
+                    final_obs_seq = obs_stacker.get_stacked()
+                    final_obs_cond = local_encode_observations(final_obs_seq)
                     # Use target value network for bootstrap value when enabled
                     final_vals = agent.compute_value(final_obs_cond[done_mask], use_target=args.use_target_value_net)
                 buffer.set_final_values(rollout_step, done_mask, final_vals)
@@ -829,12 +787,9 @@ def main():
         # Compute returns and advantages
         with torch.no_grad():
             # Get last value for bootstrapping
-            obs_seq = {
-                k: torch.stack([o[k] for o in obs_deque], dim=1)
-                for k in obs.keys()
-            }
+            obs_seq = obs_stacker.get_stacked()
             
-            obs_cond = encode_observations(obs_seq)
+            obs_cond = local_encode_observations(obs_seq)
             # Use target value network for bootstrap value when enabled
             next_value = agent.compute_value(obs_cond, use_target=args.use_target_value_net).squeeze(-1)
         
@@ -1086,7 +1041,7 @@ def main():
                     checkpoint_path = f"{log_dir}/checkpoint_best_eval_{k}.pt"
                     checkpoint = {
                         "agent": agent.state_dict(),
-                        "visual_encoder": visual_encoder.state_dict() if include_rgb or include_depth else None,
+                        "visual_encoder": visual_encoder.state_dict() if include_rgb else None,
                         "config": vars(args),
                     }
                     torch.save(checkpoint, checkpoint_path)
@@ -1105,7 +1060,7 @@ def main():
             checkpoint_path = f"{log_dir}/checkpoint_{num_updates}.pt"
             checkpoint = {
                 "agent": agent.state_dict(),
-                "visual_encoder": visual_encoder.state_dict() if include_rgb or include_depth else None,
+                "visual_encoder": visual_encoder.state_dict() if include_rgb else None,
                 "policy_optimizer": policy_optimizer.state_dict(),
                 "critic_optimizer": critic_optimizer.state_dict(),
                 "global_step": global_step,
@@ -1125,7 +1080,7 @@ def main():
     final_path = f"{log_dir}/final_model.pt"
     checkpoint = {
         "agent": agent.state_dict(),
-        "visual_encoder": visual_encoder.state_dict() if include_rgb or include_depth else None,
+        "visual_encoder": visual_encoder.state_dict() if include_rgb else None,
         "config": vars(args),
     }
     torch.save(checkpoint, final_path)

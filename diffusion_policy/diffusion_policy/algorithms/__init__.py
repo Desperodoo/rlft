@@ -29,7 +29,7 @@ from .awcp import AWCPAgent
 from .aw_shortcut_flow import AWShortCutFlowAgent
 from .dppo import DPPOAgent, ValueNetwork
 from .reinflow import ReinFlowAgent, NoisyVelocityUNet1D, ExploreNoiseNet
-from .networks import DoubleQNetwork, VelocityUNet1D
+from .networks import DoubleQNetwork, VelocityUNet1D, EnsembleQNetwork
 
 __all__ = [
     "DiffusionPolicyAgent",
@@ -48,5 +48,6 @@ __all__ = [
     "NoisyVelocityUNet1D",
     "ExploreNoiseNet",
     "DoubleQNetwork",
+    "EnsembleQNetwork",
     "VelocityUNet1D",
 ]
