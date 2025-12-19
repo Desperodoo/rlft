@@ -39,6 +39,7 @@ class FlowMatchingAgent(nn.Module):
         obs_horizon: int = 2,
         pred_horizon: int = 16,
         num_flow_steps: int = 10,
+        action_bounds: Optional[tuple] = None,  # (min, max) for action clipping, None to disable
         device: str = "cuda",
     ):
         super().__init__()
@@ -47,6 +48,7 @@ class FlowMatchingAgent(nn.Module):
         self.obs_horizon = obs_horizon
         self.pred_horizon = pred_horizon
         self.num_flow_steps = num_flow_steps
+        self.action_bounds = action_bounds
         self.device = device
     
     def compute_loss(
@@ -115,8 +117,9 @@ class FlowMatchingAgent(nn.Module):
         else:
             x = self._euler_integrate(x, obs_features)
         
-        # Clamp to valid action range
-        x = torch.clamp(x, -1.0, 1.0)
+        # Clamp to valid action range (optional)
+        if self.action_bounds is not None:
+            x = torch.clamp(x, self.action_bounds[0], self.action_bounds[1])
         
         self.velocity_net.train()
         return x

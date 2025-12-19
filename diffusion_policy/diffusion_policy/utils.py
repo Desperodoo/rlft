@@ -3,11 +3,64 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Dict, Optional, List, Any, Tuple, Callable
 from gymnasium import spaces
 from h5py import Dataset, File, Group
 from torch.utils.data.sampler import Sampler
 from tqdm import tqdm
+
+
+# ============================================================================
+# State Encoder MLP
+# ============================================================================
+
+class StateEncoder(nn.Module):
+    """MLP encoder for state observations.
+    
+    Projects state features to a latent space to align with visual features.
+    This helps with multimodal fusion when combining state and visual inputs.
+    
+    Architecture: Linear -> ReLU -> Linear -> ReLU
+    
+    Args:
+        state_dim: Input state dimension
+        hidden_dim: Hidden layer dimension (default: 128)
+        out_dim: Output feature dimension (default: 256)
+    
+    Example:
+        >>> encoder = StateEncoder(state_dim=13, hidden_dim=128, out_dim=256)
+        >>> state = torch.randn(32, 2, 13)  # [B, T, state_dim]
+        >>> features = encoder(state)  # [B, T, 256]
+    """
+    
+    def __init__(
+        self,
+        state_dim: int,
+        hidden_dim: int = 128,
+        out_dim: int = 256,
+    ):
+        super().__init__()
+        self.state_dim = state_dim
+        self.out_dim = out_dim
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim),
+            nn.ReLU(inplace=True),
+        )
+    
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """Encode state observations.
+        
+        Args:
+            state: State tensor of shape [B, state_dim], [B, T, state_dim], 
+                   or [B*T, state_dim]
+        
+        Returns:
+            Encoded features with same batch dimensions but out_dim as last dim
+        """
+        return self.mlp(state)
 
 
 class IterationBasedBatchSampler(Sampler):
@@ -221,6 +274,236 @@ def build_state_obs_extractor(env_id):
     # NOTE: You can tune/modify state observations specific to each environment here as you wish. By default we include all data
     # but in some use cases you might want to exclude e.g. obs["agent"]["qvel"] as qvel is not always something you query in the real world.
     return lambda obs: list(obs["agent"].values()) + list(obs["extra"].values())
+
+
+# ============================================================================
+# Real Robot Data Adapters (ARX5)
+# ============================================================================
+
+def build_real_robot_state_extractor():
+    """Build state extractor for ARX5 real robot data.
+    
+    ARX5 真机数据的state结构:
+        obs/joint_pos: float32, (T, 6)      # 6DoF关节位置
+        obs/joint_vel: float32, (T, 6)      # 6DoF关节速度
+        obs/gripper_pos: float32, (T, 1)    # 夹爪位置
+    
+    Returns:
+        State extractor function: obs -> list of arrays to stack
+    """
+    def extractor(obs):
+        components = []
+        
+        # Joint positions (6DoF)
+        if "joint_pos" in obs:
+            components.append(np.array(obs["joint_pos"]))
+        
+        # Joint velocities (6DoF)
+        if "joint_vel" in obs:
+            components.append(np.array(obs["joint_vel"]))
+        
+        # Gripper position (1DoF)
+        if "gripper_pos" in obs:
+            gripper = np.array(obs["gripper_pos"])
+            if gripper.ndim == 1:
+                gripper = gripper[:, np.newaxis]
+            components.append(gripper)
+        
+        return components
+    
+    return extractor
+
+
+def create_real_robot_obs_process_fn(
+    output_format: str = "NCHW",
+    camera_name: str = "wrist",  # "wrist" (eye-in-hand) or "external" (eye-to-hand)
+    include_depth: bool = False,
+    target_size: Optional[Tuple[int, int]] = None,  # (H, W) for resizing, None = no resize
+):
+    """Create observation processing function for ARX5 real robot data.
+    
+    ARX5 真机数据结构:
+        obs/images/wrist/rgb: uint8, (T, 256, 256, 3)      # Eye-in-hand RGB
+        obs/images/wrist/depth: uint16, (T, 256, 256)      # Eye-in-hand Depth
+        obs/images/external/rgb: uint8, (T, 256, 256, 3)   # Eye-to-hand RGB
+        obs/images/external/depth: uint16, (T, 256, 256)   # Eye-to-hand Depth
+        obs/joint_pos: float32, (T, 6)
+        obs/joint_vel: float32, (T, 6)
+        obs/gripper_pos: float32, (T, 1)
+    
+    Args:
+        output_format: "NCHW" for GPU training, "NHWC" for storage
+        camera_name: Which camera to use ("wrist" or "external")
+        include_depth: Whether to include depth channel
+        target_size: Optional (H, W) to resize images (e.g., (128, 128) for ManiSkill compat)
+    
+    Returns:
+        obs_process_fn: Function that takes raw obs dict and returns
+                       {"state": (T, state_dim), "rgb": (T, C, H, W)}
+    """
+    state_extractor = build_real_robot_state_extractor()
+    
+    def obs_process_fn(obs):
+        """Process real robot observations.
+        
+        Args:
+            obs: Raw observation dict from HDF5 file
+        
+        Returns:
+            Dict with "state" and "rgb" keys
+        """
+        # ===== Process State =====
+        states_to_stack = state_extractor(obs)
+        
+        processed_states = []
+        for s in states_to_stack:
+            arr = np.array(s)
+            if arr.ndim == 1:
+                arr = arr[:, np.newaxis]
+            if arr.dtype == np.bool_:
+                arr = arr.astype(np.float32)
+            if arr.dtype == np.float64:
+                arr = arr.astype(np.float32)
+            processed_states.append(arr)
+        
+        state = np.hstack(processed_states)  # (T, state_dim)
+        
+        # ===== Process Images =====
+        # Get RGB from specified camera
+        if "images" in obs and camera_name in obs["images"]:
+            rgb = np.array(obs["images"][camera_name]["rgb"])  # (T, H, W, 3)
+        else:
+            raise KeyError(f"Camera '{camera_name}' not found in obs['images']. "
+                          f"Available cameras: {list(obs.get('images', {}).keys())}")
+        
+        # Optionally resize images
+        if target_size is not None:
+            import cv2
+            T = rgb.shape[0]
+            resized = np.zeros((T, target_size[0], target_size[1], 3), dtype=np.uint8)
+            for i in range(T):
+                resized[i] = cv2.resize(rgb[i], (target_size[1], target_size[0]), 
+                                       interpolation=cv2.INTER_LINEAR)
+            rgb = resized
+        
+        # Optionally include depth
+        if include_depth:
+            if "depth" in obs["images"][camera_name]:
+                depth = np.array(obs["images"][camera_name]["depth"])  # (T, H, W), uint16
+                # Normalize depth to [0, 1] range (assuming depth_scale=1000, max ~10m)
+                depth_normalized = depth.astype(np.float32) / 10000.0  # Max 10m
+                depth_normalized = np.clip(depth_normalized, 0, 1)
+                # Convert to uint8 for channel concatenation
+                depth_uint8 = (depth_normalized * 255).astype(np.uint8)
+                
+                # Resize depth if needed
+                if target_size is not None:
+                    import cv2
+                    T = depth_uint8.shape[0]
+                    resized_depth = np.zeros((T, target_size[0], target_size[1]), dtype=np.uint8)
+                    for i in range(T):
+                        resized_depth[i] = cv2.resize(depth_uint8[i], (target_size[1], target_size[0]),
+                                                     interpolation=cv2.INTER_NEAREST)
+                    depth_uint8 = resized_depth
+                
+                # Add channel dimension: (T, H, W) -> (T, H, W, 1)
+                depth_uint8 = depth_uint8[..., np.newaxis]
+                
+                # Concatenate RGB + D: (T, H, W, 4)
+                rgb = np.concatenate([rgb, depth_uint8], axis=-1)
+            else:
+                print(f"Warning: Depth requested but not found for camera '{camera_name}'")
+        
+        # Convert to target format
+        if output_format == "NCHW":
+            rgb = np.transpose(rgb, (0, 3, 1, 2))  # (T, C, H, W)
+        # else: keep NHWC (T, H, W, C)
+        
+        return {"state": state, "rgb": rgb}
+    
+    return obs_process_fn
+
+
+def get_real_robot_data_info(data_path: str) -> Dict[str, Any]:
+    """Get information about real robot dataset.
+    
+    Reads the config.yaml and stats.json to provide dataset metadata.
+    
+    Args:
+        data_path: Path to trajectory.h5 file
+    
+    Returns:
+        Dict with dataset information:
+            - state_dim: Total state dimension (joint_pos + joint_vel + gripper)
+            - action_dim: Action dimension
+            - image_size: (H, W) tuple
+            - cameras: List of available camera names
+            - has_depth: Whether depth is available
+            - control_mode: Control mode from trajectory.json
+            - num_trajectories: Number of trajectories
+            - stats: Normalization statistics (if available)
+    """
+    import os
+    import json
+    import yaml
+    
+    data_dir = os.path.dirname(os.path.expanduser(data_path))
+    info = {}
+    
+    # Read config.yaml
+    config_path = os.path.join(data_dir, "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        info["cameras"] = list(config.get("cameras", {}).keys())
+        info["has_depth"] = any(
+            cam.get("enable_depth", False) 
+            for cam in config.get("cameras", {}).values()
+        )
+        info["robot_model"] = config.get("robot", {}).get("model", "unknown")
+        info["joint_dof"] = config.get("robot", {}).get("joint_dof", 6)
+    
+    # Read stats.json
+    stats_path = os.path.join(data_dir, "stats.json")
+    if os.path.exists(stats_path):
+        with open(stats_path, 'r') as f:
+            info["stats"] = json.load(f)
+    
+    # Read trajectory.json
+    traj_json_path = os.path.join(data_dir, "trajectory.json")
+    if os.path.exists(traj_json_path):
+        with open(traj_json_path, 'r') as f:
+            traj_info = json.load(f)
+        info["control_mode"] = traj_info.get("episodes", [{}])[0].get("control_mode", "joint_pos")
+        info["num_trajectories"] = len(traj_info.get("episodes", []))
+    
+    # Read HDF5 to get dimensions
+    from h5py import File
+    with File(os.path.expanduser(data_path), 'r') as f:
+        traj_keys = [k for k in f.keys() if k.startswith("traj_")]
+        if traj_keys:
+            first_traj = f[traj_keys[0]]
+            info["action_dim"] = first_traj["actions"].shape[-1]
+            
+            # State dimension
+            state_dim = 0
+            if "joint_pos" in first_traj["obs"]:
+                state_dim += first_traj["obs"]["joint_pos"].shape[-1]
+            if "joint_vel" in first_traj["obs"]:
+                state_dim += first_traj["obs"]["joint_vel"].shape[-1]
+            if "gripper_pos" in first_traj["obs"]:
+                gripper_shape = first_traj["obs"]["gripper_pos"].shape
+                state_dim += gripper_shape[-1] if len(gripper_shape) > 1 else 1
+            info["state_dim"] = state_dim
+            
+            # Image size
+            if "images" in first_traj["obs"]:
+                for cam_name in first_traj["obs"]["images"].keys():
+                    rgb_shape = first_traj["obs"]["images"][cam_name]["rgb"].shape
+                    info["image_size"] = (rgb_shape[1], rgb_shape[2])  # (H, W)
+                    break
+    
+    return info
 
 
 def create_obs_process_fn(

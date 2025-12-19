@@ -45,6 +45,7 @@ class ConsistencyFlowAgent(nn.Module):
         teacher_from: Literal["t_plus", "t_cons"] = "t_plus",
         student_point: Literal["t_plus", "t_cons"] = "t_plus",
         consistency_loss_space: Literal["velocity", "endpoint"] = "velocity",
+        action_bounds: Optional[tuple] = None,  # (min, max) for action clipping, None to disable
         device: str = "cuda",
     ):
         super().__init__()
@@ -81,6 +82,7 @@ class ConsistencyFlowAgent(nn.Module):
         self.teacher_from = teacher_from
         self.student_point = student_point
         self.consistency_loss_space = consistency_loss_space
+        self.action_bounds = action_bounds  # None means no clipping
         
     def update_ema(self):
         """Update EMA velocity network.
@@ -282,8 +284,9 @@ class ConsistencyFlowAgent(nn.Module):
                 
                 x = x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
         
-        # Clamp to action bounds
-        x = torch.clamp(x, -1.0, 1.0)
+        # Clamp to action bounds (optional)
+        if self.action_bounds is not None:
+            x = torch.clamp(x, self.action_bounds[0], self.action_bounds[1])
         
         self.velocity_net.train()
         return x
